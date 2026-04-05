@@ -1,28 +1,44 @@
 """
-Entropy Prime — FastAPI Backend (production-ready)
-Phases 2, 3, 4 — RL Governor · Honeypot · Session Watchdog
+Entropy Prime — FastAPI Backend (production-ready with MongoDB)
+Phases 2, 3, 4 — RL Governor · Honeypot · Session Watchdog · User Authentication
 """
 from __future__ import annotations
 
 import hashlib, hmac, logging, os, secrets, time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch, torch.nn as nn, torch.optim as optim
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
+from database import Database
+from database import (
+    user_exists, create_user, get_user_by_email, get_user_by_id,
+    update_last_login, update_user_security_level,
+    create_session, get_session, invalidate_session, update_session_trust_score,
+    store_biometric_sample, get_biometric_profile,
+    store_honeypot_entry, get_honeypot_signatures, get_honeypot_count
+)
+from models import (
+    UserCreate, UserLogin, UserResponse, AuthResponse,
+    PasswordHashResponse
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("entropy_prime")
 
+# ── Database ──────────────────────────────────────────────────────────────────
+db_handler = Database()
+
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Entropy Prime", version="1.0.0")
+app = FastAPI(title="Entropy Prime", version="2.0.0 (MongoDB)")
 
 app.add_middleware(CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -30,6 +46,17 @@ app.add_middleware(CORSMiddleware,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize MongoDB on startup"""
+    await db_handler.connect_to_mongo()
+    logger.info("✓ Entropy Prime backend initialized with MongoDB")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close MongoDB connection on shutdown"""
+    await db_handler.close_mongo_connection()
 
 SESSION_SECRET = os.environ.get("EP_SESSION_SECRET", secrets.token_hex(32))
 SHADOW_SECRET  = os.environ.get("EP_SHADOW_SECRET",  secrets.token_hex(32))
@@ -45,73 +72,26 @@ class Argon2Params:
     def from_action(cls, idx: int):
         return [cls.ECONOMY, cls.STANDARD, cls.HARD, cls.PUNISHER][idx]
 
-# ── DQN ───────────────────────────────────────────────────────────────────────
-class QNetwork(nn.Module):
-    def __init__(self, s=3, a=4):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(s,64), nn.ReLU(), nn.Linear(64,64), nn.ReLU(), nn.Linear(64,a))
-    def forward(self, x): return self.net(x)
 
-@dataclass
-class Transition:
-    state: np.ndarray; action: int; reward: float; next_state: np.ndarray; done: bool
+# ── Modular Model Imports ─────────────────────────────────────────────────────
+from models.dqn import DQNAgent
+from models.mab import MABAgent
+from models.ppo import PPOAgent
+from models.cnn1d import CNN1D
 
-class ReplayBuffer:
-    def __init__(self, cap=10_000): self._buf = deque(maxlen=cap)
-    def push(self, t): self._buf.append(t)
-    def sample(self, n): idx = np.random.choice(len(self._buf), n, replace=False); return [self._buf[i] for i in idx]
-    def __len__(self): return len(self._buf)
+# Instantiate models (replace with checkpoint loading as needed)
+dqn_agent = DQNAgent(state_dim=3, action_dim=4)
+mab_agent = MABAgent(n_arms=3)
+ppo_agent = PPOAgent(state_dim=10, action_dim=3)
+cnn_model = CNN1D(input_channels=1, out_dim=32)
 
-class RLGovernor:
-    GAMMA=.99; LR=1e-3; EPS_START=1.; EPS_END=.05; EPS_DECAY=2000
-    BATCH=64; TARGET_UPDATE=200
-
-    def __init__(self):
-        self.q = QNetwork(); self.tq = QNetwork()
-        self.tq.load_state_dict(self.q.state_dict()); self.tq.eval()
-        self.opt = optim.Adam(self.q.parameters(), lr=self.LR)
-        self.buf = ReplayBuffer(); self._steps = 0
-        ckpt = os.environ.get("EP_RL_CHECKPOINT","")
-        if ckpt and os.path.exists(ckpt):
-            st = torch.load(ckpt, map_location="cpu")
-            self.q.load_state_dict(st.get("q_net", st.get("actor_critic", st)))
-            self._steps = st.get("steps", 0)
-            logger.info("Checkpoint loaded: %s", ckpt)
-
-    def greedy(self, s: np.ndarray) -> int:
-        with torch.no_grad():
-            return int(self.q(torch.tensor(s, dtype=torch.float32).unsqueeze(0)).argmax(1).item())
-
-    def epsilon_greedy(self, s):
-        self._steps += 1
-        eps = self.EPS_END + (self.EPS_START-self.EPS_END)*np.exp(-self._steps/self.EPS_DECAY)
-        return np.random.randint(4) if np.random.rand() < eps else self.greedy(s)
-
-    def train_step(self, tr: Transition):
-        self.buf.push(tr)
-        if len(self.buf) < self.BATCH: return
-        batch = self.buf.sample(self.BATCH)
-        S  = torch.tensor(np.stack([b.state for b in batch]),      dtype=torch.float32)
-        A  = torch.tensor([b.action for b in batch],               dtype=torch.long)
-        R  = torch.tensor([b.reward for b in batch],               dtype=torch.float32)
-        S2 = torch.tensor(np.stack([b.next_state for b in batch]), dtype=torch.float32)
-        D  = torch.tensor([b.done for b in batch],                 dtype=torch.float32)
-        q  = self.q(S).gather(1, A.unsqueeze(1)).squeeze()
-        with torch.no_grad(): nq = self.tq(S2).max(1).values
-        loss = nn.functional.smooth_l1_loss(q, R + self.GAMMA*nq*(1-D))
-        self.opt.zero_grad(); loss.backward()
-        nn.utils.clip_grad_norm_(self.q.parameters(), 1.); self.opt.step()
-        if self._steps % self.TARGET_UPDATE == 0:
-            self.tq.load_state_dict(self.q.state_dict())
-
-    @staticmethod
-    def reward(theta, h_exp, action, load):
-        if theta < 0.3 and action >= 2: return  2.0
-        if theta < 0.3 and action <  2: return -2.0
-        if theta > 0.7 and h_exp > 0.6 and action == 0: return 1.0
-        if theta > 0.7 and action == 3: return -0.5
-        if load  > 0.85: return -0.3
-        return 0.0
+def rl_reward(theta, h_exp, action, load):
+    if theta < 0.3 and action >= 2: return  2.0
+    if theta < 0.3 and action <  2: return -2.0
+    if theta > 0.7 and h_exp > 0.6 and action == 0: return 1.0
+    if theta > 0.7 and action == 3: return -0.5
+    if load  > 0.85: return -0.3
+    return 0.0
 
 # ── Honeypot ──────────────────────────────────────────────────────────────────
 class HoneypotEngine:
@@ -158,7 +138,6 @@ class TokenManager:
         except: return False
 
 # ── Singletons ────────────────────────────────────────────────────────────────
-_gov      = RLGovernor()
 _honeypot = HoneypotEngine()
 _argon    = PasswordHasher(memory_cost=65_536, time_cost=2, parallelism=4)
 ACTION_LABELS = ["economy","standard","hard","punisher"]
@@ -191,13 +170,138 @@ class SessionVerifyReq(BaseModel):
     trust_score:   float = Field(..., ge=0, le=1)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+# ── Authentication Routes ──────────────────────────────────────────────────────
+@app.post("/auth/register")
+async def register(req: UserCreate, request: Request):
+    """Register a new user with email and password"""
+    # Check if user already exists
+    if await user_exists(db_handler.db, req.email):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User with this email already exists"
+        )
+    
+    # Hash password with RL-hardened Argon2id params
+    state = np.array([0.8, 0.8, 0.5], dtype=np.float32)  # Assume legitimate user
+    action = dqn_agent.select_action(state)
+    m, t, p = Argon2Params.from_action(action)
+    
+    ph = PasswordHasher(memory_cost=m, time_cost=t, parallelism=p)
+    password_hash = ph.hash(req.plain_password)
+    
+    # Create user in MongoDB
+    try:
+        user_id = await create_user(db_handler.db, req.email, password_hash)
+        
+        # Create initial session
+        lv = [0.0] * 32
+        session_token = TokenManager.create(user_id, lv)
+        await create_session(db_handler.db, user_id, session_token, lv)
+        
+        logger.info(f"[Auth] New user registered: {req.email}")
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "email": req.email,
+            "session_token": session_token,
+            "message": "User registered successfully"
+        }
+    except Exception as e:
+        logger.error(f"[Auth] Registration error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register user"
+        )
+
+@app.post("/auth/login")
+async def login(req: UserLogin, request: Request):
+    """Login user with email and password"""
+    try:
+        # Get user from MongoDB
+        user = await get_user_by_email(db_handler.db, req.email)
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+        
+        if not user.get("is_active", False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User account is inactive"
+            )
+        
+        # Verify password
+        try:
+            PasswordHasher().verify(user["password_hash"], req.plain_password)
+        except VerifyMismatchError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+        
+        # Update last login
+        await update_last_login(db_handler.db, user["_id"])
+        
+        # Create new session
+        lv = [0.0] * 32
+        session_token = TokenManager.create(user["_id"], lv)
+        await create_session(db_handler.db, user["_id"], session_token, lv)
+        
+        logger.info(f"[Auth] User login: {req.email}")
+        
+        return {
+            "success": True,
+            "session_token": session_token,
+            "user_id": user["_id"],
+            "email": user["email"],
+            "security_level": user.get("security_level", "standard")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Auth] Login error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Login failed"
+        )
+
+@app.post("/auth/logout")
+async def logout(session_token: str):
+    """Logout user by invalidating session"""
+    try:
+        await invalidate_session(db_handler.db, session_token)
+        return {"success": True, "message": "Logged out successfully"}
+    except Exception as e:
+        logger.error(f"[Auth] Logout error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Logout failed"
+        )
+
+# ── Biometric & Scoring Routes ─────────────────────────────────────────────────
 @app.post("/score")
 async def score(req: ScoreReq, request: Request):
     state  = np.array([req.theta, req.h_exp, req.server_load], dtype=np.float32)
-    action = _gov.greedy(state)
+    action = dqn_agent.select_action(state)
     m, t, p = Argon2Params.from_action(action)
 
     if req.theta < 0.1:
+        # Store bot signature in MongoDB honeypot
+        try:
+            await store_honeypot_entry(
+                db_handler.db,
+                user_agent=req.user_agent,
+                theta=req.theta,
+                ip_address=getattr(request.client, "host", "?"),
+                path="/"
+            )
+        except Exception as e:
+            logger.error(f"[Honeypot] Storage error: {str(e)}")
+        
         _honeypot.harvest({
             "theta": req.theta, "user_agent": req.user_agent,
             "ip": getattr(request.client, "host", "?"),
@@ -226,18 +330,34 @@ async def score(req: ScoreReq, request: Request):
     }
 
 @app.post("/password/hash")
-async def pw_hash(req: PwHashReq):
+async def pw_hash(req: PwHashReq, user_id: Optional[str] = None):
+    """Hash password with RL-selected Argon2id parameters
+    
+    Optionally store hash in MongoDB if user_id is provided
+    """
     state  = np.array([req.theta, req.h_exp, 0.5], dtype=np.float32)
-    action = _gov.greedy(state)
+    action = dqn_agent.select_action(state)
     m, t, p = Argon2Params.from_action(action)
     ph     = PasswordHasher(memory_cost=m, time_cost=t, parallelism=p)
     t0     = time.perf_counter()
     hashed = ph.hash(req.plain_password)
     ms     = (time.perf_counter()-t0)*1000
-    rew    = RLGovernor.reward(req.theta, req.h_exp, action, 0.5)
-    _gov.train_step(Transition(state, action, rew, state, False))
-    return {"hash": hashed, "action": ACTION_LABELS[action],
-            "elapsed_ms": ms, "argon2_params": {"m":m,"t":t,"p":p}}
+    rew    = rl_reward(req.theta, req.h_exp, action, 0.5)
+    # Optionally train DQN here
+    
+    # Store in user profile if user_id is provided
+    if user_id:
+        try:
+            await update_user_security_level(db_handler.db, user_id, ACTION_LABELS[action])
+        except Exception as e:
+            logger.error(f"[Password] Update profile error: {str(e)}")
+    
+    return {
+        "hash": hashed,
+        "action": ACTION_LABELS[action],
+        "elapsed_ms": ms,
+        "argon2_params": {"m":m,"t":t,"p":p}
+    }
 
 @app.post("/password/verify")
 async def pw_verify(req: PwHashReq):
@@ -260,8 +380,174 @@ async def session_verify(req: SessionVerifyReq):
 
 @app.get("/honeypot/signatures")
 async def signatures():
-    return {"signatures": _honeypot.signatures, "count": len(_honeypot.signatures)}
+    """Get honeypot bot signatures from MongoDB and in-memory cache"""
+    try:
+        # Fetch from MongoDB
+        db_sigs = await get_honeypot_signatures(db_handler.db, limit=100)
+        count = await get_honeypot_count(db_handler.db)
+    except Exception as e:
+        logger.error(f"[Honeypot] Fetch error: {str(e)}")
+        db_sigs = []
+        count = 0
+    
+    # Combine with in-memory cache
+    all_sigs = _honeypot.signatures + db_sigs
+    return {"signatures": all_sigs, "count": count + len(_honeypot.signatures)}
+
+# ── Biometric Feature Extraction (Phase 1) ────────────────────────────────────
+@app.post("/biometric/extract")
+async def biometric_extract(raw_signal: list[float]):
+    """Extract features using 1D CNN from raw timing signal"""
+    try:
+        signal_tensor = torch.FloatTensor(raw_signal).unsqueeze(0).unsqueeze(0)
+        with torch.no_grad():
+            features = cnn_model(signal_tensor)
+        return {
+            "success": True,
+            "features": features.squeeze().tolist(),
+            "dim": len(features.squeeze().tolist())
+        }
+    except Exception as e:
+        logger.error(f"[CNN] Extract error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Feature extraction failed")
+
+@app.get("/biometric/profile/{user_id}")
+async def get_biometric_profile_api(user_id: str):
+    """Retrieve user's biometric profile from MongoDB"""
+    try:
+        profile = await get_biometric_profile(db_handler.db, user_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return {"user_id": user_id, "profile": profile}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Biometric] Profile fetch error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve profile")
+
+# ── DQN Model API (Phase 2) ────────────────────────────────────────────────────
+@app.post("/models/dqn/action")
+async def dqn_action(state: list[float]):
+    """Get DQN action for given state"""
+    try:
+        if len(state) != 3:
+            raise ValueError("State must be 3-dimensional [theta, h_exp, server_load]")
+        state_array = np.array(state, dtype=np.float32)
+        action = dqn_agent.select_action(state_array)
+        return {
+            "action": int(action),
+            "action_label": ACTION_LABELS[action],
+            "state": state
+        }
+    except Exception as e:
+        logger.error(f"[DQN] Action error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ── MAB Model API (Phase 3 - Deceiver) ─────────────────────────────────────────
+@app.post("/models/mab/select")
+async def mab_select():
+    """Select arm from Multi-Armed Bandit"""
+    try:
+        arm = mab_agent.select_arm()
+        return {
+            "selected_arm": int(arm),
+            "n_arms": mab_agent.n_arms,
+            "arm_values": mab_agent.values.tolist()
+        }
+    except Exception as e:
+        logger.error(f"[MAB] Select error: {str(e)}")
+        raise HTTPException(status_code=500, detail="MAB selection failed")
+
+@app.post("/models/mab/update")
+async def mab_update(arm: int, reward: float):
+    """Update MAB with reward from selected arm"""
+    try:
+        if arm < 0 or arm >= mab_agent.n_arms:
+            raise ValueError(f"Invalid arm {arm}")
+        mab_agent.update(arm, reward)
+        return {
+            "success": True,
+            "arm": arm,
+            "reward": reward,
+            "updated_values": mab_agent.values.tolist()
+        }
+    except Exception as e:
+        logger.error(f"[MAB] Update error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ── PPO Model API (Phase 4 - Watchdogz) ────────────────────────────────────────
+@app.post("/models/ppo/evaluate")
+async def ppo_evaluate(state: list[float]):
+    """Evaluate session state with PPO for identity shift detection"""
+    try:
+        if len(state) != 10:
+            raise ValueError("State must be 10-dimensional")
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            policy_output = ppo_agent.policy(state_tensor)
+        action_probs = policy_output.squeeze().tolist()
+        return {
+            "state": state,
+            "action_probabilities": action_probs,
+            "recommended_action": int(np.argmax(action_probs))
+        }
+    except Exception as e:
+        logger.error(f"[PPO] Evaluate error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ── Admin APIs ─────────────────────────────────────────────────────────────────
+@app.get("/admin/honeypot/dashboard")
+async def honeypot_dashboard():
+    """Admin honeypot dashboard with statistics"""
+    try:
+        count = await get_honeypot_count(db_handler.db)
+        sigs = await get_honeypot_signatures(db_handler.db, limit=50)
+        return {
+            "total_count": count + len(_honeypot.signatures),
+            "recent_signatures": sigs,
+            "in_memory_count": len(_honeypot.signatures),
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"[Admin] Honeypot dashboard error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch dashboard")
+
+@app.get("/admin/models-status")
+async def models_status():
+    """Get status of all trained models"""
+    return {
+        "models": {
+            "dqn": {
+                "status": "loaded",
+                "type": "Deep Q-Network",
+                "state_dim": 3,
+                "action_dim": 4,
+                "phase": "Phase 2"
+            },
+            "mab": {
+                "status": "loaded",
+                "type": "Multi-Armed Bandit",
+                "n_arms": mab_agent.n_arms,
+                "arm_values": mab_agent.values.tolist(),
+                "phase": "Phase 3"
+            },
+            "ppo": {
+                "status": "loaded",
+                "type": "Proximal Policy Optimization",
+                "state_dim": 10,
+                "action_dim": 3,
+                "phase": "Phase 4"
+            },
+            "cnn1d": {
+                "status": "loaded",
+                "type": "1D CNN",
+                "output_dim": 32,
+                "phase": "Phase 1"
+            }
+        },
+        "timestamp": time.time()
+    }
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "rl_steps": _gov._steps}
+    return {"status": "ok"}

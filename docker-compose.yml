@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # MongoDB for data persistence
+  mongodb:
+    image: mongo:latest
+    container_name: entropy-prime-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_DATABASE: entropy_prime
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - entropy-prime-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Backend with Honeypot
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: entropy-prime-backend
+    ports:
+      - "8000:8000"
+    environment:
+      MONGODB_URL: mongodb://admin:admin123@mongodb:27017/entropy_prime?authSource=admin
+      MONGODB_DB_NAME: entropy_prime
+      EP_SESSION_SECRET: a0bb498cf8819aac115f0deeb8d89b18478447e5b18270e8122f2e37d86f80eb
+      EP_SHADOW_SECRET: 15b2baa3e7234c3ea289e16c7eccb3353f47768f26d85790b2f50ecbd6e17d38
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - entropy-prime-net
+    volumes:
+      - ./backend:/app
+
+networks:
+  entropy-prime-net:
+    driver: bridge
+
+volumes:
+  mongodb_data:

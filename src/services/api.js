@@ -1,4 +1,7 @@
-const BASE = '/api'
+// Production: Use Docker backend
+// Development: Use local backend or Docker
+const BACKEND_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const BASE = BACKEND_URL
 
 async function req(path, method = 'GET', body = null) {
   const opts = {
