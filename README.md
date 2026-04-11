@@ -1,27 +1,3 @@
-# ENTROPY-PRIME
-│   │
-│   ├── pages/
-│   │   ├── LoginPage.jsx     ← Phase 1+2: biometric login with live signals
-│   │   ├── LoginPage.module.css
-│   │   ├── DashboardPage.jsx ← Phase 4: live θ/E_rec charts + session watchdog
-│   │   ├── DashboardPage.module.css
-│   │   ├── ThreatPage.jsx    ← Phase 3: honeypot signature viewer
-│   │   └── ThreatPage.module.css
-│   │
-│   ├── services/
-│   │   ├── biometrics.js     ← TF.js: 1D-CNN, Autoencoder, collectors
-│   │   └── api.js            ← all fetch calls to FastAPI
-│   │
-│   └── context/
-│       └── AuthContext.jsx   ← global auth state + watchdog heartbeat
-│
-├── backend/
-│   ├── main.py               ← FastAPI: all 4 phases + CORS
-│   ├── train.py              ← DQN offline pre-trainer
-│   └── requirements.txt
-│
-├── package.json
-
 # ⚡ ENTROPY PRIME — Zero-Trust Behavioral Biometrics Engine
 
 A next-generation, production-ready authentication system that moves beyond reputation-based security (cookies, browser fingerprints) to **biological-physics security**. It analyzes neuromuscular jitter and temporal DNA via ML models running entirely in the browser.
