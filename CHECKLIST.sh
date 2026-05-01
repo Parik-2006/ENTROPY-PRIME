@@ -1,7 +1,97 @@
 #!/bin/bash
-# ENTROPY PRIME - MongoDB Setup Checklist
-# Follow these steps to get MongoDB configured and running
+# Entropy Prime - Setup Checklist & Automated Validation
+# Run with: bash CHECKLIST.sh [--auto] [--verbose]
+# Use --auto flag to run automated checks instead of manual checklist
 
+AUTO_MODE=0
+VERBOSE=0
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        --auto) AUTO_MODE=1 ;;
+        --verbose) VERBOSE=1 ;;
+    esac
+done
+
+if [ $AUTO_MODE -eq 1 ]; then
+    # Run automated validation
+    echo "🔍 Running Entropy Prime Setup Validation..."
+    echo ""
+    
+    # Check Python
+    if ! command -v python3 &> /dev/null; then
+        echo "❌ Python 3 not found"
+        exit 1
+    fi
+    echo "✓ Python 3: $(python3 --version)"
+    
+    # Check Node
+    if ! command -v node &> /dev/null; then
+        echo "❌ Node.js not found"
+        exit 1
+    fi
+    echo "✓ Node: $(node --version)"
+    
+    # Check .env
+    if [ ! -f .env ]; then
+        echo "❌ .env file not found. Run: cp .env.example .env"
+        exit 1
+    fi
+    echo "✓ .env file exists"
+    
+    # Check MongoDB
+    if ! grep -q "MONGODB_URL" .env; then
+        echo "⚠️  MONGODB_URL not configured in .env"
+    else
+        MONGO_URL=$(grep "MONGODB_URL" .env | cut -d'=' -f2)
+        echo "✓ MongoDB URL configured: $MONGO_URL"
+    fi
+    
+    # Check dependencies
+    if [ -d "backend" ] && [ -f "backend/requirements.txt" ]; then
+        echo "✓ Backend requirements.txt found"
+        if [ $VERBOSE -eq 1 ]; then
+            PIP_PKGS=$(python3 -m pip list 2>/dev/null | grep -c "torch\|fastapi\|pymongo" || echo "0")
+            echo "  Installed packages: $PIP_PKGS/3 core packages"
+        fi
+    fi
+    
+    if [ -f "package.json" ]; then
+        echo "✓ package.json found"
+        if [ -d "node_modules" ]; then
+            echo "✓ node_modules installed"
+        fi
+    fi
+    
+    # Check ports
+    if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo "✓ Port 8000 is in use (backend running)"
+    else
+        echo "⚠️  Port 8000 not in use - backend may not be running"
+    fi
+    
+    if lsof -Pi :3000 -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo "✓ Port 3000 is in use (frontend running)"
+    else
+        echo "⚠️  Port 3000 not in use - frontend may not be running"
+    fi
+    
+    # Test MongoDB connection
+    if command -v mongosh &> /dev/null; then
+        if mongosh --quiet "$(grep MONGODB_URL .env | cut -d'=' -f2)" --eval "db.adminCommand('ping')" &>/dev/null; then
+            echo "✓ MongoDB connection successful"
+        else
+            echo "⚠️  MongoDB connection failed"
+        fi
+    fi
+    
+    echo ""
+    echo "✅ Validation complete"
+    exit 0
+fi
+
+# Manual checklist mode
 cat << 'EOF'
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                  ENTROPY PRIME - MongoDB Integration Checklist               ║

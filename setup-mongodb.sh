@@ -1,9 +1,9 @@
 #!/bin/bash
-
 # Entropy Prime - MongoDB Setup Script
-# This script sets up MongoDB connection and initializes the project
+# Production-hardened setup with validation and error handling
 
-set -e
+set -euo pipefail
+trap 'echo "❌ Setup failed. Please check .env configuration." && exit 1' ERR
 
 echo "╔════════════════════════════════════════════════════════════════════════╗"
 echo "║       Entropy Prime + MongoDB Initialization Script                    ║"
@@ -103,39 +103,90 @@ echo "║              Installing Dependencies                                  
 echo "╚════════════════════════════════════════════════════════════════════════╝"
 echo ""
 
+# Check Python
+if ! command -v python3 &> /dev/null; then
+    echo "❌ Python 3 not found. Please install Python 3.8+"
+    exit 1
+fi
+PYTHON_VER=$(python3 --version 2>&1 | awk '{print $2}')
+echo "✓ Python $PYTHON_VER found"
+
+# Check Node
+if ! command -v npm &> /dev/null; then
+    echo "⚠️  npm not found. Frontend dependencies will be skipped."
+else
+    NODE_VER=$(node --version)
+    echo "✓ Node $NODE_VER found"
+fi
+echo ""
+
 # Install backend dependencies
 echo "[1/2] Installing backend dependencies..."
-cd backend
-pip install -r requirements.txt --quiet
-echo "✓ Backend dependencies installed"
+if [ -d "backend" ]; then
+    cd backend
+    if [ ! -f requirements.txt ]; then
+        echo "❌ requirements.txt not found in backend/"
+        exit 1
+    fi
+    if pip install -r requirements.txt --quiet; then
+        echo "✓ Backend dependencies installed"
+    else
+        echo "⚠️  Some backend dependencies may have failed. Check manually."
+    fi
+    cd ..
+else
+    echo "❌ backend/ directory not found"
+    exit 1
+fi
 
 # Install frontend dependencies
 echo "[2/2] Installing frontend dependencies..."
-cd ..
-npm install --silent --legacy-peer-deps 2>/dev/null || true
-echo "✓ Frontend dependencies installed"
+if [ -f "package.json" ]; then
+    if command -v npm &> /dev/null; then
+        if npm install --silent --legacy-peer-deps 2>/dev/null; then
+            echo "✓ Frontend dependencies installed"
+        else
+            echo "⚠️  Some frontend dependencies may have failed. Check manually."
+        fi
+    else
+        echo "⚠️  npm not found - skipping frontend dependencies"
+    fi
+else
+    echo "⚠️  package.json not found"
+fi
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════════════╗"
 echo "║                    Setup Complete! ✓                                    ║"
 echo "╚════════════════════════════════════════════════════════════════════════╝"
 echo ""
+echo "✅ Environment configured successfully"
+echo ""
 echo "Next steps:"
 echo ""
-echo "1️⃣  Test MongoDB Connection (optional):"
-echo "    python backend/main.py"
+echo "1️⃣  Verify MongoDB Connection:"
+echo "    python3 backend/main.py"
+echo "    Look for: ✓ Connected to MongoDB: entropy_prime"
+echo "    Press Ctrl+C to stop"
 echo ""
-echo "2️⃣  Pre-train RL Model (optional but recommended):"
+echo "2️⃣  (Optional) Pre-train RL Model:"
 echo "    cd backend"
 echo "    python train.py --episodes 100000 --out ../checkpoints/governor.pt"
+echo "    cd .."
 echo ""
 echo "3️⃣  Run Full Stack:"
-echo "    ./start.sh"
+echo "    For Docker:     docker-compose up -d && ./complete-setup.sh"
+echo "    For Local:      ./start.sh"
 echo ""
-echo "4️⃣  Create Test User:"
+echo "4️⃣  Test User Registration:"
 echo "    curl -X POST http://localhost:8000/auth/register \\\\"
 echo "      -H 'Content-Type: application/json' \\\\"
-echo "      -d '{\"email\": \"test@example.com\", \"plain_password\": \"TestPass123!\"}'"
+echo "      -d '{\"email\":\"test@example.com\",\"plain_password\":\"Test123!\"}'"
 echo ""
-echo "📖 More info: See MONGODB_SETUP.md"
+echo "5️⃣  Start Frontend:"
+echo "    npm run dev"
+echo "    Navigate to: http://localhost:3000"
+echo ""
+echo "📖 Documentation: See MONGODB_SETUP.md for more details"
+echo "🆘 Troubleshooting: Check docker-compose logs or backend logs"
 echo ""
