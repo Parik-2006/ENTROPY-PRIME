@@ -5,9 +5,8 @@ import { sendWatchdogHeartbeat, saveUserBiometricProfile } from '../services/api
 const AuthCtx = createContext(null)
 
 export function AuthProvider({ children }) {
-  const [user,       setUser]       = useState(() => {
-    try { return JSON.parse(localStorage.getItem('ep_user')) } catch { return null }
-  })
+  const [user,       setUser]       = useState(null)
+  const [loading,    setLoading]    = useState(true)
   const [epReady,    setEpReady]    = useState(false)
   const [liveTheta,  setLiveTheta]  = useState(null)
   const [trustScore, setTrustScore] = useState(1.0)
@@ -18,6 +17,30 @@ export function AuthProvider({ children }) {
   const [selectedFeatures, setSelectedFeatures] = useState([])
 
   const clientRef = useRef(null)
+
+  // Restore session from localStorage on boot
+  useEffect(() => {
+    const restoreUser = async () => {
+      try {
+        const storedUser = localStorage.getItem('ep_user')
+        const storedToken = localStorage.getItem('ep_token')
+        
+        if (storedUser && storedToken) {
+          const parsedUser = JSON.parse(storedUser)
+          // In a real app, we'd verify the token with the backend here
+          setUser(parsedUser)
+        }
+      } catch (e) {
+        console.error('Failed to restore session:', e)
+        localStorage.removeItem('ep_user')
+        localStorage.removeItem('ep_token')
+      } finally {
+        setLoading(false)
+      }
+    }
+    restoreUser()
+  }, [])
+
 
   // Boot biometrics engine
   useEffect(() => {
@@ -121,9 +144,25 @@ export function AuthProvider({ children }) {
 
   const getClient = useCallback(() => clientRef.current, [])
 
+  const restoreSession = useCallback(async () => {
+    setLoading(true)
+    try {
+      const storedToken = localStorage.getItem('ep_token')
+      const storedUser = localStorage.getItem('ep_user')
+      if (storedToken && storedUser) {
+        // Here we could add a call to /session/verify to ensure token is still valid
+        setUser(JSON.parse(storedUser))
+      }
+    } catch (e) {
+      logout()
+    } finally {
+      setLoading(false)
+    }
+  }, [logout])
+
   return (
     <AuthCtx.Provider value={{
-      user, login, logout,
+      user, loading, login, logout, restoreSession,
       epReady, liveTheta, trustScore, anomaly, sigCount,
       profileStats, liveDrift, selectedFeatures,
       getClient,
