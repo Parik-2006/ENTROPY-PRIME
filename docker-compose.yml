@@ -17,13 +17,14 @@ services:
       - mongodb_config:/data/configdb
     networks:
       - entropy-prime-net
-    resources:
-      limits:
-        cpus: '1.0'
-        memory: 1G
-      reservations:
-        cpus: '0.5'
-        memory: 512M
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -54,13 +55,14 @@ services:
         condition: service_healthy
     networks:
       - entropy-prime-net
-    resources:
-      limits:
-        cpus: '2.0'
-        memory: 2G
-      reservations:
-        cpus: '1.0'
-        memory: 1G
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
