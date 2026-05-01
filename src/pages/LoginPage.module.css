@@ -1,3 +1,4 @@
+/* ── Base page ─────────────────────────────────────────────────────────── */
 .page {
   min-height: 100vh;
   display: flex;
@@ -17,7 +18,7 @@
   z-index: 100;
 }
 
-/* Left panel */
+/* ── Left panel ────────────────────────────────────────────────────────── */
 .left {
   width: 420px;
   flex-shrink: 0;
@@ -25,7 +26,7 @@
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 40px;
+  gap: 32px;
   background: var(--bg2);
   position: relative;
   overflow: hidden;
@@ -67,7 +68,7 @@
   margin-top: 2px;
 }
 
-.phases { display: flex; flex-direction: column; gap: 20px; }
+.phases { display: flex; flex-direction: column; gap: 16px; }
 
 .phaseItem { display: flex; gap: 14px; align-items: flex-start; }
 
@@ -86,6 +87,48 @@
 
 .phaseDesc { font-size: 11px; color: var(--text2); line-height: 1.5; }
 
+/* ── Feature selection panel ───────────────────────────────────────────── */
+.featurePanel {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.featurePanelTitle {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 2px;
+  color: var(--text3);
+}
+
+.featureChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.featureChip {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text3);
+  transition: all .3s ease;
+}
+
+.featureSub {
+  font-family: var(--mono);
+  font-size: 8px;
+  color: var(--text3);
+  letter-spacing: 0.5px;
+}
+
 .tagline {
   margin-top: auto;
   font-size: 13px; color: var(--text2);
@@ -95,7 +138,7 @@
 }
 .tagline em { color: var(--accent); font-style: normal; }
 
-/* Right panel */
+/* ── Right panel ───────────────────────────────────────────────────────── */
 .right {
   flex: 1;
   display: flex;
@@ -114,6 +157,7 @@
   animation: fadeIn .5s ease both;
 }
 
+/* ── Card header ───────────────────────────────────────────────────────── */
 .cardHeader {
   display: flex; align-items: center; gap: 8px;
   padding: 12px 20px;
@@ -132,13 +176,56 @@
   font-family: var(--mono);
   font-size: 10px; letter-spacing: 2px;
   color: var(--text2);
+  flex: 1;
 }
 
-/* Signal panel */
+.driftBadge {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(255,184,0,.08);
+  border: 1px solid rgba(255,184,0,.2);
+}
+
+/* ── Profile progress bar ──────────────────────────────────────────────── */
+.profileProgress {
+  padding: 8px 20px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.profileProgressLabel {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  width: 160px;
+  flex-shrink: 0;
+}
+
+.profileProgressTrack {
+  flex: 1;
+  height: 2px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.profileProgressFill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width .5s ease, background .3s;
+}
+
+/* ── Signal panel ──────────────────────────────────────────────────────── */
 .signalPanel {
   display: flex;
   gap: 0;
-  padding: 20px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
@@ -159,12 +246,13 @@
 }
 .metaVal { display: block; font-family: var(--mono); font-size: 16px; font-weight: 700; }
 
-.signalRight { flex: 1; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; }
+.signalRight { flex: 1; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
 
 .signalRow { display: flex; align-items: center; gap: 8px; }
 .signalLabel {
-  font-family: var(--mono); font-size: 8px; letter-spacing: 1.5px;
+  font-family: var(--mono); font-size: 8px; letter-spacing: 1px;
   color: var(--text3); width: 46px; flex-shrink: 0;
+  transition: color .3s;
 }
 .signalTrack {
   flex: 1; height: 3px;
@@ -182,13 +270,13 @@
 .traceWrap { margin-top: 4px; }
 .trace { display: block; }
 
-/* Form */
-.form { padding: 24px 20px; display: flex; flex-direction: column; gap: 12px; }
+/* ── Form ──────────────────────────────────────────────────────────────── */
+.form { padding: 20px 20px 16px; display: flex; flex-direction: column; gap: 10px; }
 
 .label {
   font-family: var(--mono);
   font-size: 9px; letter-spacing: 2px;
-  color: var(--text3); margin-bottom: -6px;
+  color: var(--text3); margin-bottom: -4px;
 }
 
 .input {
@@ -238,7 +326,7 @@
 .hashLabel { font-family: var(--mono); font-size: 9px; letter-spacing: 1.5px; color: var(--text3); }
 .hashVal { font-family: var(--mono); font-size: 11px; color: var(--text); }
 
-/* Footer */
+/* ── Card footer ───────────────────────────────────────────────────────── */
 .cardFooter {
   display: flex; justify-content: space-between;
   padding: 10px 20px;
@@ -249,7 +337,7 @@
 }
 .cardFooter b { color: var(--accent); }
 
-/* Responsive */
+/* ── Responsive ────────────────────────────────────────────────────────── */
 @media (max-width: 860px) {
   .page { flex-direction: column; }
   .left { width: 100%; border-right: none; border-bottom: 1px solid var(--border); padding: 28px 24px; }

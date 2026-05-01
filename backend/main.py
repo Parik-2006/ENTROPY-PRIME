@@ -1,21 +1,19 @@
 """
 Entropy Prime — FastAPI Backend (production-ready with MongoDB)
-Phases 2, 3, 4 — RL Governor · Honeypot · Session Watchdog · User Authentication
+Per-User Biometric Intelligence: feature extraction, per-user selection,
+drift detection, behavioral profile storage.
 """
 from __future__ import annotations
 
 import hashlib, hmac, logging, os, secrets, time
-from collections import deque
-from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import numpy as np
-import torch, torch.nn as nn, torch.optim as optim
+import torch
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from database import Database
@@ -23,12 +21,16 @@ from database import (
     user_exists, create_user, get_user_by_email, get_user_by_id,
     update_last_login, update_user_security_level,
     create_session, get_session, invalidate_session, update_session_trust_score,
-    store_biometric_sample, get_biometric_profile,
-    store_honeypot_entry, get_honeypot_signatures, get_honeypot_count
+    store_biometric_sample, get_biometric_profile, get_biometric_profile_summary,
+    upsert_biometric_profile,
+    log_drift_event, get_drift_events, get_drift_summary,
+    record_feature_selection, get_feature_selection_history,
+    store_honeypot_entry, get_honeypot_signatures, get_honeypot_count,
 )
 from models import (
     UserCreate, UserLogin, UserResponse, AuthResponse,
-    PasswordHashResponse
+    PasswordHashResponse, BiometricProfileUpdateRequest, SessionVerifyRequest,
+    FEATURE_NAMES,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +40,7 @@ logger = logging.getLogger("entropy_prime")
 db_handler = Database()
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Entropy Prime", version="2.0.0 (MongoDB)")
+app = FastAPI(title="Entropy Prime", version="3.0.0 (Per-User Biometrics)")
 
 app.add_middleware(CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -49,13 +51,11 @@ app.add_middleware(CORSMiddleware,
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize MongoDB on startup"""
     await db_handler.connect_to_mongo()
-    logger.info("✓ Entropy Prime backend initialized with MongoDB")
+    logger.info("✓ Entropy Prime backend initialized with per-user biometric profiles")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Close MongoDB connection on shutdown"""
     await db_handler.close_mongo_connection()
 
 SESSION_SECRET = os.environ.get("EP_SESSION_SECRET", secrets.token_hex(32))
@@ -72,26 +72,85 @@ class Argon2Params:
     def from_action(cls, idx: int):
         return [cls.ECONOMY, cls.STANDARD, cls.HARD, cls.PUNISHER][idx]
 
+ACTION_LABELS = ["economy", "standard", "hard", "punisher"]
 
-# ── Modular Model Imports ─────────────────────────────────────────────────────
-from models.dqn import DQNAgent
-from models.mab import MABAgent
-from models.ppo import PPOAgent
+# ── Model Imports ─────────────────────────────────────────────────────────────
+from models.dqn   import DQNAgent
+from models.mab   import MABAgent
+from models.ppo   import PPOAgent
 from models.cnn1d import CNN1D
 
-# Instantiate models (replace with checkpoint loading as needed)
 dqn_agent = DQNAgent(state_dim=3, action_dim=4)
 mab_agent = MABAgent(n_arms=3)
 ppo_agent = PPOAgent(state_dim=10, action_dim=3)
 cnn_model = CNN1D(input_channels=1, out_dim=32)
 
-def rl_reward(theta, h_exp, action, load):
-    if theta < 0.3 and action >= 2: return  2.0
-    if theta < 0.3 and action <  2: return -2.0
-    if theta > 0.7 and h_exp > 0.6 and action == 0: return 1.0
-    if theta > 0.7 and action == 3: return -0.5
-    if load  > 0.85: return -0.3
-    return 0.0
+# ── Per-User Feature Selector (server-side mirror) ────────────────────────────
+class ServerFeatureSelector:
+    """
+    Server-side mirror of the browser UserFeatureSelector.
+    Validates and cross-checks the browser-reported selected_features.
+    Uses stored feature_means from MongoDB to confirm selection stability.
+    """
+    N_FEATURES = 8
+    K          = 6
+
+    @staticmethod
+    def validate_selection(selected: list, feature_means: list) -> dict:
+        """
+        Cross-validate browser-reported feature selection against
+        the server-stored feature means using CV ranking.
+        Returns confidence score and any discrepancies.
+        """
+        if not feature_means or len(feature_means) != ServerFeatureSelector.N_FEATURES:
+            return {"confidence": 0.5, "discrepancies": [], "server_ranking": []}
+
+        # Compute rough CV from means (we don't have variance server-side without history)
+        # Use inverse of mean as a proxy for discriminativeness (low mean → high CV potential)
+        cvs = [(1.0 / max(m, 0.01)) for m in feature_means]
+        server_top_k = sorted(range(len(cvs)), key=lambda i: cvs[i], reverse=True)[:ServerFeatureSelector.K]
+        server_names = [FEATURE_NAMES[i] for i in server_top_k]
+
+        selected_set = set(selected)
+        server_set   = set(server_names)
+        overlap      = len(selected_set & server_set)
+        confidence   = overlap / max(len(server_set), 1)
+        discrepancies = list(selected_set - server_set)
+
+        return {
+            "confidence":    confidence,
+            "discrepancies": discrepancies,
+            "server_ranking": server_names,
+        }
+
+# ── Drift Governor ────────────────────────────────────────────────────────────
+class DriftGovernor:
+    """
+    Server-side per-user drift policy.
+    Decides action based on behavioral drift score + e_rec + trust.
+    """
+    @staticmethod
+    def evaluate(
+        trust_score: float,
+        e_rec: float,
+        behavioral_drift: float,
+        adaptive_threshold: float,
+        sample_count: int,
+    ) -> tuple[str, str]:
+        """Returns (action, reason)."""
+        # Need enough samples before strict enforcement
+        if sample_count < 20:
+            return "ok", "profile_building"
+
+        drift_ratio = behavioral_drift / max(adaptive_threshold, 0.01)
+
+        if trust_score < 0.25 or (drift_ratio > 3.0 and e_rec > 0.25):
+            return "disable_sensitive_apis", "severe_identity_shift"
+        if trust_score < 0.5 or drift_ratio > 2.0:
+            return "passive_reauth", "identity_drift_elevated"
+        if drift_ratio > 1.5 or e_rec > 0.18:
+            return "flag_session", "mild_drift"
+        return "ok", "identity_stable"
 
 # ── Honeypot ──────────────────────────────────────────────────────────────────
 class HoneypotEngine:
@@ -104,24 +163,24 @@ class HoneypotEngine:
 
     def harvest(self, data: dict):
         self._log.append({
-            "ts": time.time(), "ua": data.get("user_agent",""),
-            "theta": data.get("theta",0), "path": data.get("path","/"),
-            "headers": data.get("headers",{})
+            "ts": time.time(), "ua": data.get("user_agent", ""),
+            "theta": data.get("theta", 0), "path": data.get("path", "/"),
+            "headers": data.get("headers", {}),
         })
-        logger.warning("[Honeypot] θ=%.3f UA=%s", data.get("theta",0), data.get("user_agent","")[:60])
+        logger.warning("[Honeypot] θ=%.3f UA=%s", data.get("theta", 0), data.get("user_agent", "")[:60])
 
     def is_shadow(self, token: str) -> bool: return token.startswith("ep_shadow_")
     @property
     def signatures(self): return list(self._log)
 
-# ── Session Token ─────────────────────────────────────────────────────────────
+# ── Token Manager ─────────────────────────────────────────────────────────────
 class TokenManager:
     @staticmethod
     def create(uid: str, lv: list) -> str:
         vh  = hashlib.sha256(str(lv).encode()).hexdigest()[:16]
         pay = f"{uid}:{time.time():.0f}:{vh}"
         sig = hmac.new(SESSION_SECRET.encode(), pay.encode(), hashlib.sha256).hexdigest()
-        return secrets.token_urlsafe(8) + "." + (pay+":"+sig).encode().hex()
+        return secrets.token_urlsafe(8) + "." + (pay + ":" + sig).encode().hex()
 
     @staticmethod
     def verify(token, uid, lv) -> bool:
@@ -135,14 +194,21 @@ class TokenManager:
             if hashlib.sha256(str(lv).encode()).hexdigest()[:16] != vh: return False
             if time.time() - float(ts) > 1800: return False
             return True
-        except: return False
+        except:
+            return False
 
-# ── Singletons ────────────────────────────────────────────────────────────────
 _honeypot = HoneypotEngine()
 _argon    = PasswordHasher(memory_cost=65_536, time_cost=2, parallelism=4)
-ACTION_LABELS = ["economy","standard","hard","punisher"]
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
+def rl_reward(theta, h_exp, action, load):
+    if theta < 0.3 and action >= 2: return  2.0
+    if theta < 0.3 and action <  2: return -2.0
+    if theta > 0.7 and h_exp > 0.6 and action == 0: return 1.0
+    if theta > 0.7 and action == 3: return -0.5
+    if load  > 0.85: return -0.3
+    return 0.0
+
+# ── Pydantic Request Models ───────────────────────────────────────────────────
 class ScoreReq(BaseModel):
     theta:         float = Field(..., ge=0, le=1)
     h_exp:         float = Field(..., ge=0, le=1)
@@ -158,131 +224,79 @@ class ScoreReq(BaseModel):
 
 class PwHashReq(BaseModel):
     plain_password: str
-    stored_hash:    str = ""
+    stored_hash:    str   = ""
     theta:          float = 0.5
     h_exp:          float = 0.5
 
-class SessionVerifyReq(BaseModel):
-    session_token: str
-    user_id:       str
-    latent_vector: list[float]
-    e_rec:         float = Field(..., ge=0)
-    trust_score:   float = Field(..., ge=0, le=1)
-
-# ── Routes ────────────────────────────────────────────────────────────────────
-
-# ── Authentication Routes ──────────────────────────────────────────────────────
+# ── Auth Routes ───────────────────────────────────────────────────────────────
 @app.post("/auth/register")
 async def register(req: UserCreate, request: Request):
-    """Register a new user with email and password"""
-    # Check if user already exists
     if await user_exists(db_handler.db, req.email):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User with this email already exists"
-        )
-    
-    # Hash password with RL-hardened Argon2id params
-    state = np.array([0.8, 0.8, 0.5], dtype=np.float32)  # Assume legitimate user
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="User with this email already exists")
+    state  = np.array([0.8, 0.8, 0.5], dtype=np.float32)
     action = dqn_agent.select_action(state)
     m, t, p = Argon2Params.from_action(action)
-    
-    ph = PasswordHasher(memory_cost=m, time_cost=t, parallelism=p)
+    ph     = PasswordHasher(memory_cost=m, time_cost=t, parallelism=p)
     password_hash = ph.hash(req.plain_password)
-    
-    # Create user in MongoDB
     try:
         user_id = await create_user(db_handler.db, req.email, password_hash)
-        
-        # Create initial session
-        lv = [0.0] * 32
+        lv      = [0.0] * 32
         session_token = TokenManager.create(user_id, lv)
         await create_session(db_handler.db, user_id, session_token, lv)
-        
         logger.info(f"[Auth] New user registered: {req.email}")
-        
         return {
             "success": True,
             "user_id": user_id,
-            "email": req.email,
+            "email":   req.email,
             "session_token": session_token,
-            "message": "User registered successfully"
+            "message": "User registered successfully",
         }
     except Exception as e:
-        logger.error(f"[Auth] Registration error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to register user"
-        )
+        logger.error(f"[Auth] Registration error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to register user")
 
 @app.post("/auth/login")
 async def login(req: UserLogin, request: Request):
-    """Login user with email and password"""
     try:
-        # Get user from MongoDB
         user = await get_user_by_email(db_handler.db, req.email)
-        
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-        
+            raise HTTPException(status_code=401, detail="Invalid email or password")
         if not user.get("is_active", False):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User account is inactive"
-            )
-        
-        # Verify password
+            raise HTTPException(status_code=403, detail="User account is inactive")
         try:
             PasswordHasher().verify(user["password_hash"], req.plain_password)
         except VerifyMismatchError:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-        
-        # Update last login
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
         await update_last_login(db_handler.db, user["_id"])
-        
-        # Create new session
         lv = [0.0] * 32
         session_token = TokenManager.create(user["_id"], lv)
         await create_session(db_handler.db, user["_id"], session_token, lv)
-        
         logger.info(f"[Auth] User login: {req.email}")
-        
         return {
-            "success": True,
-            "session_token": session_token,
-            "user_id": user["_id"],
-            "email": user["email"],
-            "security_level": user.get("security_level", "standard")
+            "success":        True,
+            "session_token":  session_token,
+            "user_id":        user["_id"],
+            "email":          user["email"],
+            "security_level": user.get("security_level", "standard"),
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[Auth] Login error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login failed"
-        )
+        logger.error(f"[Auth] Login error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
 
 @app.post("/auth/logout")
 async def logout(session_token: str):
-    """Logout user by invalidating session"""
     try:
         await invalidate_session(db_handler.db, session_token)
         return {"success": True, "message": "Logged out successfully"}
     except Exception as e:
-        logger.error(f"[Auth] Logout error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Logout failed"
-        )
+        logger.error(f"[Auth] Logout error: {e}")
+        raise HTTPException(status_code=500, detail="Logout failed")
 
-# ── Biometric & Scoring Routes ─────────────────────────────────────────────────
+# ── Score Route ───────────────────────────────────────────────────────────────
 @app.post("/score")
 async def score(req: ScoreReq, request: Request):
     state  = np.array([req.theta, req.h_exp, req.server_load], dtype=np.float32)
@@ -290,74 +304,59 @@ async def score(req: ScoreReq, request: Request):
     m, t, p = Argon2Params.from_action(action)
 
     if req.theta < 0.1:
-        # Store bot signature in MongoDB honeypot
         try:
             await store_honeypot_entry(
                 db_handler.db,
                 user_agent=req.user_agent,
                 theta=req.theta,
                 ip_address=getattr(request.client, "host", "?"),
-                path="/"
+                path="/",
             )
         except Exception as e:
-            logger.error(f"[Honeypot] Storage error: {str(e)}")
-        
+            logger.error(f"[Honeypot] Storage error: {e}")
         _honeypot.harvest({
             "theta": req.theta, "user_agent": req.user_agent,
             "ip": getattr(request.client, "host", "?"),
         })
         return {
-            "session_token":  _honeypot.synthetic_token({"ip": getattr(request.client,"host","?")}),
+            "session_token":  _honeypot.synthetic_token({"ip": getattr(request.client, "host", "?")}),
             "shadow_mode":    True,
-            "argon2_params":  {"m":m,"t":t,"p":p},
+            "argon2_params":  {"m": m, "t": t, "p": p},
             "humanity_score": req.theta,
             "entropy_score":  req.h_exp,
             "action_label":   ACTION_LABELS[action],
         }
 
     uid   = "usr_" + secrets.token_hex(6)
-    lv    = req.latent_vector or [0.]*32
+    lv    = req.latent_vector or [0.] * 32
     token = TokenManager.create(uid, lv)
     logger.info("[Score] θ=%.3f H=%.3f → %s (m=%d)", req.theta, req.h_exp, ACTION_LABELS[action], m)
-
     return {
         "session_token":  token,
         "shadow_mode":    False,
-        "argon2_params":  {"m":m,"t":t,"p":p},
+        "argon2_params":  {"m": m, "t": t, "p": p},
         "humanity_score": req.theta,
         "entropy_score":  req.h_exp,
         "action_label":   ACTION_LABELS[action],
     }
 
+# ── Password Routes ───────────────────────────────────────────────────────────
 @app.post("/password/hash")
 async def pw_hash(req: PwHashReq, user_id: Optional[str] = None):
-    """Hash password with RL-selected Argon2id parameters
-    
-    Optionally store hash in MongoDB if user_id is provided
-    """
     state  = np.array([req.theta, req.h_exp, 0.5], dtype=np.float32)
     action = dqn_agent.select_action(state)
     m, t, p = Argon2Params.from_action(action)
     ph     = PasswordHasher(memory_cost=m, time_cost=t, parallelism=p)
     t0     = time.perf_counter()
     hashed = ph.hash(req.plain_password)
-    ms     = (time.perf_counter()-t0)*1000
-    rew    = rl_reward(req.theta, req.h_exp, action, 0.5)
-    # Optionally train DQN here
-    
-    # Store in user profile if user_id is provided
+    ms     = (time.perf_counter() - t0) * 1000
     if user_id:
         try:
             await update_user_security_level(db_handler.db, user_id, ACTION_LABELS[action])
         except Exception as e:
-            logger.error(f"[Password] Update profile error: {str(e)}")
-    
-    return {
-        "hash": hashed,
-        "action": ACTION_LABELS[action],
-        "elapsed_ms": ms,
-        "argon2_params": {"m":m,"t":t,"p":p}
-    }
+            logger.error(f"[Password] Update profile error: {e}")
+    return {"hash": hashed, "action": ACTION_LABELS[action], "elapsed_ms": ms,
+            "argon2_params": {"m": m, "t": t, "p": p}}
 
 @app.post("/password/verify")
 async def pw_verify(req: PwHashReq):
@@ -367,53 +366,106 @@ async def pw_verify(req: PwHashReq):
     except VerifyMismatchError:
         return {"valid": False}
 
+# ── Session Verify (Per-User Drift Aware) ─────────────────────────────────────
 @app.post("/session/verify")
-async def session_verify(req: SessionVerifyReq):
-    action = "ok"
-    if req.trust_score < 0.25:
-        action = "disable_sensitive_apis"
-        logger.warning("[Watchdog] Severe shift trust=%.2f e_rec=%.4f", req.trust_score, req.e_rec)
-    elif req.trust_score < 0.5:
-        action = "passive_reauth"
-        logger.info("[Watchdog] Passive reauth trust=%.2f", req.trust_score)
-    return {"action": action, "trust_score": req.trust_score, "e_rec": req.e_rec}
+async def session_verify(req: SessionVerifyRequest, request: Request):
+    """
+    Extended watchdog heartbeat.
+    Incorporates per-user behavioral drift and adaptive threshold.
+    Logs drift events for forensic audit.
+    """
+    action, reason = DriftGovernor.evaluate(
+        trust_score=req.trust_score,
+        e_rec=req.e_rec,
+        behavioral_drift=req.behavioral_drift,
+        adaptive_threshold=req.adaptive_threshold,
+        sample_count=req.sample_count,
+    )
 
-@app.get("/honeypot/signatures")
-async def signatures():
-    """Get honeypot bot signatures from MongoDB and in-memory cache"""
-    try:
-        # Fetch from MongoDB
-        db_sigs = await get_honeypot_signatures(db_handler.db, limit=100)
-        count = await get_honeypot_count(db_handler.db)
-    except Exception as e:
-        logger.error(f"[Honeypot] Fetch error: {str(e)}")
-        db_sigs = []
-        count = 0
-    
-    # Combine with in-memory cache
-    all_sigs = _honeypot.signatures + db_sigs
-    return {"signatures": all_sigs, "count": count + len(_honeypot.signatures)}
+    if action != "ok":
+        logger.warning(
+            "[Watchdog] user=%s action=%s reason=%s drift=%.3f e_rec=%.4f trust=%.2f",
+            req.user_id, action, reason,
+            req.behavioral_drift, req.e_rec, req.trust_score,
+        )
+        # Log drift event to MongoDB
+        try:
+            await log_drift_event(
+                db_handler.db,
+                user_id=req.user_id,
+                drift_score=req.behavioral_drift,
+                adaptive_threshold=req.adaptive_threshold,
+                trust_score=req.trust_score,
+                e_rec=req.e_rec,
+                selected_features=req.selected_features,
+                action=action,
+                session_token=req.session_token,
+            )
+        except Exception as e:
+            logger.error(f"[Watchdog] Drift log error: {e}")
 
-# ── Biometric Feature Extraction (Phase 1) ────────────────────────────────────
-@app.post("/biometric/extract")
-async def biometric_extract(raw_signal: list[float]):
-    """Extract features using 1D CNN from raw timing signal"""
+    return {
+        "action":             action,
+        "reason":             reason,
+        "trust_score":        req.trust_score,
+        "e_rec":              req.e_rec,
+        "behavioral_drift":   req.behavioral_drift,
+        "adaptive_threshold": req.adaptive_threshold,
+    }
+
+# ── Per-User Biometric Profile Routes ─────────────────────────────────────────
+@app.post("/biometric/profile/update")
+async def update_biometric_profile(req: BiometricProfileUpdateRequest):
+    """
+    Receive per-user biometric profile sync from browser.
+    Stores feature selector state, behavioral EMA, and drift stats.
+    """
     try:
-        signal_tensor = torch.FloatTensor(raw_signal).unsqueeze(0).unsqueeze(0)
-        with torch.no_grad():
-            features = cnn_model(signal_tensor)
+        # Validate feature selection consistency
+        validation = ServerFeatureSelector.validate_selection(
+            req.selected_features, req.feature_means
+        )
+        logger.info(
+            "[Profile] user=%s samples=%d drift=%.3f features=%s confidence=%.2f",
+            req.user_id, req.sample_count, req.last_drift,
+            req.selected_features, validation["confidence"],
+        )
+
+        await upsert_biometric_profile(
+            db_handler.db,
+            user_id=req.user_id,
+            sample_count=req.sample_count,
+            last_drift=req.last_drift,
+            adaptive_threshold=req.adaptive_threshold,
+            feature_means=req.feature_means,
+            selected_features=req.selected_features,
+            ema_profile=req.ema_profile,
+            ema_variance=req.ema_variance,
+        )
+
+        # Snapshot feature selection every 50 samples for stability tracking
+        if req.sample_count > 0 and req.sample_count % 50 == 0:
+            await record_feature_selection(
+                db_handler.db,
+                user_id=req.user_id,
+                selected_features=req.selected_features,
+                feature_means=req.feature_means,
+                feature_variances=req.ema_variance or [0.0] * 8,
+                sample_count=req.sample_count,
+            )
+
         return {
-            "success": True,
-            "features": features.squeeze().tolist(),
-            "dim": len(features.squeeze().tolist())
+            "success":    True,
+            "validation": validation,
+            "stored_features": req.selected_features,
         }
     except Exception as e:
-        logger.error(f"[CNN] Extract error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Feature extraction failed")
+        logger.error(f"[Profile] Update error: {e}")
+        raise HTTPException(status_code=500, detail="Profile update failed")
 
 @app.get("/biometric/profile/{user_id}")
 async def get_biometric_profile_api(user_id: str):
-    """Retrieve user's biometric profile from MongoDB"""
+    """Full biometric profile for a user."""
     try:
         profile = await get_biometric_profile(db_handler.db, user_id)
         if not profile:
@@ -422,63 +474,103 @@ async def get_biometric_profile_api(user_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[Biometric] Profile fetch error: {str(e)}")
+        logger.error(f"[Profile] Fetch error: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve profile")
 
-# ── DQN Model API (Phase 2) ────────────────────────────────────────────────────
+@app.get("/biometric/profile/{user_id}/summary")
+async def get_biometric_profile_summary_api(user_id: str):
+    """Lightweight profile summary (no heavy arrays)."""
+    try:
+        summary = await get_biometric_profile_summary(db_handler.db, user_id)
+        if not summary:
+            return {"user_id": user_id, "profile": None, "exists": False}
+        return {"user_id": user_id, "profile": summary, "exists": True}
+    except Exception as e:
+        logger.error(f"[Profile] Summary fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve profile summary")
+
+@app.get("/biometric/profile/{user_id}/drift")
+async def get_drift_history(user_id: str, limit: int = 50):
+    """Drift event log for a user."""
+    try:
+        events  = await get_drift_events(db_handler.db, user_id, limit=limit)
+        summary = await get_drift_summary(db_handler.db, user_id)
+        return {"user_id": user_id, "events": events, "summary": summary}
+    except Exception as e:
+        logger.error(f"[Drift] History fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve drift history")
+
+@app.get("/biometric/profile/{user_id}/features")
+async def get_feature_selection_history_api(user_id: str, limit: int = 20):
+    """Feature selection history for a user (stability analysis)."""
+    try:
+        history = await get_feature_selection_history(db_handler.db, user_id, limit=limit)
+        return {"user_id": user_id, "history": history, "count": len(history)}
+    except Exception as e:
+        logger.error(f"[Features] History fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve feature history")
+
+@app.post("/biometric/extract")
+async def biometric_extract(raw_signal: list[float]):
+    """Extract features using 1D CNN from raw timing signal."""
+    try:
+        signal_tensor = torch.FloatTensor(raw_signal).unsqueeze(0).unsqueeze(0)
+        with torch.no_grad():
+            features = cnn_model(signal_tensor)
+        return {
+            "success":  True,
+            "features": features.squeeze().tolist(),
+            "dim":      len(features.squeeze().tolist()),
+        }
+    except Exception as e:
+        logger.error(f"[CNN] Extract error: {e}")
+        raise HTTPException(status_code=500, detail="Feature extraction failed")
+
+# ── Honeypot Routes ───────────────────────────────────────────────────────────
+@app.get("/honeypot/signatures")
+async def signatures():
+    try:
+        db_sigs = await get_honeypot_signatures(db_handler.db, limit=100)
+        count   = await get_honeypot_count(db_handler.db)
+    except Exception as e:
+        logger.error(f"[Honeypot] Fetch error: {e}")
+        db_sigs, count = [], 0
+    all_sigs = _honeypot.signatures + db_sigs
+    return {"signatures": all_sigs, "count": count + len(_honeypot.signatures)}
+
+# ── Model API Routes ──────────────────────────────────────────────────────────
 @app.post("/models/dqn/action")
 async def dqn_action(state: list[float]):
-    """Get DQN action for given state"""
     try:
         if len(state) != 3:
             raise ValueError("State must be 3-dimensional [theta, h_exp, server_load]")
-        state_array = np.array(state, dtype=np.float32)
-        action = dqn_agent.select_action(state_array)
-        return {
-            "action": int(action),
-            "action_label": ACTION_LABELS[action],
-            "state": state
-        }
+        action = dqn_agent.select_action(np.array(state, dtype=np.float32))
+        return {"action": int(action), "action_label": ACTION_LABELS[action], "state": state}
     except Exception as e:
-        logger.error(f"[DQN] Action error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# ── MAB Model API (Phase 3 - Deceiver) ─────────────────────────────────────────
 @app.post("/models/mab/select")
 async def mab_select():
-    """Select arm from Multi-Armed Bandit"""
     try:
         arm = mab_agent.select_arm()
-        return {
-            "selected_arm": int(arm),
-            "n_arms": mab_agent.n_arms,
-            "arm_values": mab_agent.values.tolist()
-        }
+        return {"selected_arm": int(arm), "n_arms": mab_agent.n_arms,
+                "arm_values": mab_agent.values.tolist()}
     except Exception as e:
-        logger.error(f"[MAB] Select error: {str(e)}")
         raise HTTPException(status_code=500, detail="MAB selection failed")
 
 @app.post("/models/mab/update")
 async def mab_update(arm: int, reward: float):
-    """Update MAB with reward from selected arm"""
     try:
         if arm < 0 or arm >= mab_agent.n_arms:
             raise ValueError(f"Invalid arm {arm}")
         mab_agent.update(arm, reward)
-        return {
-            "success": True,
-            "arm": arm,
-            "reward": reward,
-            "updated_values": mab_agent.values.tolist()
-        }
+        return {"success": True, "arm": arm, "reward": reward,
+                "updated_values": mab_agent.values.tolist()}
     except Exception as e:
-        logger.error(f"[MAB] Update error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# ── PPO Model API (Phase 4 - Watchdogz) ────────────────────────────────────────
 @app.post("/models/ppo/evaluate")
 async def ppo_evaluate(state: list[float]):
-    """Evaluate session state with PPO for identity shift detection"""
     try:
         if len(state) != 10:
             raise ValueError("State must be 10-dimensional")
@@ -486,66 +578,38 @@ async def ppo_evaluate(state: list[float]):
         with torch.no_grad():
             policy_output = ppo_agent.policy(state_tensor)
         action_probs = policy_output.squeeze().tolist()
-        return {
-            "state": state,
-            "action_probabilities": action_probs,
-            "recommended_action": int(np.argmax(action_probs))
-        }
+        return {"state": state, "action_probabilities": action_probs,
+                "recommended_action": int(np.argmax(action_probs))}
     except Exception as e:
-        logger.error(f"[PPO] Evaluate error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# ── Admin APIs ─────────────────────────────────────────────────────────────────
+# ── Admin Routes ──────────────────────────────────────────────────────────────
 @app.get("/admin/honeypot/dashboard")
 async def honeypot_dashboard():
-    """Admin honeypot dashboard with statistics"""
     try:
         count = await get_honeypot_count(db_handler.db)
-        sigs = await get_honeypot_signatures(db_handler.db, limit=50)
+        sigs  = await get_honeypot_signatures(db_handler.db, limit=50)
         return {
-            "total_count": count + len(_honeypot.signatures),
+            "total_count":       count + len(_honeypot.signatures),
             "recent_signatures": sigs,
-            "in_memory_count": len(_honeypot.signatures),
-            "timestamp": time.time()
+            "in_memory_count":   len(_honeypot.signatures),
+            "timestamp":         time.time(),
         }
     except Exception as e:
-        logger.error(f"[Admin] Honeypot dashboard error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch dashboard")
 
 @app.get("/admin/models-status")
 async def models_status():
-    """Get status of all trained models"""
     return {
         "models": {
-            "dqn": {
-                "status": "loaded",
-                "type": "Deep Q-Network",
-                "state_dim": 3,
-                "action_dim": 4,
-                "phase": "Phase 2"
-            },
-            "mab": {
-                "status": "loaded",
-                "type": "Multi-Armed Bandit",
-                "n_arms": mab_agent.n_arms,
-                "arm_values": mab_agent.values.tolist(),
-                "phase": "Phase 3"
-            },
-            "ppo": {
-                "status": "loaded",
-                "type": "Proximal Policy Optimization",
-                "state_dim": 10,
-                "action_dim": 3,
-                "phase": "Phase 4"
-            },
-            "cnn1d": {
-                "status": "loaded",
-                "type": "1D CNN",
-                "output_dim": 32,
-                "phase": "Phase 1"
-            }
+            "dqn":   {"status": "loaded", "type": "Deep Q-Network",    "state_dim": 3,  "action_dim": 4},
+            "mab":   {"status": "loaded", "type": "Multi-Armed Bandit", "n_arms": mab_agent.n_arms,
+                      "arm_values": mab_agent.values.tolist()},
+            "ppo":   {"status": "loaded", "type": "PPO",               "state_dim": 10, "action_dim": 3},
+            "cnn1d": {"status": "loaded", "type": "1D CNN",            "output_dim": 32},
         },
-        "timestamp": time.time()
+        "feature_names": FEATURE_NAMES,
+        "timestamp": time.time(),
     }
 
 @app.get("/health")

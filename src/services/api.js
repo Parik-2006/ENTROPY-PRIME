@@ -49,14 +49,35 @@ export async function verifyPassword({ plainPassword, storedHash }) {
   })
 }
 
-// Phase 4: Session verification heartbeat
-export async function sendWatchdogHeartbeat({ userId, latentVector, eRec, trustScore }) {
+// Phase 4: Session verification heartbeat — now includes per-user drift context
+export async function sendWatchdogHeartbeat({
+  userId, latentVector, eRec, trustScore,
+  behavioralDrift, adaptiveThreshold, selectedFeatures, sampleCount
+}) {
   return req('/session/verify', 'POST', {
-    session_token:  localStorage.getItem('ep_token') ?? '',
-    user_id:        userId,
-    latent_vector:  latentVector,
-    e_rec:          eRec,
-    trust_score:    trustScore,
+    session_token:      localStorage.getItem('ep_token') ?? '',
+    user_id:            userId,
+    latent_vector:      latentVector,
+    e_rec:              eRec,
+    trust_score:        trustScore,
+    behavioral_drift:   behavioralDrift  ?? 0,
+    adaptive_threshold: adaptiveThreshold ?? 0.18,
+    selected_features:  selectedFeatures  ?? [],
+    sample_count:       sampleCount       ?? 0,
+  })
+}
+
+// Sync per-user biometric profile to MongoDB
+export async function saveUserBiometricProfile({
+  userId, profileStats, featureMeans, selectedFeatures
+}) {
+  return req('/biometric/profile/update', 'POST', {
+    user_id:          userId,
+    sample_count:     profileStats.sampleCount,
+    last_drift:       profileStats.lastDrift,
+    adaptive_threshold: profileStats.adaptiveThreshold,
+    feature_means:    featureMeans,
+    selected_features: selectedFeatures,
   })
 }
 

@@ -3,14 +3,19 @@ import { useAuth } from '../context/AuthContext'
 import { submitScore, hashPassword } from '../services/api'
 import styles from './LoginPage.module.css'
 
-// ── Live signal bar ─────────────────────────────────────────────────────────
-function SignalBar({ label, value, color = 'var(--accent)', max = 1 }) {
+// ── Live signal bar ──────────────────────────────────────────────────────────
+function SignalBar({ label, value, color = 'var(--accent)', max = 1, active = false }) {
   const pct = Math.min(value / max, 1) * 100
   return (
     <div className={styles.signalRow}>
-      <span className={styles.signalLabel}>{label}</span>
+      <span className={styles.signalLabel} style={{ color: active ? 'var(--accent)' : undefined }}>
+        {label}{active ? ' ★' : ''}
+      </span>
       <div className={styles.signalTrack}>
-        <div className={styles.signalFill} style={{ width: pct + '%', background: color }} />
+        <div className={styles.signalFill} style={{
+          width: pct + '%',
+          background: active ? 'var(--accent3)' : color
+        }} />
       </div>
       <span className={styles.signalVal}>{(value).toFixed(3)}</span>
     </div>
@@ -19,9 +24,9 @@ function SignalBar({ label, value, color = 'var(--accent)', max = 1 }) {
 
 // ── Score ring ───────────────────────────────────────────────────────────────
 function ScoreRing({ theta }) {
-  const r   = 36
-  const circ = 2 * Math.PI * r
-  const pct  = theta ?? 0
+  const r     = 36
+  const circ  = 2 * Math.PI * r
+  const pct   = theta ?? 0
   const color = pct > 0.7 ? '#00ffa3' : pct > 0.4 ? '#ffb800' : '#ff3b5c'
   const label = pct > 0.7 ? 'HUMAN' : pct > 0.4 ? 'UNCERTAIN' : 'SUSPECT'
   return (
@@ -60,35 +65,69 @@ function TypingTrace({ events }) {
       </text>
     </svg>
   )
-  const max = Math.max(...events.map(e => e.dwell), 200)
+  const max  = Math.max(...events.map(e => e.dwell), 200)
   const step = W / Math.max(events.length - 1, 1)
   const pts  = events.map((e, i) => `${i * step},${H - (e.dwell / max) * (H - 4)}`)
   return (
     <svg width={W} height={H} className={styles.trace}>
       <polyline points={pts.join(' ')} fill="none"
         stroke="var(--accent)" strokeWidth="1.5" strokeLinejoin="round" />
-      {events.slice(-1).map((e, i) => (
-        <circle key={i} cx={(events.length - 1) * step} cy={H - (e.dwell / max) * (H - 4)}
+      {events.slice(-1).map((_, i) => (
+        <circle key={i} cx={(events.length - 1) * step}
+          cy={H - (events[events.length - 1].dwell / max) * (H - 4)}
           r="3" fill="var(--accent3)" />
       ))}
     </svg>
   )
 }
 
+// ── Feature chip ─────────────────────────────────────────────────────────────
+function FeatureChip({ name, selected }) {
+  const shortName = name.replace('_norm', '').toUpperCase()
+  return (
+    <span className={styles.featureChip}
+      style={{ borderColor: selected ? 'var(--accent3)' : 'var(--border)',
+               color: selected ? 'var(--accent3)' : 'var(--text3)',
+               background: selected ? 'rgba(0,255,163,.07)' : 'transparent' }}>
+      {shortName}
+    </span>
+  )
+}
+
+// ── Profile build bar ────────────────────────────────────────────────────────
+function ProfileProgress({ sampleCount }) {
+  const MIN_STABLE = 50
+  const pct = Math.min(sampleCount / MIN_STABLE, 1)
+  const label = pct >= 1 ? 'PROFILE STABLE' : `BUILDING PROFILE (${sampleCount}/${MIN_STABLE})`
+  const color = pct >= 1 ? 'var(--accent3)' : 'var(--accent)'
+  return (
+    <div className={styles.profileProgress}>
+      <div className={styles.profileProgressLabel} style={{ color }}>{label}</div>
+      <div className={styles.profileProgressTrack}>
+        <div className={styles.profileProgressFill}
+          style={{ width: (pct * 100) + '%', background: color }} />
+      </div>
+    </div>
+  )
+}
+
+// ── All feature names ─────────────────────────────────────────────────────────
+const ALL_FEATURES = ['dwell', 'flight', 'speed', 'jitter', 'accel', 'rhythm', 'pause', 'bigram']
+
 // ── Main page ────────────────────────────────────────────────────────────────
 export default function LoginPage() {
-  const { login, epReady, liveTheta, getClient } = useAuth()
+  const { login, epReady, liveTheta, getClient, selectedFeatures, liveDrift } = useAuth()
 
   const [email,    setEmail]    = useState('')
   const [password, setPassword] = useState('')
-  const [phase,    setPhase]    = useState('idle')  // idle | scanning | hashing | done | error
+  const [phase,    setPhase]    = useState('idle')
   const [result,   setResult]   = useState(null)
   const [error,    setError]    = useState('')
-  const [kbStats,  setKbStats]  = useState({ avgDwell: 0, avgFlight: 0, count: 0 })
-  const [ptStats,  setPtStats]  = useState({ avgSpeed: 0, avgJitter: 0 })
+  const [kbStats,  setKbStats]  = useState({ avgDwell: 0, avgFlight: 0, rhythm: 0, avgPause: 0, count: 0 })
+  const [ptStats,  setPtStats]  = useState({ avgSpeed: 0, avgJitter: 0, avgAccel: 0 })
   const [keyTrace, setKeyTrace] = useState([])
   const [hashInfo, setHashInfo] = useState(null)
-  const [tick,     setTick]     = useState(0)
+  const [profileStats, setProfileStats] = useState(null)
 
   // Refresh stats on interval
   useEffect(() => {
@@ -98,7 +137,7 @@ export default function LoginPage() {
       setKbStats(ep.getKeyboardStats())
       setPtStats(ep.getPointerStats())
       setKeyTrace([...ep.keyboard._events.slice(-40)])
-      setTick(t => t + 1)
+      setProfileStats(ep.getProfileStats())
     }, 400)
     return () => clearInterval(id)
   }, [getClient])
@@ -110,23 +149,18 @@ export default function LoginPage() {
     try {
       const ep = getClient()
       const { theta, hExp } = await ep.evaluate(password)
-
-      // Get latent vector for token binding
-      const latentVector = await ep.getLatentVector()
+      const latentVector    = await ep.getLatentVector()
 
       setPhase('hashing')
 
-      // Phase 2: RL-governor selects Argon2id params
       const scoreData = await submitScore({
         theta, hExp, latentVector,
         serverLoad: 0.4 + Math.random() * 0.3,
       })
 
-      // Hash password with selected params
       const hashData = await hashPassword({ plainPassword: password, theta, hExp })
       setHashInfo(hashData)
 
-      // Save session
       const userData = { id: 'usr_' + Date.now(), email, theta, hExp }
       login(userData, scoreData.session_token)
 
@@ -138,13 +172,12 @@ export default function LoginPage() {
     }
   }, [email, password, getClient, login])
 
-  const theta    = liveTheta ?? 0
-  const hExp     = kbStats.count > 5 ? Math.min(kbStats.count / 50, 1) : 0
+  const theta      = liveTheta ?? 0
+  const hExp       = kbStats.count > 5 ? Math.min(kbStats.count / 50, 1) : 0
   const thetaColor = theta > 0.7 ? '#00ffa3' : theta > 0.4 ? '#ffb800' : '#ff3b5c'
 
   return (
     <div className={styles.page}>
-      {/* Scanline effect */}
       <div className={styles.scanline} />
 
       {/* Left panel: branding */}
@@ -159,10 +192,10 @@ export default function LoginPage() {
 
         <div className={styles.phases}>
           {[
-            ['01', 'BIOLOGICAL GATEWAY',  'Neuromuscular signal extraction via 1D-CNN'],
-            ['02', 'RESOURCE GOVERNOR',   'RL-driven Argon2id hardening (PPO/DQN)'],
+            ['01', 'BIOLOGICAL GATEWAY',  'Neuromuscular signal extraction via 8-channel 1D-CNN'],
+            ['02', 'RESOURCE GOVERNOR',   'RL-driven Argon2id hardening (DQN/MAB)'],
             ['03', 'OFFENSIVE DECEPTION', 'Honeypot injection + shadow sandbox routing'],
-            ['04', 'SESSION WATCHDOG',    'Continuous autoencoder identity verification'],
+            ['04', 'SESSION WATCHDOG',    'Per-user behavioral profile + adaptive drift detection'],
           ].map(([n, title, desc]) => (
             <div key={n} className={styles.phaseItem}>
               <span className={styles.phaseNum}>{n}</span>
@@ -174,21 +207,46 @@ export default function LoginPage() {
           ))}
         </div>
 
+        {/* Feature selection panel */}
+        <div className={styles.featurePanel}>
+          <div className={styles.featurePanelTitle}>PER-USER FEATURE SELECTION</div>
+          <div className={styles.featureChips}>
+            {ALL_FEATURES.map(f => (
+              <FeatureChip key={f} name={f + '_norm'}
+                selected={selectedFeatures.some(sf => sf.includes(f))} />
+            ))}
+          </div>
+          <div className={styles.featureSub}>
+            ★ = selected as discriminative for this user
+          </div>
+        </div>
+
         <div className={styles.tagline}>
           Moving from <em>reputation</em> to <em>biology</em>.
         </div>
       </div>
 
-      {/* Right panel: login form + live signals */}
+      {/* Right panel */}
       <div className={styles.right}>
         <div className={styles.card}>
-          {/* Header */}
           <div className={styles.cardHeader}>
-            <div className={styles.statusDot} style={{ background: epReady ? 'var(--accent3)' : 'var(--text3)' }} />
+            <div className={styles.statusDot}
+              style={{ background: epReady ? 'var(--accent3)' : 'var(--text3)' }} />
             <span className={styles.statusText}>
               {epReady ? 'BIOMETRIC ENGINE ACTIVE' : 'INITIALIZING ENGINE...'}
             </span>
+            {liveDrift > 0 && (
+              <span className={styles.driftBadge}
+                style={{ color: liveDrift > 2 ? 'var(--danger)' : 'var(--warn)' }}>
+                DRIFT: {liveDrift.toFixed(2)}
+              </span>
+            )}
           </div>
+
+          {/* Profile progress */}
+          {profileStats && (
+            <ProfileProgress sampleCount={profileStats.sampleCount} />
+          )}
 
           {/* Live signal panel */}
           <div className={styles.signalPanel}>
@@ -202,10 +260,18 @@ export default function LoginPage() {
               </div>
             </div>
             <div className={styles.signalRight}>
-              <SignalBar label="H_EXP"    value={hExp}                   color="var(--accent)" />
-              <SignalBar label="DWELL"    value={kbStats.avgDwell}       color="var(--accent3)" max={300} />
-              <SignalBar label="FLIGHT"   value={kbStats.avgFlight}      color="#a78bfa"        max={500} />
-              <SignalBar label="JITTER"   value={ptStats.avgJitter || 0} color="var(--warn)"    max={100} />
+              <SignalBar label="H_EXP"   value={hExp}                    color="var(--accent)"
+                active={selectedFeatures.includes('dwell_norm')} />
+              <SignalBar label="DWELL"   value={kbStats.avgDwell}        color="var(--accent3)" max={300}
+                active={selectedFeatures.includes('dwell_norm')} />
+              <SignalBar label="FLIGHT"  value={kbStats.avgFlight}       color="#a78bfa" max={500}
+                active={selectedFeatures.includes('flight_norm')} />
+              <SignalBar label="RHYTHM"  value={kbStats.rhythm || 0}     color="var(--warn)" max={1}
+                active={selectedFeatures.includes('rhythm_norm')} />
+              <SignalBar label="JITTER"  value={ptStats.avgJitter || 0}  color="var(--warn)" max={100}
+                active={selectedFeatures.includes('jitter_norm')} />
+              <SignalBar label="ACCEL"   value={ptStats.avgAccel || 0}   color="#f472b6" max={500}
+                active={selectedFeatures.includes('accel_norm')} />
               <div className={styles.traceWrap}>
                 <TypingTrace events={keyTrace} />
               </div>
@@ -246,10 +312,9 @@ export default function LoginPage() {
               {phase === 'hashing'  && <><Spinner /> COMPUTING ARGON2ID</>}
               {phase === 'done'     && '✓ AUTHENTICATED'}
               {phase === 'error'    && 'RETRY AUTHENTICATION'}
-              {(phase === 'idle')   && 'AUTHENTICATE'}
+              {phase === 'idle'     && 'AUTHENTICATE'}
             </button>
 
-            {/* Hash result info */}
             {hashInfo && (
               <div className={styles.hashInfo}>
                 <div className={styles.hashRow}>
@@ -272,13 +337,24 @@ export default function LoginPage() {
                     {result?.shadow_mode ? 'BOT ROUTED' : 'DISABLED'}
                   </span>
                 </div>
+                {profileStats && (
+                  <div className={styles.hashRow}>
+                    <span className={styles.hashLabel}>PROFILE SAMPLES</span>
+                    <span className={styles.hashVal} style={{ color: 'var(--accent)' }}>
+                      {profileStats.sampleCount}
+                    </span>
+                  </div>
+                )}
               </div>
             )}
           </div>
 
           <div className={styles.cardFooter}>
-            <span>KEYSTROKES CAPTURED: <b>{kbStats.count}</b></span>
-            <span>POINTER SAMPLES: <b>{ptStats.count || 0}</b></span>
+            <span>KEYSTROKES: <b>{kbStats.count}</b></span>
+            <span>POINTER: <b>{ptStats.count || 0}</b></span>
+            <span>DRIFT: <b style={{ color: liveDrift > 2 ? 'var(--warn)' : 'var(--accent3)' }}>
+              {liveDrift.toFixed(3)}
+            </b></span>
           </div>
         </div>
       </div>
