@@ -3,44 +3,70 @@ version: '3.8'
 services:
   # MongoDB for data persistence
   mongodb:
-    image: mongo:latest
+    image: mongo:7-alpine
     container_name: entropy-prime-mongodb
+    restart: always
     ports:
-      - "27017:27017"
+      - "${MONGODB_PORT:-27017}:27017"
     environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme}
       MONGO_INITDB_DATABASE: entropy_prime
     volumes:
       - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
     networks:
       - entropy-prime-net
+    resources:
+      limits:
+        cpus: '1.0'
+        memory: 1G
+      reservations:
+        cpus: '0.5'
+        memory: 512M
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
 
-  # FastAPI Backend with Honeypot
+  # FastAPI Backend with Orchestration
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.11"
     container_name: entropy-prime-backend
+    restart: always
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     environment:
-      MONGODB_URL: mongodb://admin:admin123@mongodb:27017/entropy_prime?authSource=admin
+      MONGODB_URL: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-changeme}@mongodb:27017/entropy_prime?authSource=admin
       MONGODB_DB_NAME: entropy_prime
-      EP_SESSION_SECRET: a0bb498cf8819aac115f0deeb8d89b18478447e5b18270e8122f2e37d86f80eb
-      EP_SHADOW_SECRET: 15b2baa3e7234c3ea289e16c7eccb3353f47768f26d85790b2f50ecbd6e17d38
+      EP_SESSION_SECRET: ${EP_SESSION_SECRET}
+      EP_SHADOW_SECRET: ${EP_SHADOW_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONUNBUFFERED: "1"
     depends_on:
       mongodb:
         condition: service_healthy
     networks:
       - entropy-prime-net
-    volumes:
-      - ./backend:/app
+    resources:
+      limits:
+        cpus: '2.0'
+        memory: 2G
+      reservations:
+        cpus: '1.0'
+        memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
 networks:
   entropy-prime-net:
@@ -48,3 +74,5 @@ networks:
 
 volumes:
   mongodb_data:
+  mongodb_config:
+

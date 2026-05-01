@@ -5,8 +5,10 @@ Each stage has explicit I/O contracts, confidence handling, and fallbacks.
 """
 from __future__ import annotations
 
-import json, logging, os, secrets, time
+import json, logging, os, secrets, time, signal, sys
 from typing import Optional
+from datetime import datetime
+from contextlib import asynccontextmanager
 
 import numpy as np
 import torch
@@ -14,6 +16,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from database import Database
@@ -34,8 +37,12 @@ from models.cnn1d import CNN1D
 from pipeline import PipelineOrchestrator, BiometricInput
 from pipeline.contracts import WatchdogAction
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO")),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("entropy_prime")
+logger.info(f"Starting Entropy Prime v3 (log level: {os.environ.get('LOG_LEVEL', 'INFO')})")
 
 # ── Secrets ───────────────────────────────────────────────────────────────────
 SESSION_SECRET = os.environ.get("EP_SESSION_SECRET", secrets.token_hex(32))
@@ -87,36 +94,74 @@ def _load_checkpoints() -> None:
 # ── Pipeline orchestrator (built after models are ready) ──────────────────────
 orchestrator: Optional[PipelineOrchestrator] = None
 
+# ── Lifespan events for graceful startup/shutdown ───────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global orchestrator
+    logger.info("🚀 Entropy Prime starting up...")
+    try:
+        await db_handler.connect_to_mongo()
+        _load_checkpoints()
+        orchestrator = PipelineOrchestrator(
+            dqn_agent=dqn_agent,
+            mab_agent=mab_agent,
+            ppo_agent=ppo_agent,
+            shadow_secret=SHADOW_SECRET,
+            session_secret=SESSION_SECRET,
+        )
+        logger.info("✓ Entropy Prime v3 initialized — 4-stage pipeline active")
+    except Exception as e:
+        logger.error(f"Startup failed: {e}", exc_info=True)
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("🛑 Entropy Prime shutting down...")
+    try:
+        await db_handler.close_mongo_connection()
+        logger.info("✓ Shutdown complete")
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}", exc_info=True)
+
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Entropy Prime", version="3.0.0 (Pipeline)")
+app = FastAPI(
+    title="Entropy Prime",
+    version="3.0.0 (Pipeline)",
+    description="Zero-trust behavioral biometrics engine with multi-agent orchestration",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Middleware: Request logging ────────────────────────────────────────────────
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    try:
+        response = await call_next(request)
+        duration = time.time() - start
+        logger.debug(f"{request.method} {request.url.path} - {response.status_code} ({duration:.3f}s)")
+        return response
+    except Exception as e:
+        logger.error(f"Request failed: {request.method} {request.url.path} - {str(e)}", exc_info=True)
+        raise
 
-@app.on_event("startup")
-async def startup_event():
-    global orchestrator
-    await db_handler.connect_to_mongo()
-    _load_checkpoints()
-    orchestrator = PipelineOrchestrator(
-        dqn_agent=dqn_agent,
-        mab_agent=mab_agent,
-        ppo_agent=ppo_agent,
-        shadow_secret=SHADOW_SECRET,
-        session_secret=SESSION_SECRET,
+# ── Exception handlers ─────────────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {type(exc).__name__}: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error"}
     )
-    logger.info("✓ Entropy Prime v3 started — 4-stage pipeline active")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await db_handler.close_mongo_connection()
 
 
 # ── Pydantic request models ────────────────────────────────────────────────────

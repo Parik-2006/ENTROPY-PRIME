@@ -85,18 +85,23 @@ echo ""
 echo -e "${GREEN}► Backend  → http://localhost:8000${NC}"
 echo -e "${GREEN}► Docs     → http://localhost:8000/docs${NC}"
 cd "$BACKEND_DIR"
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload --log-level info &
 BACKEND_PID=$!
 
 # Wait for backend to be ready
 echo -n "  Waiting for backend"
-for i in $(seq 1 20); do
+for i in $(seq 1 30); do
   sleep 0.5
   if curl -s http://localhost:8000/health >/dev/null 2>&1; then
     echo -e " ${GREEN}✓${NC}"
     break
   fi
   echo -n "."
+  if [ $i -eq 30 ]; then
+    echo -e " ${RED}✗ Backend failed to start${NC}"
+    kill $BACKEND_PID 2>/dev/null || true
+    exit 1
+  fi
 done
 
 # ── Start frontend ─────────────────────────────────────────────────────────────
@@ -106,10 +111,13 @@ npm run dev &
 FRONTEND_PID=$!
 
 echo ""
-echo -e "${CYAN}─────────────────────────────────────────────${NC}"
-echo -e "${GREEN}  Entropy Prime is running!${NC}"
-echo -e "  Open: ${CYAN}http://localhost:3000${NC}"
-echo -e "${CYAN}─────────────────────────────────────────────${NC}"
+echo -e "${GREEN}═════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  🚀 ENTROPY PRIME IS RUNNING${NC}"
+echo -e "${GREEN}═════════════════════════════════════════════════${NC}"
+echo -e "  Frontend: ${CYAN}http://localhost:3000${NC}"
+echo -e "  API:      ${CYAN}http://localhost:8000${NC}"
+echo -e "  Docs:     ${CYAN}http://localhost:8000/docs${NC}"
+echo -e "${GREEN}═════════════════════════════════════════════════${NC}"
 echo ""
 echo "  Press Ctrl+C to stop all services"
 echo ""

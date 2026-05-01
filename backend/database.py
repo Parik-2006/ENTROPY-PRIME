@@ -1,57 +1,92 @@
 """
 MongoDB Connection and Database Operations for Entropy Prime
 Includes per-user biometric profile: feature selection, drift tracking, behavioral pattern storage.
+Production-ready with connection pooling and retry logic.
 """
 import os
+import logging
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure
 from bson import ObjectId
 from typing import Optional, List
 
+logger = logging.getLogger("entropy_prime.database")
+
 # ─────────────────────────────────────────────────────────────────────────────
-# MongoDB Connection
+# MongoDB Connection with Connection Pooling
 # ─────────────────────────────────────────────────────────────────────────────
 class Database:
     def __init__(self):
         self.client: Optional[AsyncIOMotorClient] = None
         self.db = None
+        self.max_retries = 5
+        self.retry_delay = 2
 
     async def connect_to_mongo(self):
+        """Connect to MongoDB with retry logic for production resilience."""
         mongo_url = os.environ.get("MONGODB_URL", "mongodb://localhost:27017")
         db_name   = os.environ.get("MONGODB_DB_NAME", "entropy_prime")
-        self.client = AsyncIOMotorClient(mongo_url)
-        self.db     = self.client[db_name]
-        await self._create_indexes()
-        print(f"✓ Connected to MongoDB: {db_name}")
+        
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                self.client = AsyncIOMotorClient(
+                    mongo_url,
+                    serverSelectionTimeoutMS=5000,
+                    socketTimeoutMS=5000,
+                    retryWrites=True,
+                    maxPoolSize=50,
+                    minPoolSize=10,
+                )
+                # Test the connection
+                await self.client.admin.command('ping')
+                self.db = self.client[db_name]
+                await self._create_indexes()
+                logger.info(f"✓ Connected to MongoDB: {db_name}")
+                return
+            except (ServerSelectionTimeoutError, ConnectionFailure) as e:
+                logger.warning(f"Connection attempt {attempt}/{self.max_retries} failed: {e}")
+                if attempt < self.max_retries:
+                    import asyncio
+                    await asyncio.sleep(self.retry_delay)
+                else:
+                    logger.error(f"Failed to connect to MongoDB after {self.max_retries} attempts")
+                    raise
 
     async def close_mongo_connection(self):
         if self.client:
             self.client.close()
-            print("✓ MongoDB connection closed")
+            logger.info("✓ MongoDB connection closed")
 
     async def _create_indexes(self):
-        await self.db.users.create_index("email", unique=True)
-        await self.db.users.create_index([("created_at", DESCENDING)])
-        await self.db.sessions.create_index("session_token", unique=True)
-        await self.db.sessions.create_index("user_id")
-        await self.db.sessions.create_index(
-            [("expires_at", ASCENDING)], expireAfterSeconds=0
-        )
-        await self.db.honeypot.create_index([("timestamp", DESCENDING)])
-        await self.db.honeypot.create_index("ip_address")
-        # Per-user biometric profile indexes
-        await self.db.biometric_profiles.create_index("user_id", unique=True)
-        await self.db.biometric_profiles.create_index([("updated_at", DESCENDING)])
-        # Drift event log
-        await self.db.drift_events.create_index("user_id")
-        await self.db.drift_events.create_index([("timestamp", DESCENDING)])
-        await self.db.drift_events.create_index(
-            [("timestamp", ASCENDING)], expireAfterSeconds=60 * 60 * 24 * 30  # 30-day TTL
-        )
-        # Feature selection history per user
-        await self.db.feature_selections.create_index("user_id")
-        await self.db.feature_selections.create_index([("recorded_at", DESCENDING)])
+        """Create database indexes for performance and data integrity."""
+        try:
+            await self.db.users.create_index("email", unique=True)
+            await self.db.users.create_index([("created_at", DESCENDING)])
+            await self.db.sessions.create_index("session_token", unique=True)
+            await self.db.sessions.create_index("user_id")
+            await self.db.sessions.create_index(
+                [("expires_at", ASCENDING)], expireAfterSeconds=0
+            )
+            await self.db.honeypot.create_index([("timestamp", DESCENDING)])
+            await self.db.honeypot.create_index("ip_address")
+            # Per-user biometric profile indexes
+            await self.db.biometric_profiles.create_index("user_id", unique=True)
+            await self.db.biometric_profiles.create_index([("updated_at", DESCENDING)])
+            # Drift event log
+            await self.db.drift_events.create_index("user_id")
+            await self.db.drift_events.create_index([("timestamp", DESCENDING)])
+            await self.db.drift_events.create_index(
+                [("timestamp", ASCENDING)], expireAfterSeconds=60 * 60 * 24 * 30  # 30-day TTL
+            )
+            # Feature selection history per user
+            await self.db.feature_selections.create_index("user_id")
+            await self.db.feature_selections.create_index([("recorded_at", DESCENDING)])
+            logger.info("✓ All database indexes created")
+        except Exception as e:
+            logger.error(f"Index creation error: {e}", exc_info=True)
+            raise
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User Operations
