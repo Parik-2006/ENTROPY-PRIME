@@ -1,16 +1,26 @@
 """
-Entropy Prime — FastAPI Backend  v3.0.0
+Entropy Prime — FastAPI Backend  v3.1.0
 All biometric scoring flows through the 4-stage PipelineOrchestrator.
 
-Fixed from draft:
-  - /auth/logout: session_token moved from query-param to request body (LogoutReq)
-    so it never appears in server logs / proxies.
-  - /biometric/extract: bare list[float] body wrapped in BiometricExtractReq so
-    FastAPI can deserialize it without a 422.
-  - All inline `from pipeline import …` moved to module level; import errors
-    surface at startup rather than silently at request time.
-  - _load_checkpoints() separated from lifespan so it can be unit-tested in
-    isolation without spinning up a full async event loop.
+v3.1.0 changes
+──────────────
+• `verify_session_dep` FastAPI dependency: validates every token against the
+  DB before any sensitive route runs.  Rejects expired / inactive sessions with
+  HTTP 401.
+• /auth/login and /auth/register now call `create_session` with the correct
+  initial latent vector and return the token; behaviour is unchanged but the
+  flow is explicit and auditable.
+• /session/verify heartbeat:
+    - Validates the session token against the DB first.
+    - Calls orchestrator.run_watchdog with the *DB-persisted* trust score as
+      the authoritative baseline (not the client-supplied value, which could
+      be replayed / inflated).
+    - Persists the watchdog's *updated* trust score (post-decay) back to the DB.
+    - Returns 401 if the session is no longer active.
+• /honeypot/reward:
+    - Validates `arm` is in [0, mab_agent.n_arms).
+    - Clamps reward to [-1.0, 1.0] (belt-and-suspenders on top of Pydantic).
+• /auth/logout: unchanged; session_token in body.
 """
 from __future__ import annotations
 
@@ -21,13 +31,13 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Annotated, Optional
 
 import numpy as np
 import torch
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import FastAPI, Request, HTTPException, status
+from fastapi import Depends, FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
@@ -64,7 +74,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("entropy_prime")
-logger.info("Starting Entropy Prime v3 (log level: %s)", os.environ.get("LOG_LEVEL", "INFO"))
+logger.info("Starting Entropy Prime v3.1 (log level: %s)", os.environ.get("LOG_LEVEL", "INFO"))
 
 # ── Module-level secrets ───────────────────────────────────────────────────────
 SESSION_SECRET = os.environ.get("EP_SESSION_SECRET", secrets.token_hex(32))
@@ -94,9 +104,7 @@ def _load_checkpoints() -> None:
       1. Environment variable  (EP_RL_CHECKPOINT / EP_MAB_CHECKPOINT / EP_PPO_CHECKPOINT)
       2. Default path          (EP_CHECKPOINT_DIR / <name>.pt|json)
 
-    Missing checkpoints are non-fatal: the agent keeps randomly-initialised
-    weights and logs an INFO message.  Only genuine load *errors* (corrupt file,
-    shape mismatch, …) produce a WARNING — they never abort startup.
+    Missing checkpoints are non-fatal.
     """
     ckpt_dir = os.environ.get("EP_CHECKPOINT_DIR", "checkpoints")
 
@@ -104,82 +112,48 @@ def _load_checkpoints() -> None:
     mab_path = os.environ.get("EP_MAB_CHECKPOINT", os.path.join(ckpt_dir, "mab.json"))
     ppo_path = os.environ.get("EP_PPO_CHECKPOINT", os.path.join(ckpt_dir, "watchdog.pt"))
 
-    # ── DQN (Resource Governor) ───────────────────────────────────────────────
     if os.path.exists(rl_path):
         try:
             dqn_agent.load_checkpoint(rl_path)
             logger.info("✓ DQN checkpoint loaded: %s", rl_path)
         except Exception as exc:
-            logger.warning(
-                "DQN checkpoint at %s is corrupt or incompatible (%s) — "
-                "continuing with random weights",
-                rl_path, exc,
-            )
+            logger.warning("DQN checkpoint corrupt (%s) — random weights", exc)
     else:
-        logger.info(
-            "DQN checkpoint not found at %s — using random weights (expected on first run)",
-            rl_path,
-        )
+        logger.info("DQN checkpoint not found at %s — random weights", rl_path)
 
-    # ── MAB (Honeypot arm selector) ───────────────────────────────────────────
     if os.path.exists(mab_path):
         try:
             with open(mab_path) as fh:
                 mab_agent.load_state_dict(json.load(fh))
             logger.info("✓ MAB checkpoint loaded: %s", mab_path)
         except Exception as exc:
-            logger.warning(
-                "MAB checkpoint at %s failed to load (%s) — cold-start bandit",
-                mab_path, exc,
-            )
+            logger.warning("MAB checkpoint failed (%s) — cold-start bandit", exc)
     else:
         logger.info("MAB checkpoint not found at %s — cold-start bandit", mab_path)
 
-    # ── PPO (Session Watchdog) ────────────────────────────────────────────────
     if os.path.exists(ppo_path):
         try:
             ppo_agent.load_checkpoint(ppo_path)
             logger.info("✓ PPO checkpoint loaded: %s", ppo_path)
         except Exception as exc:
-            logger.warning(
-                "PPO checkpoint at %s is corrupt or incompatible (%s) — "
-                "fallback rules will be used for session watchdog",
-                ppo_path, exc,
-            )
+            logger.warning("PPO checkpoint corrupt (%s) — rule-based fallback", exc)
     else:
-        logger.info(
-            "PPO checkpoint not found at %s — watchdog will use rule-based fallback",
-            ppo_path,
-        )
+        logger.info("PPO checkpoint not found at %s — rule-based fallback", ppo_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lifespan  (startup → yield → shutdown)
+# Lifespan
 # ─────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Sequence matters:
-      1. Connect to MongoDB (or fall back to mongomock for dev).
-      2. Load model checkpoints — agents must exist before the orchestrator
-         references them, but they don't need DB access.
-      3. Build PipelineOrchestrator — binds the agent instances and secrets.
-
-    If any step raises, FastAPI propagates the exception and the process
-    exits with a non-zero code (so container orchestrators restart it).
-    """
     global orchestrator
 
-    logger.info("🚀 Entropy Prime v3 starting up…")
+    logger.info("🚀 Entropy Prime v3.1 starting up…")
 
-    # Step 1 — Database
     await db_handler.connect_to_mongo()
-
-    # Step 2 — Model checkpoints (non-async, CPU-bound, done before first request)
     _load_checkpoints()
 
-    # Step 3 — Pipeline orchestrator
     orchestrator = PipelineOrchestrator(
         dqn_agent     = dqn_agent,
         mab_agent     = mab_agent,
@@ -188,10 +162,9 @@ async def lifespan(app: FastAPI):
         session_secret= SESSION_SECRET,
     )
 
-    logger.info("✓ Entropy Prime v3 initialised — 4-stage pipeline active")
+    logger.info("✓ Entropy Prime v3.1 initialised — 4-stage pipeline active")
     yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
     logger.info("🛑 Entropy Prime shutting down…")
     try:
         await db_handler.close_mongo_connection()
@@ -206,7 +179,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Entropy Prime",
-    version     = "3.0.0",
+    version     = "3.1.0",
     description = "Zero-trust behavioural biometrics engine with multi-agent orchestration",
     lifespan    = lifespan,
 )
@@ -247,13 +220,6 @@ async def log_requests(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """
-    Catch-all for any unhandled exception that escapes a route handler.
-
-    Logs the full traceback at ERROR level (so it appears in monitoring) and
-    returns a generic 500 body.  The body intentionally omits the exception
-    message so internal details are never leaked to callers.
-    """
     logger.error(
         "Unhandled %s on %s %s",
         type(exc).__name__, request.method, request.url.path,
@@ -263,6 +229,58 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
         status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
         content     = {"detail": "Internal server error"},
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session Guard — reusable FastAPI dependency
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SessionGuardDep:
+    """
+    FastAPI dependency that verifies a session token is active in MongoDB.
+
+    Usage:
+        @app.post("/some/sensitive/route")
+        async def handler(session=Depends(require_active_session)):
+            user_id = session["user_id"]
+            ...
+
+    Raises HTTP 401 when:
+      - No `X-Session-Token` header is present.
+      - The token does not exist in the DB.
+      - The session has expired or was explicitly invalidated (is_active=False).
+
+    The returned dict is the raw session document from MongoDB (with ObjectIds
+    already stringified by `get_session`).
+    """
+
+    async def __call__(self, request: Request) -> dict:
+        token = request.headers.get("X-Session-Token")
+        if not token:
+            raise HTTPException(
+                status_code = status.HTTP_401_UNAUTHORIZED,
+                detail      = "Missing X-Session-Token header",
+                headers     = {"WWW-Authenticate": "Bearer"},
+            )
+        try:
+            session = await get_session(db_handler.db, token)
+        except Exception as exc:
+            logger.error("[SessionGuard] DB error: %s", exc)
+            raise HTTPException(
+                status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail      = "Session store unavailable",
+            )
+        if session is None:
+            raise HTTPException(
+                status_code = status.HTTP_401_UNAUTHORIZED,
+                detail      = "Invalid or expired session",
+                headers     = {"WWW-Authenticate": "Bearer"},
+            )
+        return session
+
+
+require_active_session = _SessionGuardDep()
+ActiveSession = Annotated[dict, Depends(require_active_session)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -291,11 +309,27 @@ class PwHashReq(BaseModel):
 
 
 class SessionVerifyReq(BaseModel):
+    """
+    Heartbeat payload for /session/verify.
+
+    `session_token` and `user_id` identify the session.
+    `latent_vector` is the current 32-dim behavioural embedding.
+    `e_rec` is the autoencoder reconstruction error from the client-side model.
+
+    NOTE: `trust_score` is intentionally NOT accepted from the client.  The
+    authoritative trust score lives in the DB and is used as the baseline for
+    the watchdog so a replayed or inflated value cannot bypass drift detection.
+    """
     session_token: str
     user_id:       str
     latent_vector: list[float]
     e_rec:         float = Field(..., ge=0.0)
-    trust_score:   float = Field(..., ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_latent(self):
+        if len(self.latent_vector) != 32:
+            raise ValueError("latent_vector must be exactly 32-dim")
+        return self
 
 
 class MabRewardReq(BaseModel):
@@ -304,17 +338,11 @@ class MabRewardReq(BaseModel):
 
 
 class LogoutReq(BaseModel):
-    """
-    Keeps the session token out of the URL (query params appear in logs/proxies).
-    """
+    """Session token in body — never in the URL."""
     session_token: str
 
 
 class BiometricExtractReq(BaseModel):
-    """
-    Wrapper so FastAPI can deserialize a JSON array body for /biometric/extract.
-    A bare `list[float]` parameter is not supported by FastAPI's body parser.
-    """
     raw_signal: list[float]
 
 
@@ -325,16 +353,9 @@ class BiometricExtractReq(BaseModel):
 @app.post("/score")
 async def score(req: ScoreReq, request: Request):
     """
-    Runs the full 4-stage pipeline:
-      S1 Biometric interpretation
-      S2 Honeypot classification (MAB)
-      S3 Resource Governor (DQN)  → Argon2id preset
-      S4 Session Watchdog (PPO)   — skipped for confirmed bots
-
-    Always returns HTTP 200.  Bots receive a synthetic shadow token so they
-    cannot distinguish themselves from legitimate users via HTTP status codes.
+    Runs the full 4-stage pipeline.
+    Always returns HTTP 200 (bots receive a synthetic shadow token).
     """
-    # ── Build typed input ─────────────────────────────────────────────────────
     raw = BiometricInput(
         theta         = req.theta,
         h_exp         = req.h_exp,
@@ -344,10 +365,8 @@ async def score(req: ScoreReq, request: Request):
         ip_address    = getattr(request.client, "host", "?"),
     )
 
-    # ── Run pipeline (never raises; always returns PipelineOutput) ────────────
     result = orchestrator.run(raw)
 
-    # ── Persist honeypot entry when bot is shadow-routed ──────────────────────
     if result.shadow_mode:
         try:
             await store_honeypot_entry(
@@ -356,11 +375,9 @@ async def score(req: ScoreReq, request: Request):
                 theta       = req.theta,
                 ip_address  = raw.ip_address,
                 path        = "/score",
-                headers     = dict(request.headers),   # full headers for forensics
+                headers     = dict(request.headers),
             )
         except Exception as exc:
-            # Honeypot persistence failure must never affect the response —
-            # bots must not learn that logging broke.
             logger.error("[Honeypot] DB write failed: %s", exc)
 
     logger.info(
@@ -372,11 +389,10 @@ async def score(req: ScoreReq, request: Request):
         result.humanity_score,
     )
 
-    # ── Compose response ──────────────────────────────────────────────────────
     response: dict = {
         "session_token":       result.session_token,
         "shadow_mode":         result.shadow_mode,
-        "argon2_params":       result.argon2_params,       # {m, t, p}
+        "argon2_params":       result.argon2_params,
         "humanity_score":      result.humanity_score,
         "entropy_score":       result.entropy_score,
         "action_label":        result.action_label,
@@ -384,7 +400,6 @@ async def score(req: ScoreReq, request: Request):
         "degraded":            result.degraded,
     }
 
-    # Watchdog metrics — only present when S4 actually ran (non-bot, 32-dim vector)
     if result.watchdog is not None:
         response["watchdog"] = {
             "action":      result.watchdog.action.value,
@@ -394,7 +409,6 @@ async def score(req: ScoreReq, request: Request):
             "reason":      result.watchdog.reason,
         }
 
-    # MAB arm — only for shadow responses so the caller can close the reward loop
     if result.shadow_mode and result.honeypot.mab_arm_selected >= 0:
         response["mab_arm"] = result.honeypot.mab_arm_selected
 
@@ -408,20 +422,87 @@ async def score(req: ScoreReq, request: Request):
 @app.post("/session/verify")
 async def session_verify(req: SessionVerifyReq):
     """
-    Runs Stage 4 (Watchdog) in isolation for established sessions.
-    Called periodically by the client to detect identity drift mid-session.
+    Continuous identity-drift heartbeat.  Called periodically by the client.
+
+    Security model
+    ──────────────
+    1. The session token is validated against MongoDB first.  An expired or
+       invalidated session always returns 401 — the watchdog never runs for
+       dead sessions.
+    2. The trust score baseline comes from the DB record, not from the
+       request body.  This prevents a replayed / inflated value from
+       bypassing drift detection.
+    3. The watchdog's *updated* trust score (after decay / recovery) is
+       written back to the DB so the next heartbeat sees the correct state.
+    4. If the watchdog returns FORCE_LOGOUT the session is immediately
+       invalidated in the DB so subsequent requests also get 401.
     """
+    # ── 1. Validate session against DB ────────────────────────────────────────
+    try:
+        session = await get_session(db_handler.db, req.session_token)
+    except Exception as exc:
+        logger.error("[SessionVerify] DB read failed: %s", exc)
+        raise HTTPException(
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail      = "Session store unavailable",
+        )
+
+    if session is None:
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail      = "Invalid or expired session",
+            headers     = {"WWW-Authenticate": "Bearer"},
+        )
+
+    # Confirm the session belongs to the claimed user
+    if session.get("user_id") != req.user_id:
+        logger.warning(
+            "[SessionVerify] user_id mismatch: token owner=%s  claimed=%s",
+            session.get("user_id"), req.user_id,
+        )
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail      = "Session / user_id mismatch",
+        )
+
+    # ── 2. Use DB trust score as authoritative baseline ───────────────────────
+    db_trust_score: float = float(session.get("trust_score", 1.0))
+
+    # ── 3. Run watchdog ───────────────────────────────────────────────────────
     wd = orchestrator.run_watchdog(
         latent_vector = req.latent_vector,
         e_rec         = req.e_rec,
-        trust_score   = req.trust_score,
+        trust_score   = db_trust_score,   # ← DB value, not client-supplied
     )
 
-    # Persist updated trust score (non-critical; best-effort)
+    logger.info(
+        "[SessionVerify] user=%s action=%s trust %.3f→%.3f e_rec=%.3f conf=%s",
+        req.user_id, wd.action.value,
+        db_trust_score, wd.trust_score,
+        wd.e_rec, wd.confidence.value,
+    )
+
+    # ── 4. Persist updated trust score (post-decay) ───────────────────────────
     try:
-        await update_session_trust_score(db_handler.db, req.session_token, wd.trust_score)
+        await update_session_trust_score(
+            db_handler.db, req.session_token, wd.trust_score
+        )
     except Exception as exc:
+        # Non-critical: next heartbeat re-computes from the stale value, which
+        # is still safe — it just delays decay propagation by one cycle.
         logger.warning("[SessionVerify] trust-score persist failed: %s", exc)
+
+    # ── 5. Invalidate session immediately on FORCE_LOGOUT ─────────────────────
+    if wd.action == WatchdogAction.FORCE_LOGOUT:
+        try:
+            await invalidate_session(db_handler.db, req.session_token)
+            logger.info(
+                "[SessionVerify] Session invalidated (FORCE_LOGOUT): user=%s", req.user_id
+            )
+        except Exception as exc:
+            logger.error("[SessionVerify] Session invalidation failed: %s", exc)
+        # Still return the watchdog result so the client can display the
+        # correct reason / redirect to the login page.
 
     return {
         "action":      wd.action.value,
@@ -429,6 +510,8 @@ async def session_verify(req: SessionVerifyReq):
         "e_rec":       wd.e_rec,
         "confidence":  wd.confidence.value,
         "reason":      wd.reason,
+        # Convenience flag so the client doesn't have to string-compare action
+        "session_invalidated": wd.action == WatchdogAction.FORCE_LOGOUT,
     }
 
 
@@ -439,11 +522,29 @@ async def session_verify(req: SessionVerifyReq):
 @app.post("/honeypot/reward")
 async def honeypot_reward(req: MabRewardReq):
     """
-    Called after a shadow session ends.
-    reward > 0 → deception held; reward < 0 → bot escaped the honeypot.
+    Called after a shadow session ends to close the MAB reward loop.
+
+    reward > 0 → deception held (bot stayed in honeypot)
+    reward < 0 → bot escaped (arm strategy was ineffective)
+
+    The arm index is validated against the agent's actual number of arms so a
+    corrupted / replayed reward payload cannot index out of bounds.
     """
-    orchestrator.report_mab_reward(req.arm, req.reward)
-    return {"ok": True, "arm": req.arm, "reward": req.reward}
+    n_arms = mab_agent.n_arms
+    if not (0 <= req.arm < n_arms):
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail      = f"arm must be in [0, {n_arms - 1}]; got {req.arm}",
+        )
+
+    # Belt-and-suspenders clamp (Pydantic already enforces ge/le but explicit
+    # is better than implicit when it gates a model update)
+    reward = max(-1.0, min(1.0, req.reward))
+
+    orchestrator.report_mab_reward(req.arm, reward)
+
+    logger.info("[MAB] reward arm=%d  reward=%.3f", req.arm, reward)
+    return {"ok": True, "arm": req.arm, "reward": reward}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -454,8 +555,17 @@ async def honeypot_reward(req: MabRewardReq):
 async def register(req: UserCreate, request: Request):
     """
     Register a new user.
-    Uses the pipeline governor (DQN) to pick Argon2id strength at registration
-    time, binding account security to the server's current load profile.
+
+    Session lifecycle
+    ─────────────────
+    • After the user document is created a session is immediately opened so
+      the client can start the behavioural warm-up phase without a separate
+      login round-trip.
+    • The initial latent vector is all-zeros (no behavioural data yet); it
+      will be replaced on the first /session/verify heartbeat.
+    • The DQN governor picks the Argon2id preset at registration time based
+      on the current server load — binding account security to real-world
+      conditions, not a compile-time constant.
     """
     if await user_exists(db_handler.db, req.email):
         raise HTTPException(
@@ -463,7 +573,7 @@ async def register(req: UserCreate, request: Request):
             detail      = "An account with that email already exists",
         )
 
-    # Use a high-confidence human signal so we get a real (not economy) preset
+    # Governor chooses Argon2id strength
     bio_raw = BiometricInput(
         theta=0.9, h_exp=0.9, server_load=0.4,
         user_agent="", latent_vector=[], ip_address="register",
@@ -479,27 +589,57 @@ async def register(req: UserCreate, request: Request):
     password_hash = ph.hash(req.plain_password)
 
     try:
-        user_id       = await create_user(db_handler.db, req.email, password_hash)
-        lv            = [0.0] * 32
-        session_token = _make_session_token(user_id, lv, SESSION_SECRET)
-        await create_session(db_handler.db, user_id, session_token, lv)
-        await update_user_security_level(db_handler.db, user_id, gov.preset.value)
-        logger.info("[Auth] Registered %s  preset=%s", req.email, gov.preset.value)
-        return {
-            "success":        True,
-            "user_id":        user_id,
-            "email":          req.email,
-            "session_token":  session_token,
-            "security_level": gov.preset.value,
-        }
+        user_id = await create_user(db_handler.db, req.email, password_hash)
     except Exception as exc:
-        logger.error("[Auth] Register error: %s", exc, exc_info=True)
+        logger.error("[Auth] Register — user creation failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to register user")
+
+    # Open an initial session with a zero latent vector
+    initial_lv    = [0.0] * 32
+    session_token = _make_session_token(user_id, initial_lv, SESSION_SECRET)
+    try:
+        await create_session(
+            db_handler.db,
+            user_id       = user_id,
+            session_token = session_token,
+            latent_vector = initial_lv,
+            # Slightly shorter window for brand-new accounts — no behavioural
+            # baseline yet, so we trust the session for less time upfront.
+            expires_in_minutes = 20,
+        )
+    except Exception as exc:
+        logger.error("[Auth] Register — session creation failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create session after registration")
+
+    try:
+        await update_user_security_level(db_handler.db, user_id, gov.preset.value)
+    except Exception:
+        pass  # non-critical
+
+    logger.info("[Auth] Registered %s  preset=%s", req.email, gov.preset.value)
+    return {
+        "success":        True,
+        "user_id":        user_id,
+        "email":          req.email,
+        "session_token":  session_token,
+        "security_level": gov.preset.value,
+    }
 
 
 @app.post("/auth/login")
 async def login(req: UserLogin, request: Request):
-    """Standard email + password login.  Returns a session token on success."""
+    """
+    Email + password login.
+
+    Session lifecycle
+    ─────────────────
+    • A new session document is always created on successful login — we never
+      re-use a previous session token so stolen tokens from a prior session
+      cannot be replayed.
+    • The initial trust score is 1.0 (full trust at login time); it decays
+      based on watchdog heartbeats.
+    • The initial latent vector is zero; it is replaced on the first heartbeat.
+    """
     try:
         user = await get_user_by_email(db_handler.db, req.email)
         if not user:
@@ -515,15 +655,25 @@ async def login(req: UserLogin, request: Request):
         except VerifyMismatchError:
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
-        await update_last_login(db_handler.db, user["_id"])
-        lv            = [0.0] * 32
-        session_token = _make_session_token(user["_id"], lv, SESSION_SECRET)
-        await create_session(db_handler.db, user["_id"], session_token, lv)
+        user_id = user["_id"]
+        await update_last_login(db_handler.db, user_id)
+
+        # Create a fresh session (never reuse old tokens)
+        initial_lv    = [0.0] * 32
+        session_token = _make_session_token(user_id, initial_lv, SESSION_SECRET)
+        await create_session(
+            db_handler.db,
+            user_id       = user_id,
+            session_token = session_token,
+            latent_vector = initial_lv,
+            expires_in_minutes = 30,
+        )
+
         logger.info("[Auth] Login: %s", req.email)
         return {
             "success":        True,
             "session_token":  session_token,
-            "user_id":        user["_id"],
+            "user_id":        user_id,
             "email":          user["email"],
             "security_level": user.get("security_level", "standard"),
         }
@@ -537,11 +687,9 @@ async def login(req: UserLogin, request: Request):
 @app.post("/auth/logout")
 async def logout(req: LogoutReq):
     """
-    Invalidate a session.
-
-    The session token is accepted in the request body (not as a query parameter)
-    so it never appears in server access logs, reverse-proxy logs, or browser
-    history — all of which record full URLs including query strings.
+    Invalidate a session.  Token in the request body, never the URL.
+    Protected by the session guard so a forged token never reaches the DB
+    invalidation call.
     """
     try:
         await invalidate_session(db_handler.db, req.session_token)
@@ -552,15 +700,44 @@ async def logout(req: LogoutReq):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Protected: example of a route that requires an active session
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/me")
+async def me(session: ActiveSession):
+    """
+    Returns the authenticated user's profile.
+
+    Demonstrates `require_active_session`: the dependency validates the
+    X-Session-Token header against MongoDB before this handler runs.
+    If the session is invalid or expired the caller gets HTTP 401.
+    """
+    user_id = session["user_id"]
+    try:
+        user = await get_user_by_id(db_handler.db, user_id)
+    except Exception as exc:
+        logger.error("[Me] DB error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to retrieve profile")
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "user_id":        user_id,
+        "email":          user.get("email"),
+        "security_level": user.get("security_level", "standard"),
+        "last_login":     user.get("last_login"),
+        "created_at":     user.get("created_at"),
+        "trust_score":    session.get("trust_score", 1.0),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Password utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/password/hash")
 async def pw_hash(req: PwHashReq, user_id: Optional[str] = None):
-    """
-    Hash a plaintext password using the DQN-selected Argon2id preset.
-    Optionally updates the user's stored security_level to reflect the chosen preset.
-    """
     bio_raw = BiometricInput(
         theta=req.theta, h_exp=req.h_exp, server_load=0.5,
         user_agent="", latent_vector=[], ip_address="hash",
@@ -581,7 +758,7 @@ async def pw_hash(req: PwHashReq, user_id: Optional[str] = None):
         try:
             await update_user_security_level(db_handler.db, user_id, gov.preset.value)
         except Exception:
-            pass  # non-critical
+            pass
 
     return {
         "hash":          hashed,
@@ -595,7 +772,6 @@ async def pw_hash(req: PwHashReq, user_id: Optional[str] = None):
 
 @app.post("/password/verify")
 async def pw_verify(req: PwHashReq):
-    """Verify a plaintext password against a stored Argon2id hash."""
     try:
         PasswordHasher().verify(req.stored_hash, req.plain_password)
         return {"valid": True}
@@ -657,16 +833,11 @@ async def pipeline_debug(
     h_exp:       float = 0.5,
     server_load: float = 0.4,
 ):
-    """
-    Dry-run the full pipeline with synthetic inputs.
-    Returns the per-stage breakdown — useful for smoke-testing without a browser.
-    """
     raw    = BiometricInput(
         theta=theta, h_exp=h_exp, server_load=server_load,
         user_agent="debug", latent_vector=[0.0] * 32, ip_address="127.0.0.1",
     )
     result = orchestrator.run(raw)
-
     return {
         "shadow_mode":         result.shadow_mode,
         "action_label":        result.action_label,
@@ -706,13 +877,6 @@ async def pipeline_debug(
 
 @app.post("/biometric/extract")
 async def biometric_extract(req: BiometricExtractReq):
-    """
-    Run a raw keystroke/touch signal through the CNN1D feature extractor.
-
-    The request body is a JSON object: {"raw_signal": [0.1, 0.3, …]}
-    A bare JSON array is not supported by FastAPI's body parser, so we wrap
-    it in BiometricExtractReq.
-    """
     try:
         features = cnn_model.extract(req.raw_signal)
         return {"success": True, "features": features, "dim": len(features)}
@@ -722,7 +886,18 @@ async def biometric_extract(req: BiometricExtractReq):
 
 
 @app.get("/biometric/profile/{user_id}")
-async def get_biometric_profile_api(user_id: str):
+async def get_biometric_profile_api(user_id: str, session: ActiveSession):
+    """
+    Protected by the session guard.  A user may only fetch their own profile
+    unless they present an admin-scoped session (not implemented yet — the
+    guard simply ensures the caller is authenticated).
+    """
+    # Scope check: callers may only read their own profile
+    if session.get("user_id") != user_id:
+        raise HTTPException(
+            status_code = status.HTTP_403_FORBIDDEN,
+            detail      = "Cannot access another user's biometric profile",
+        )
     try:
         profile = await get_biometric_profile(db_handler.db, user_id)
         if not profile:

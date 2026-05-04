@@ -2,6 +2,16 @@
 MongoDB Connection and Database Operations for Entropy Prime
 Includes per-user biometric profile: feature selection, drift tracking, behavioral pattern storage.
 Production-ready with connection pooling and retry logic.
+
+v3.1.0 changes
+──────────────
+• update_session_trust_score: now accepts the *post-decay* trust score from
+  the watchdog and writes it atomically with `last_verified`.  The previous
+  implementation wrote the client-supplied score, which could be inflated.
+• get_active_session_for_user: new helper — returns the most-recently-created
+  active session for a given user_id.  Used by tests and admin tooling; the
+  /session/verify flow uses get_session (token-keyed lookup) instead.
+• No other behaviour changes.
 """
 import os
 import logging
@@ -39,7 +49,6 @@ class Database:
                     maxPoolSize=50,
                     minPoolSize=10,
                 )
-                # Test the connection
                 await self.client.admin.command('ping')
                 self.db = self.client[db_name]
                 await self._create_indexes()
@@ -53,15 +62,11 @@ class Database:
                 else:
                     logger.warning(f"Failed to connect to real MongoDB after {self.max_retries} attempts")
                     logger.info("Falling back to mongomock (in-memory) for development...")
-                    
-                    # Fallback: use mongomock (synchronous wrapper in async context)
                     try:
                         import mongomock
-                        # Create sync mongomock client
                         sync_client = mongomock.MongoClient()
-                        self.client = sync_client  # Will work with Motor's interface
+                        self.client = sync_client
                         self.db = sync_client[db_name]
-                        # Skip index creation for mongomock (not fully supported)
                         logger.info(f"✓ Using mongomock database: {db_name} (development/test mode)")
                         return
                     except Exception as mock_err:
@@ -85,16 +90,13 @@ class Database:
             )
             await self.db.honeypot.create_index([("timestamp", DESCENDING)])
             await self.db.honeypot.create_index("ip_address")
-            # Per-user biometric profile indexes
             await self.db.biometric_profiles.create_index("user_id", unique=True)
             await self.db.biometric_profiles.create_index([("updated_at", DESCENDING)])
-            # Drift event log
             await self.db.drift_events.create_index("user_id")
             await self.db.drift_events.create_index([("timestamp", DESCENDING)])
             await self.db.drift_events.create_index(
-                [("timestamp", ASCENDING)], expireAfterSeconds=60 * 60 * 24 * 30  # 30-day TTL
+                [("timestamp", ASCENDING)], expireAfterSeconds=60 * 60 * 24 * 30
             )
-            # Feature selection history per user
             await self.db.feature_selections.create_index("user_id")
             await self.db.feature_selections.create_index([("recorded_at", DESCENDING)])
             logger.info("✓ All database indexes created")
@@ -196,12 +198,67 @@ async def invalidate_session(db: AsyncIOMotorDatabase, session_token: str):
     )
 
 async def update_session_trust_score(
-    db: AsyncIOMotorDatabase, session_token: str, trust_score: float
-):
-    await db.sessions.update_one(
-        {"session_token": session_token},
-        {"$set": {"trust_score": trust_score, "last_verified": datetime.utcnow()}}
+    db: AsyncIOMotorDatabase,
+    session_token: str,
+    trust_score: float,
+) -> bool:
+    """
+    Persist the watchdog's post-decay trust score for a session.
+
+    This is called with the *updated* trust score returned by
+    WatchdogResult.trust_score — i.e. after the watchdog has already applied
+    its decay / recovery delta.  We never write a client-supplied value here.
+
+    `last_verified` is stamped to the current UTC time so the admin dashboard
+    can show how stale the heartbeat is.
+
+    Returns True on a successful update, False when no matching active session
+    was found (e.g. already invalidated by a concurrent FORCE_LOGOUT).
+    """
+    trust_score = max(0.0, min(1.0, trust_score))   # clamp: DB must never store out-of-range
+
+    result = await db.sessions.update_one(
+        {
+            "session_token": session_token,
+            "is_active":     True,    # don't silently re-open an invalidated session
+        },
+        {
+            "$set": {
+                "trust_score":   trust_score,
+                "last_verified": datetime.utcnow(),
+            }
+        },
     )
+    updated = result.matched_count > 0
+    if not updated:
+        logger.warning(
+            "[DB] update_session_trust_score: no active session found for token …%s",
+            session_token[-8:],
+        )
+    return updated
+
+async def get_active_session_for_user(
+    db: AsyncIOMotorDatabase,
+    user_id: str,
+) -> Optional[dict]:
+    """
+    Return the most-recently-created *active* session for a user.
+
+    Intended for tests and admin tooling.  The /session/verify flow uses
+    get_session (token-keyed) instead because it always has the token.
+    """
+    session = await db.sessions.find_one(
+        {
+            "user_id":   user_id,
+            "is_active": True,
+            "expires_at": {"$gt": datetime.utcnow()},
+        },
+        sort=[("created_at", DESCENDING)],
+    )
+    if session:
+        session["_id"]     = str(session["_id"])
+        session["user_id"] = str(session["user_id"])
+    return session
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-User Biometric Profile Operations
@@ -213,15 +270,11 @@ async def upsert_biometric_profile(
     sample_count: int,
     last_drift: float,
     adaptive_threshold: float,
-    feature_means: List[float],       # 8-dim EMA feature vector
-    selected_features: List[str],     # e.g. ["dwell_norm","flight_norm",...]
-    ema_profile: Optional[List[float]] = None,   # full EMA profile vector
-    ema_variance: Optional[List[float]] = None,  # per-feature variance
+    feature_means: List[float],
+    selected_features: List[str],
+    ema_profile: Optional[List[float]] = None,
+    ema_variance: Optional[List[float]] = None,
 ) -> str:
-    """
-    Upsert the per-user biometric profile.
-    Stores the full behavioral EMA and per-user selected feature subset.
-    """
     now = datetime.utcnow()
     update_doc = {
         "$set": {
@@ -250,14 +303,12 @@ async def upsert_biometric_profile(
     return str(result.upserted_id) if result.upserted_id else user_id
 
 async def get_biometric_profile(db: AsyncIOMotorDatabase, user_id: str) -> Optional[dict]:
-    """Retrieve full biometric profile for a user."""
     profile = await db.biometric_profiles.find_one({"user_id": user_id})
     if profile:
         profile["_id"] = str(profile["_id"])
     return profile
 
 async def get_biometric_profile_summary(db: AsyncIOMotorDatabase, user_id: str) -> Optional[dict]:
-    """Lightweight profile summary (no heavy arrays)."""
     profile = await db.biometric_profiles.find_one(
         {"user_id": user_id},
         {
@@ -285,7 +336,6 @@ async def store_biometric_sample(
     bigram: float,
     device_ip: str,
 ):
-    """Store a raw biometric sample (8-dim) and update rolling EMA on profile."""
     sample = {
         "timestamp": datetime.utcnow(),
         "theta":     theta,
@@ -323,7 +373,7 @@ async def store_biometric_sample(
     result = await db.biometric_profiles.update_one(
         {"user_id": user_id},
         {
-            "$push": {"samples": {"$each": [sample], "$slice": -500}},  # keep last 500
+            "$push": {"samples": {"$each": [sample], "$slice": -500}},
             "$set": {
                 "avg_theta":  avg_theta,
                 "avg_h_exp":  avg_h_exp,
@@ -359,7 +409,6 @@ async def log_drift_event(
     action: str,
     session_token: str = "",
 ):
-    """Append a drift detection event for forensic/audit use."""
     event = {
         "user_id":           user_id,
         "timestamp":         datetime.utcnow(),
@@ -379,7 +428,6 @@ async def get_drift_events(
     user_id: str,
     limit: int = 50,
 ) -> List[dict]:
-    """Retrieve recent drift events for a user."""
     events = await db.drift_events.find(
         {"user_id": user_id}
     ).sort("timestamp", DESCENDING).limit(limit).to_list(limit)
@@ -388,7 +436,6 @@ async def get_drift_events(
     return events
 
 async def get_drift_summary(db: AsyncIOMotorDatabase, user_id: str) -> dict:
-    """Aggregate drift stats for a user."""
     pipeline = [
         {"$match": {"user_id": user_id}},
         {"$group": {
@@ -415,7 +462,6 @@ async def record_feature_selection(
     feature_variances: List[float],
     sample_count: int,
 ):
-    """Snapshot the current feature selection state for drift/audit analysis."""
     doc = {
         "user_id":          user_id,
         "recorded_at":      datetime.utcnow(),
@@ -432,7 +478,6 @@ async def get_feature_selection_history(
     user_id: str,
     limit: int = 20,
 ) -> List[dict]:
-    """Retrieve feature selection history for a user (for stability analysis)."""
     docs = await db.feature_selections.find(
         {"user_id": user_id}
     ).sort("recorded_at", DESCENDING).limit(limit).to_list(limit)
