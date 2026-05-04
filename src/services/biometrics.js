@@ -687,8 +687,10 @@ export class EntropyPrimeClient {
       
       // Need minimum window to generate proper tensor
       if (keyEvents.length < 10) {
-        console.log('[getLatentVector] Not enough samples yet:', keyEvents.length)
-        return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
+        console.log('[getLatentVector] Not enough samples:', keyEvents.length, '- returning random vector')
+        const randomVec = new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
+        console.log('[getLatentVector] Random vector length:', randomVec.length)
+        return randomVec
       }
       
       // Use proper CNN input with all 8 features
@@ -697,10 +699,24 @@ export class EntropyPrimeClient {
       const latentArr = await prediction.data()
       tensor.dispose()
       prediction.dispose()
-      return Array.from(latentArr)
+      
+      const result = Array.from(latentArr)
+      console.log('[getLatentVector] Generated vector length:', result.length, 'values:', result.slice(0, 5), '...')
+      
+      // Ensure exactly LATENT_DIM dimensions
+      if (result.length !== LATENT_DIM) {
+        console.warn('[getLatentVector] Length mismatch! Expected', LATENT_DIM, 'got', result.length)
+        const padded = new Array(LATENT_DIM).fill(0)
+        result.slice(0, LATENT_DIM).forEach((v, i) => { padded[i] = v })
+        return padded
+      }
+      
+      return result
     } catch (e) {
-      console.error('Failed to get latent vector:', e)
-      return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.05)
+      console.error('[getLatentVector] Exception:', e)
+      const fallback = new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.05)
+      console.log('[getLatentVector] Returning fallback vector, length:', fallback.length)
+      return fallback
     }
   }
 

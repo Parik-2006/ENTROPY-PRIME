@@ -179,7 +179,12 @@ export default function LoginPage() {
 
       setPhase('hashing')
 
-      console.log('[LoginPage] Submitting score:', { theta, hExp, latentVectorLen: latentVector.length })
+      console.log('[LoginPage] Before submitScore:', {
+        theta: typeof theta, thetaVal: theta, isFinite_theta: isFinite(theta),
+        hExp: typeof hExp, hExpVal: hExp, isFinite_hExp: isFinite(hExp),
+        latentVectorLen: latentVector.length,
+        latentFirst5: latentVector.slice(0, 5),
+      })
       const scoreData = await submitScore({
         theta, hExp, latentVector,
         serverLoad: 0.4 + Math.random() * 0.3,

@@ -23,8 +23,23 @@ async function req(path, method = 'GET', body = null) {
   const res  = await fetch(BACKEND_URL + path, opts)
   const data = await res.json()
   if (!res.ok) {
-    const errorMsg = data.detail || `API error ${res.status}`
-    console.error(`[API] ${res.status} ${path}:`, data)
+    // Format error message
+    let errorMsg = data.detail || `API error ${res.status}`
+    
+    // If detail is an array of validation errors
+    if (Array.isArray(data.detail)) {
+      errorMsg = data.detail.map(err => {
+        if (err.msg) return `${err.loc?.join('.')}: ${err.msg}`
+        return JSON.stringify(err)
+      }).join('; ')
+    }
+    
+    console.error(`[API] ${res.status} ${path}:`, {
+      status: res.status,
+      detail: data.detail,
+      errorMsg,
+      fullResponse: data
+    })
     throw new Error(errorMsg)
   }
   return data
@@ -50,13 +65,21 @@ async function req(path, method = 'GET', body = null) {
  * }
  */
 export async function submitScore({ theta, hExp, latentVector, userAgent, serverLoad }) {
-  return req('/score', 'POST', {
+  const payload = {
     theta,
     h_exp:         hExp,
     server_load:   serverLoad ?? 0.5,
     user_agent:    userAgent  ?? navigator.userAgent,
     latent_vector: latentVector ?? [],
+  }
+  console.log('[submitScore] Payload:', {
+    theta: payload.theta,
+    h_exp: payload.h_exp,
+    latent_vector_len: payload.latent_vector.length,
+    latent_vector_valid: payload.latent_vector.length === 0 || payload.latent_vector.length === 32,
+    server_load: payload.server_load,
   })
+  return req('/score', 'POST', payload)
 }
 
 // ── Password ──────────────────────────────────────────────────────────────────
