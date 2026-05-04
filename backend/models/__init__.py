@@ -1,13 +1,14 @@
 """
 Entropy Prime — Models Package
-Orchestration, ML agents, and training pipelines.
+Contracts, orchestration, ML agents, and training pipelines.
 """
 
 # ─── Contracts & Config ───────────────────────────────────────────────────────
 from .contracts import (
     BiometricInput,
+    BiometricResult,
     HoneypotResult,
-    GovernorOutput,
+    GovernorResult,
     WatchdogResult,
     PipelineOutput,
     Confidence,
@@ -23,46 +24,54 @@ from .contracts import (
     SERVER_LOAD_HIGH,
 )
 
-# ─── Orchestrator ─────────────────────────────────────────────────────────────
-from .orchestrator import PipelineOrchestrator
-
-# ─── ML Agents ─────────────────────────────────────────────────────────────────
-from .cnn1d import CNN1D
-from .dqn import DQNAgent
-from .mab import MABAgent
-from .ppo import PPOAgent
-
-# ─── Pipeline Stages ──────────────────────────────────────────────────────────
-from .stage1_biometric import Stage1BiometricInterpreter
-from .stage2_honeypot import Stage2HoneypotClassifier
-from .stage3_governor import Stage3ResourceGovernor
-from .stage4_watchdog import Stage4SessionWatchdog
+# ─── Lazy Imports: Torch/ML Dependencies ──────────────────────────────────────
+try:
+    from .orchestrator import PipelineOrchestrator
+    from .cnn1d import CNN1D
+    from .dqn import DQNAgent
+    from .mab import MABAgent
+    from .ppo import PPOAgent
+    from .stage1_biometric import Stage1BiometricInterpreter
+    from .stage2_honeypot import Stage2HoneypotClassifier
+    from .stage3_governor import Stage3ResourceGovernor
+    from .stage4_watchdog import Stage4SessionWatchdog
+    _TORCH_AVAILABLE = True
+except ImportError as e:
+    # PyTorch or related dependency not available; stages will be imported later
+    _TORCH_AVAILABLE = False
+    _TORCH_ERROR = str(e)
 
 # ─── Pydantic Models ──────────────────────────────────────────────────────────
-from .pydantic_models import (
-    UserCreate,
-    UserLogin,
-    User,
-    UserResponse,
-    Session,
-    BiometricSample,
-    BiometricProfile,
-    HoneypotEntry,
-    AuthResponse,
-    PasswordHashResponse,
-)
+try:
+    from .pydantic_models import (
+        UserCreate,
+        UserLogin,
+        User,
+        UserResponse,
+        Session,
+        BiometricSample,
+        BiometricProfile,
+        HoneypotEntry,
+        AuthResponse,
+        PasswordHashResponse,
+    )
+except ImportError:
+    pass
 
 __all__ = [
     # Contracts
     "BiometricInput",
+    "BiometricResult",
     "HoneypotResult",
-    "GovernorOutput",
+    "GovernorResult",
     "WatchdogResult",
     "PipelineOutput",
+    # Enums
     "Confidence",
     "HoneypotVerdict",
     "SecurityPreset",
     "WatchdogAction",
+    # Thresholds
     "BOT_THETA_HARD",
     "BOT_THETA_SOFT",
     "EREC_WARN",
@@ -70,14 +79,13 @@ __all__ = [
     "TRUST_WARN",
     "TRUST_CRITICAL",
     "SERVER_LOAD_HIGH",
-    # Orchestrator
+    # Orchestrator & Agents (if available)
     "PipelineOrchestrator",
-    # Agents
     "CNN1D",
     "DQNAgent",
     "MABAgent",
     "PPOAgent",
-    # Stages
+    # Stages (if available)
     "Stage1BiometricInterpreter",
     "Stage2HoneypotClassifier",
     "Stage3ResourceGovernor",
@@ -93,4 +101,6 @@ __all__ = [
     "HoneypotEntry",
     "AuthResponse",
     "PasswordHashResponse",
+    # Diagnostics
+    "_TORCH_AVAILABLE",
 ]

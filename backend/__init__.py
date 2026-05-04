@@ -1,5 +1,5 @@
 """Entropy Prime — Multi-Agent Pipeline Package"""
-from .contracts    import (
+from .models.contracts    import (
     BiometricInput, BiometricResult,
     HoneypotResult, GovernorResult, WatchdogResult,
     PipelineOutput, Confidence,
@@ -9,7 +9,7 @@ from .contracts    import (
     TRUST_WARN, TRUST_CRITICAL,
     SERVER_LOAD_HIGH,
 )
-from .orchestrator import PipelineOrchestrator
+from .models.orchestrator import PipelineOrchestrator
 
 __all__ = [
     "BiometricInput", "BiometricResult",

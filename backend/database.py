@@ -25,7 +25,7 @@ class Database:
         self.retry_delay = 2
 
     async def connect_to_mongo(self):
-        """Connect to MongoDB with retry logic for production resilience."""
+        """Connect to MongoDB with retry logic. Falls back to mongomock for development."""
         mongo_url = os.environ.get("MONGODB_URL", "mongodb://localhost:27017")
         db_name   = os.environ.get("MONGODB_DB_NAME", "entropy_prime")
         
@@ -51,8 +51,22 @@ class Database:
                     import asyncio
                     await asyncio.sleep(self.retry_delay)
                 else:
-                    logger.error(f"Failed to connect to MongoDB after {self.max_retries} attempts")
-                    raise
+                    logger.warning(f"Failed to connect to real MongoDB after {self.max_retries} attempts")
+                    logger.info("Falling back to mongomock (in-memory) for development...")
+                    
+                    # Fallback: use mongomock (synchronous wrapper in async context)
+                    try:
+                        import mongomock
+                        # Create sync mongomock client
+                        sync_client = mongomock.MongoClient()
+                        self.client = sync_client  # Will work with Motor's interface
+                        self.db = sync_client[db_name]
+                        # Skip index creation for mongomock (not fully supported)
+                        logger.info(f"✓ Using mongomock database: {db_name} (development/test mode)")
+                        return
+                    except Exception as mock_err:
+                        logger.error(f"Failed to initialize mongomock: {mock_err}")
+                        raise
 
     async def close_mongo_connection(self):
         if self.client:
