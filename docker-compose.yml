@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # MongoDB for data persistence
   mongodb:
-    image: mongo:7-alpine
+    image: mongo:7
     container_name: entropy-prime-mongodb
     restart: always
     ports:

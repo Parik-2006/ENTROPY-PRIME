@@ -71,6 +71,22 @@ export function AuthProvider({ children }) {
     }
   }, [user])
 
+  // Update profile stats frequently for real-time progress tracking
+  useEffect(() => {
+    if (!user) return
+    const id = setInterval(() => {
+      try {
+        const ep = clientRef.current
+        if (!ep) return
+        const pStats = ep.getProfileStats()
+        setProfileStats(pStats)
+      } catch (e) {
+        console.error('Failed to update profile stats:', e)
+      }
+    }, 2000) // Update every 2 seconds for live progress
+    return () => clearInterval(id)
+  }, [user])
+
   // Watchdog heartbeat every 30s with per-user profile drift info
   useEffect(() => {
     if (!user) return

@@ -658,19 +658,21 @@ export class EntropyPrimeClient {
 
   /**
    * Generates a 32-dim latent vector from current behavioral signals.
-   * This is sent to the backend for identity verification.
+   * Uses proper 8-channel CNN input with all biometric features.
    */
   async getLatentVector() {
     try {
-      const keyboardData = this.keyboard.getWindow(CNN_SEQ_LEN).map(e => e.dwell)
-      if (keyboardData.length < CNN_SEQ_LEN) {
+      const keyEvents = this.keyboard.getWindow(CNN_SEQ_LEN)
+      const pointerEvents = this.pointer.getWindow(CNN_SEQ_LEN)
+      
+      // Need minimum window to generate proper tensor
+      if (keyEvents.length < 10) {
+        console.log('[getLatentVector] Not enough samples yet:', keyEvents.length)
         return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
       }
       
-      const tensor = tf.tensor3d(
-        [keyboardData.map(value => [value])],
-        [1, CNN_SEQ_LEN, 1],
-      )
+      // Use proper CNN input with all 8 features
+      const tensor = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
       const prediction = this.cnn.predict(tensor)
       const latentArr = await prediction.data()
       tensor.dispose()
@@ -680,6 +682,20 @@ export class EntropyPrimeClient {
       console.error('Failed to get latent vector:', e)
       return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.05)
     }
+  }
+
+  /**
+   * Get current biometric sample count for progress tracking
+   */
+  getSampleCount() {
+    return this._featureSampleCount
+  }
+
+  /**
+   * Get keyboard event window size
+   */
+  getKeyboardEventCount() {
+    return this.keyboard._events.length
   }
 }
 

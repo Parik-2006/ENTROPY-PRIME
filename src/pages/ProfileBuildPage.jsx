@@ -186,6 +186,27 @@ export default function ProfileBuildPage() {
             }}>
               {profileStats?.sampleCount ?? 0} / 50 SAMPLES {isProfileStable ? '✓ STABLE' : ''}
             </div>
+            {!isProfileStable && (
+              <div style={{
+                color: 'var(--text3)',
+                fontSize: '10px',
+                marginTop: '8px',
+                fontStyle: 'italic'
+              }}>
+                {50 - (profileStats?.sampleCount ?? 0)} more samples needed...
+              </div>
+            )}
+            {isProfileStable && (
+              <div style={{
+                color: 'var(--accent3)',
+                fontSize: '10px',
+                marginTop: '8px',
+                fontWeight: 600,
+                animation: 'blink 1.5s infinite'
+              }}>
+                ✓ Profile ready! Test scenarios enabled.
+              </div>
+            )}
           </div>
 
           <div style={{ 
