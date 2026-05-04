@@ -78,6 +78,16 @@ class PPOAgent:
             prob  = float(probs[idx].item())
         return idx, prob
 
+    def policy(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Return action probability distribution for a state tensor.
+        Accepts a batched tensor (batch, state_dim) and returns (batch, action_dim).
+        Used directly by tests that inspect the raw policy output.
+        """
+        with torch.no_grad():
+            return self.actor(state)
+
+
     # ── Checkpoint I/O ────────────────────────────────────────────────────────
 
     def load_checkpoint(self, path: str) -> None:

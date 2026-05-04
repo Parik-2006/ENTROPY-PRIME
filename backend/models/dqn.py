@@ -66,6 +66,45 @@ class DQNAgent:
             q = self.q_net(t)
             return int(q.argmax(dim=1).item())
 
+    def q_values(self, state: np.ndarray) -> np.ndarray:
+        """Return raw Q-values for all actions (shape: (action_dim,))."""
+        with torch.no_grad():
+            t = torch.FloatTensor(state).unsqueeze(0)
+            return self.q_net(t).squeeze(0).numpy()
+
+    def train_step(
+        self,
+        state:      np.ndarray,
+        action:     int,
+        reward:     float,
+        next_state: np.ndarray,
+        done:       bool,
+        gamma:      float = 0.99,
+    ) -> float:
+        """
+        Single TD-error training step.  Returns the scalar loss value.
+        (Used by tests and offline training scripts; not called at request time.)
+        """
+        import torch.optim as optim
+        optimizer = optim.Adam(self.q_net.parameters(), lr=1e-3)
+        self.q_net.train()
+
+        s  = torch.FloatTensor(state).unsqueeze(0)
+        ns = torch.FloatTensor(next_state).unsqueeze(0)
+
+        with torch.no_grad():
+            target_q = reward if done else reward + gamma * self.q_net(ns).max().item()
+
+        current_q = self.q_net(s)[0, action]
+        loss = (current_q - target_q) ** 2
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        self.q_net.eval()
+        return float(loss.item())
+
+
     # ── Checkpoint I/O ────────────────────────────────────────────────────────
 
     def load_checkpoint(self, path: str) -> None:

@@ -32,7 +32,7 @@ class SecurityPreset(str, Enum):
 class WatchdogAction(str, Enum):
     OK                    = "ok"
     PASSIVE_REAUTH        = "passive_reauth"
-    DISABLE_SENSITIVE_API = "disable_sensitive_apis"
+    DISABLE_SENSITIVE_API = "disable_sensitive_api"
     FORCE_LOGOUT          = "force_logout"
 
 

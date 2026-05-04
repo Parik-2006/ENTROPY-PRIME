@@ -135,8 +135,10 @@ def _make_shadow_token(ip: str, arm: int, secret: str) -> str:
     """
     Synthetic session token that mimics the real token format.
     HMAC-signed with the shadow secret so it cannot be replayed against real endpoints.
+    Prefixed with "ep_shadow_" so callers can identify shadow sessions.
     """
     payload = f"shadow:{ip}:{arm}:{int(time.time())}"
     sig     = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     encoded = (payload + ":" + sig).encode().hex()
-    return secrets.token_urlsafe(8) + "." + encoded
+    return "ep_shadow_" + secrets.token_hex(4) + "." + encoded
+

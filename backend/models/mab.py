@@ -50,12 +50,14 @@ class MABAgent:
     def update(self, arm: int, reward: float) -> None:
         """Incremental running-average update (Welford-style)."""
         if arm < 0 or arm >= self.n_arms:
-            logger.warning("MAB update: invalid arm %d (n_arms=%d)", arm, self.n_arms)
-            return
+            raise ValueError(
+                f"Invalid arm {arm}: must be in [0, {self.n_arms - 1}]"
+            )
         self.counts[arm] += 1
         self._total      += 1
         n = self.counts[arm]
         self.values[arm] += (reward - self.values[arm]) / n
+
 
     # ── Checkpoint I/O ────────────────────────────────────────────────────────
 

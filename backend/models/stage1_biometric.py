@@ -42,6 +42,7 @@ def run(raw: BiometricInput) -> BiometricResult:
     """
     theta = float(raw.theta)
     h_exp = float(raw.h_exp)
+    has_latent = bool(raw.latent_vector)
 
     try:
         if theta < BOT_THETA_HARD:
@@ -72,8 +73,16 @@ def run(raw: BiometricInput) -> BiometricResult:
                 note        = f"θ={theta:.3f} in suspect band",
             )
 
-        # Confirmed human
-        conf = Confidence.HIGH if theta > 0.85 else Confidence.MEDIUM
+        # Confirmed human — determine confidence
+        # [BOT_THETA_SOFT, 0.50) → LOW: contested band, barely past the threshold
+        if theta < 0.50:
+            conf = Confidence.LOW
+        elif theta > 0.85:
+            # Only HIGH if we also have a latent vector to back it up
+            conf = Confidence.HIGH if has_latent else Confidence.MEDIUM
+        else:
+            conf = Confidence.MEDIUM
+
         return BiometricResult(
             theta       = theta,
             h_exp       = h_exp,
@@ -82,7 +91,7 @@ def run(raw: BiometricInput) -> BiometricResult:
             confidence  = conf,
             is_bot      = False,
             is_suspect  = False,
-            note        = "",
+            note        = "" if has_latent else "no_latent_vector",
         )
 
     except Exception as exc:
@@ -95,3 +104,4 @@ def run(raw: BiometricInput) -> BiometricResult:
             confidence  = Confidence.LOW,
             note        = f"error_fallback: {exc}",
         )
+

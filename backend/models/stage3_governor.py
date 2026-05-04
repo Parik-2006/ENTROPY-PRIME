@@ -73,6 +73,12 @@ def run(bio: BiometricResult, dqn_agent) -> GovernorResult:
         state  = _build_state(bio)
         action = int(dqn_agent.select_action(state))
         action = max(0, min(3, action))          # clamp to valid range
+
+        # Cap preset for high server load — even humans get at most STANDARD
+        # when the server is under strain, to avoid burning extra compute.
+        if bio.server_load >= SERVER_LOAD_HIGH:
+            action = min(action, 1)  # ECONOMY=0 or STANDARD=1
+
         conf   = _action_confidence(bio, action)
         preset, mem, tc, par = _PRESETS[action]
         logger.debug("[S3] DQN → action=%d (%s) conf=%s", action, preset.value, conf.value)
@@ -97,6 +103,7 @@ def run(bio: BiometricResult, dqn_agent) -> GovernorResult:
             confidence  = Confidence.LOW,
             fallback    = True,
         )
+
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
