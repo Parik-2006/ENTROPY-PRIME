@@ -1,31 +1,33 @@
 """
-Entropy Prime — Multi-Agent Pipeline Contracts
-All inter-model I/O is typed here. Every agent consumes and produces
-one of these dataclasses. Nothing raw passes between stages.
+pipeline/contracts.py
+
+Typed contracts for every inter-stage boundary.
+A single source of truth for all thresholds, enums, and dataclasses.
+No business logic lives here — only shapes and constants.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, List
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class Confidence(str, Enum):
-    HIGH   = "high"    # agent is certain (score ≥ threshold)
-    MEDIUM = "medium"  # agent is uncertain; downstream may hedge
-    LOW    = "low"     # agent is guessing; fallback rules apply
+    HIGH   = "high"    # ≥ threshold; agent is certain
+    MEDIUM = "medium"  # uncertain; downstream may hedge
+    LOW    = "low"     # guessing; fallback rules apply
 
 class HoneypotVerdict(str, Enum):
-    BOT      = "bot"       # θ < BOT_THETA_HARD
-    SUSPECT  = "suspect"   # BOT_THETA_HARD ≤ θ < BOT_THETA_SOFT
-    HUMAN    = "human"     # θ ≥ BOT_THETA_SOFT
+    BOT     = "bot"      # θ < BOT_THETA_HARD
+    SUSPECT = "suspect"  # BOT_THETA_HARD ≤ θ < BOT_THETA_SOFT
+    HUMAN   = "human"    # θ ≥ BOT_THETA_SOFT
 
 class SecurityPreset(str, Enum):
-    ECONOMY  = "economy"   # DQN action 0
+    ECONOMY  = "economy"   # DQN action 0 — cheapest; used for bots
     STANDARD = "standard"  # DQN action 1
     HARD     = "hard"      # DQN action 2
-    PUNISHER = "punisher"  # DQN action 3
+    PUNISHER = "punisher"  # DQN action 3 — maximum hardening
 
 class WatchdogAction(str, Enum):
     OK                    = "ok"
@@ -36,36 +38,36 @@ class WatchdogAction(str, Enum):
 
 # ── Thresholds (single source of truth) ───────────────────────────────────────
 
-BOT_THETA_HARD    = 0.10   # below → definite bot → honeypot
-BOT_THETA_SOFT    = 0.30   # below → suspect
-EREC_WARN         = 0.18   # autoencoder reconstruction error → drift warning
-EREC_CRITICAL     = 0.35   # → force reauth / disable APIs
-TRUST_WARN        = 0.50
-TRUST_CRITICAL    = 0.25
-SERVER_LOAD_HIGH  = 0.85
+BOT_THETA_HARD   = 0.10   # θ below → definite bot → honeypot
+BOT_THETA_SOFT   = 0.30   # θ below → suspect
+EREC_WARN        = 0.18   # autoencoder reconstruction error → drift warning
+EREC_CRITICAL    = 0.35   # → force reauth / disable APIs
+TRUST_WARN       = 0.50
+TRUST_CRITICAL   = 0.25
+SERVER_LOAD_HIGH = 0.85
 
 
 # ── Stage 1: Biometric Interpretation ─────────────────────────────────────────
 
 @dataclass
 class BiometricInput:
-    """Raw signals arriving from the browser."""
-    theta:          float          # humanity score [0,1]  (from CNN)
-    h_exp:          float          # password entropy [0,1]
-    server_load:    float          # [0,1]
-    user_agent:     str
-    latent_vector:  list[float]    # 32-dim or []
-    ip_address:     str = "?"
+    """Raw signals arriving from the browser / score endpoint."""
+    theta:         float           # humanity score [0, 1]  (from CNN)
+    h_exp:         float           # password-entropy signal [0, 1]
+    server_load:   float           # current server load [0, 1]
+    user_agent:    str
+    latent_vector: List[float]     # 32-dim embedding, or []
+    ip_address:    str = "?"
+
 
 @dataclass
 class BiometricResult:
-    """Stage-1 output: classified signal with confidence."""
+    """Stage-1 output: classified signal with confidence band."""
     theta:       float
     h_exp:       float
     server_load: float
     verdict:     HoneypotVerdict
     confidence:  Confidence
-    # Derived signals for downstream agents
     is_bot:      bool = False
     is_suspect:  bool = False
     note:        str  = ""
@@ -75,12 +77,12 @@ class BiometricResult:
 
 @dataclass
 class HoneypotResult:
-    """Stage-2 output: routing decision."""
+    """Stage-2 output: routing decision + MAB arm selection."""
     should_shadow:    bool
-    synthetic_token:  Optional[str]   # set only when should_shadow=True
+    synthetic_token:  Optional[str]   # set iff should_shadow=True
     verdict:          HoneypotVerdict
     confidence:       Confidence
-    mab_arm_selected: int             # which deception strategy was chosen
+    mab_arm_selected: int             # -1 → no arm chosen (error/fallback)
     mab_confidence:   Confidence
 
 
@@ -88,56 +90,57 @@ class HoneypotResult:
 
 @dataclass
 class GovernorResult:
-    """Stage-3 output: Argon2id hardening decision."""
-    action:      int             # 0-3
+    """Stage-3 output: Argon2id preset chosen by the DQN governor."""
+    action:      int             # 0–3
     preset:      SecurityPreset
     memory_kb:   int
     time_cost:   int
     parallelism: int
     confidence:  Confidence
-    fallback:    bool = False    # True when DQN was bypassed
+    fallback:    bool = False    # True when DQN was bypassed by hard override
 
 
 # ── Stage 4: Session Watchdog (PPO) ───────────────────────────────────────────
 
 @dataclass
 class WatchdogResult:
-    """Stage-4 output: continuous identity verification."""
+    """Stage-4 output: continuous identity-drift verdict."""
     action:      WatchdogAction
     trust_score: float
-    e_rec:       float
+    e_rec:       float           # autoencoder reconstruction error
     confidence:  Confidence
     reason:      str = ""
 
 
-# ── Final Policy Output ────────────────────────────────────────────────────────
+# ── Final Pipeline Output ──────────────────────────────────────────────────────
 
 @dataclass
 class PipelineOutput:
     """
-    What /score returns after all four agents have run.
-    Frontend consumes this directly.
+    Returned by PipelineOrchestrator.run() and consumed directly by /score.
+    Carries both the user-facing response fields and the per-stage results
+    used by the admin dashboard and audit log.
     """
     # Routing
-    shadow_mode:      bool
-    session_token:    str
+    shadow_mode:   bool
+    session_token: str
 
-    # Argon2id params chosen by Governor
-    argon2_params:    dict           # {m, t, p}
-    action_label:     str
+    # Argon2id params chosen by the Governor
+    argon2_params: dict           # {"m": int, "t": int, "p": int}
+    action_label:  str
 
-    # Scores
-    humanity_score:   float
-    entropy_score:    float
+    # Biometric scores (echoed back to caller)
+    humanity_score: float
+    entropy_score:  float
 
-    # Per-stage results (for logging / admin dashboard)
-    biometric:        BiometricResult
-    honeypot:         HoneypotResult
-    governor:         GovernorResult
-    watchdog:         Optional[WatchdogResult]
+    # Per-stage results (for logging / dashboard)
+    biometric: BiometricResult
+    honeypot:  HoneypotResult
+    governor:  GovernorResult
+    watchdog:  Optional[WatchdogResult]
 
-    # Overall confidence of the pipeline run
+    # Overall pipeline confidence (min across all stages that ran)
     pipeline_confidence: Confidence
 
-    # Degraded-mode flag: at least one agent used its fallback
-    degraded:         bool = False
+    # Degraded flag: True if at least one stage used its fallback path
+    degraded: bool = False

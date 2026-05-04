@@ -1,102 +1,140 @@
 """
-Stage 3 — Resource Governor (DQN)
-Selects the Argon2id hardening preset based on the biometric signal and
-server load. Falls back to STANDARD when DQN is unavailable or uncertain.
+pipeline/stage3_governor.py  —  Stage 3: Resource Governor (DQN)
 
-Input contract:  BiometricResult
-Output contract: GovernorResult
+Selects the Argon2id hardening preset (ECONOMY → PUNISHER) based on the
+biometric classification and current server load.
+
+DQN action → preset mapping
+──────────────────────────
+  0  ECONOMY   64 MB / t=2 / p=4    — bots, high-load fallback
+  1  STANDARD 128 MB / t=3 / p=4    — default for legitimate users
+  2  HARD     256 MB / t=4 / p=8    — elevated-risk sessions
+  3  PUNISHER 512 MB / t=5 / p=8    — maximum hardening (suspicious human)
+
+Hard overrides (bypass DQN entirely):
+  • Bot + server_load > SERVER_LOAD_HIGH → ECONOMY (save resources)
+  • Bot + healthy server                 → HARD    (punish scrapers)
+  • MEDIUM/LOW confidence from S1        → STANDARD (conservative)
 """
 from __future__ import annotations
+
+import logging
+from typing import Optional
+
 import numpy as np
+
 from .contracts import (
-    BiometricResult, GovernorResult,
-    Confidence, SecurityPreset,
+    BiometricResult,
+    Confidence,
+    GovernorResult,
+    HoneypotVerdict,
+    SecurityPreset,
     SERVER_LOAD_HIGH,
 )
 
+logger = logging.getLogger("entropy_prime.stage3")
 
-# ── Argon2id param table ──────────────────────────────────────────────────────
-PRESETS: dict[int, tuple[SecurityPreset, int, int, int]] = {
-    # action → (preset, memory_kb, time_cost, parallelism)
-    0: (SecurityPreset.ECONOMY,  65_536,    2,  4),
-    1: (SecurityPreset.STANDARD, 131_072,   3,  4),
-    2: (SecurityPreset.HARD,     524_288,   4,  8),
-    3: (SecurityPreset.PUNISHER, 1_048_576, 8, 16),
+# ── Argon2id preset table ──────────────────────────────────────────────────────
+_PRESETS: dict[int, tuple[SecurityPreset, int, int, int]] = {
+    #           preset           memory_kb   time_cost  parallelism
+    0: (SecurityPreset.ECONOMY,   65_536,     2,         4),
+    1: (SecurityPreset.STANDARD, 131_072,     3,         4),
+    2: (SecurityPreset.HARD,     262_144,     4,         8),
+    3: (SecurityPreset.PUNISHER, 524_288,     5,         8),
 }
 
-# Safe default when model is missing/uncertain
-FALLBACK_ACTION = 1  # STANDARD
+_DEFAULT_ACTION = 1   # STANDARD
 
 
 def run(bio: BiometricResult, dqn_agent) -> GovernorResult:
     """
-    Fallback rules (applied before DQN):
-      - is_bot and server overloaded → ECONOMY (don't waste resources)
-      - is_bot and server fine       → HARD (burn attacker resources)
-      - server_load > HIGH           → cap at STANDARD regardless of DQN
+    Determine the Argon2id preset for this request.
 
-    DQN override: if bio.confidence is LOW, DQN output is accepted but
-    GovernorResult.confidence is set to MEDIUM (hedged).
-
-    If DQN is None or raises, FALLBACK_ACTION is used and fallback=True.
+    Returns a GovernorResult; never raises.  A fallback result is returned
+    with fallback=True if the DQN errors so the orchestrator can set degraded=True.
     """
-    # ── Hard override: bot + overloaded server ────────────────────────────────
-    if bio.is_bot and bio.server_load > SERVER_LOAD_HIGH:
-        return _make_result(0, fallback=True, conf=Confidence.HIGH,
-                            reason="bot+overload → economy")
+    # ── Hard overrides ─────────────────────────────────────────────────────────
+    override = _hard_override(bio)
+    if override is not None:
+        preset, mem, tc, par = _PRESETS[override]
+        logger.debug("[S3] Hard override → action=%d (%s)", override, preset.value)
+        return GovernorResult(
+            action      = override,
+            preset      = preset,
+            memory_kb   = mem,
+            time_cost   = tc,
+            parallelism = par,
+            confidence  = Confidence.HIGH,
+            fallback    = True,   # override is still a "fallback" from DQN's perspective
+        )
 
-    # ── Hard override: definite bot, server healthy → burn resources ──────────
-    if bio.is_bot and bio.confidence == Confidence.HIGH:
-        return _make_result(2, fallback=True, conf=Confidence.HIGH,
-                            reason="confirmed bot → hard")
-
-    # ── DQN ───────────────────────────────────────────────────────────────────
-    action, dqn_conf, used_fallback = _dqn_select(dqn_agent, bio)
-
-    # ── Server load cap ───────────────────────────────────────────────────────
-    if bio.server_load > SERVER_LOAD_HIGH and action > 1:
-        action        = 1           # clamp to STANDARD
-        dqn_conf      = Confidence.MEDIUM
-        used_fallback = True
-
-    # ── Propagate bio confidence through ─────────────────────────────────────
-    if bio.confidence == Confidence.LOW and dqn_conf == Confidence.HIGH:
-        dqn_conf = Confidence.MEDIUM   # input was noisy; hedge output
-
-    return _make_result(action, fallback=used_fallback, conf=dqn_conf)
-
-
-# ── Internals ─────────────────────────────────────────────────────────────────
-
-def _dqn_select(dqn_agent, bio: BiometricResult) -> tuple[int, Confidence, bool]:
-    if dqn_agent is None:
-        return FALLBACK_ACTION, Confidence.LOW, True
+    # ── DQN inference ─────────────────────────────────────────────────────────
     try:
-        state  = np.array([bio.theta, bio.h_exp, bio.server_load], dtype=np.float32)
+        state  = _build_state(bio)
         action = int(dqn_agent.select_action(state))
-        # Measure Q-value spread as a proxy for confidence
-        q_vals = dqn_agent.q_values(state)          # returns np.ndarray [4]
-        spread = float(np.max(q_vals) - np.min(q_vals))
-        if spread > 1.5:
-            conf = Confidence.HIGH
-        elif spread > 0.5:
-            conf = Confidence.MEDIUM
-        else:
-            conf = Confidence.LOW
-        return action, conf, False
-    except Exception:
-        return FALLBACK_ACTION, Confidence.LOW, True
+        action = max(0, min(3, action))          # clamp to valid range
+        conf   = _action_confidence(bio, action)
+        preset, mem, tc, par = _PRESETS[action]
+        logger.debug("[S3] DQN → action=%d (%s) conf=%s", action, preset.value, conf.value)
+        return GovernorResult(
+            action      = action,
+            preset      = preset,
+            memory_kb   = mem,
+            time_cost   = tc,
+            parallelism = par,
+            confidence  = conf,
+            fallback    = False,
+        )
+    except Exception as exc:
+        logger.error("[S3] DQN inference failed: %s — STANDARD fallback", exc)
+        preset, mem, tc, par = _PRESETS[_DEFAULT_ACTION]
+        return GovernorResult(
+            action      = _DEFAULT_ACTION,
+            preset      = preset,
+            memory_kb   = mem,
+            time_cost   = tc,
+            parallelism = par,
+            confidence  = Confidence.LOW,
+            fallback    = True,
+        )
 
 
-def _make_result(action: int, *, fallback: bool, conf: Confidence,
-                 reason: str = "") -> GovernorResult:
-    preset, mem, t, p = PRESETS[action]
-    return GovernorResult(
-        action      = action,
-        preset      = preset,
-        memory_kb   = mem,
-        time_cost   = t,
-        parallelism = p,
-        confidence  = conf,
-        fallback    = fallback,
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _hard_override(bio: BiometricResult) -> Optional[int]:
+    """Return a fixed action index when business rules supersede the DQN."""
+    if bio.is_bot:
+        # Bots on an overloaded server → ECONOMY (don't waste compute)
+        if bio.server_load > SERVER_LOAD_HIGH:
+            return 0
+        # Bots on a healthy server → HARD (punish scraping attempts)
+        return 2
+
+    # Low-confidence classification → conservative STANDARD
+    if bio.confidence == Confidence.LOW:
+        return 1
+
+    return None  # no override — let the DQN decide
+
+
+def _build_state(bio: BiometricResult) -> np.ndarray:
+    """
+    3-element state vector for the DQN:
+      [theta, server_load, is_suspect_float]
+    """
+    return np.array(
+        [bio.theta, bio.server_load, float(bio.is_suspect)],
+        dtype=np.float32,
     )
+
+
+def _action_confidence(bio: BiometricResult, action: int) -> Confidence:
+    """
+    Map biometric confidence + action to an overall confidence band.
+    We trust the DQN more when the biometric signal is strong.
+    """
+    if bio.confidence == Confidence.HIGH:
+        return Confidence.HIGH
+    if bio.confidence == Confidence.MEDIUM:
+        return Confidence.MEDIUM
+    return Confidence.LOW

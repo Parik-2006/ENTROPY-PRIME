@@ -1,20 +1,22 @@
-"""Entropy Prime — Multi-Agent Pipeline Package"""
-from .models.contracts    import (
-    BiometricInput, BiometricResult,
-    HoneypotResult, GovernorResult, WatchdogResult,
-    PipelineOutput, Confidence,
-    HoneypotVerdict, SecurityPreset, WatchdogAction,
-    BOT_THETA_HARD, BOT_THETA_SOFT,
-    EREC_WARN, EREC_CRITICAL,
-    TRUST_WARN, TRUST_CRITICAL,
-    SERVER_LOAD_HIGH,
-)
-from .models.orchestrator import PipelineOrchestrator
+"""
+pipeline/__init__.py
+
+Public surface of the pipeline package.
+main.py imports `from pipeline import PipelineOrchestrator, BiometricInput`
+and `from pipeline import stage1_biometric as s1` etc., so we expose those here.
+"""
+from .orchestrator import PipelineOrchestrator   # noqa: F401
+from .contracts    import BiometricInput          # noqa: F401
+from .             import stage1_biometric        # noqa: F401
+from .             import stage2_honeypot         # noqa: F401
+from .             import stage3_governor         # noqa: F401
+from .             import stage4_watchdog         # noqa: F401
 
 __all__ = [
-    "BiometricInput", "BiometricResult",
-    "HoneypotResult", "GovernorResult", "WatchdogResult",
-    "PipelineOutput", "Confidence",
-    "HoneypotVerdict", "SecurityPreset", "WatchdogAction",
     "PipelineOrchestrator",
+    "BiometricInput",
+    "stage1_biometric",
+    "stage2_honeypot",
+    "stage3_governor",
+    "stage4_watchdog",
 ]

@@ -1,17 +1,24 @@
 """
-Entropy Prime — Pipeline Orchestrator
-Sequences stages 1-4 with explicit I/O contracts, confidence propagation,
-and degraded-mode tracking. This is the single entry point for /score.
+pipeline/orchestrator.py  —  Pipeline Orchestrator
 
-Usage:
-    from pipeline.orchestrator import PipelineOrchestrator
-    orch = PipelineOrchestrator(dqn, mab, ppo, shadow_secret, session_secret)
-    output: PipelineOutput = orch.run(raw_input)
+Sequences Stages 1-4 with explicit I/O contracts, confidence propagation,
+and degraded-mode tracking.  This is the single entry point for /score.
+
+Design notes
+────────────
+• Stateless: holds model references only.  Each call to run() is safe for
+  concurrent requests without any locking.
+• Fail-safe: every stage is wrapped in try/except.  Failures produce fallback
+  results and set degraded=True, never 500s.
+• Bot short-circuit: confirmed bots skip Stages 3 and 4 entirely — no point
+  profiling a known attacker.
+• Confidence roll-up: overall pipeline confidence is the minimum across all
+  stages that ran.  A single LOW stage poisons the rating (conservative).
 """
 from __future__ import annotations
 
 import hashlib
-import hmac as hmac_mod   # aliased to avoid shadowing in _make_session_token
+import hmac as hmac_mod   # aliased to avoid shadowing the local `hmac` name
 import logging
 import secrets
 import time
@@ -40,10 +47,9 @@ logger = logging.getLogger("entropy_prime.pipeline")
 class PipelineOrchestrator:
     """
     Stateless orchestrator — holds references to model agents only.
-    Each call to run() is fully independent (safe for concurrent requests).
 
-    Degraded mode: if any stage uses its fallback, the final PipelineOutput
-    carries degraded=True so ops dashboards can alert.
+    Dependency injection via constructor lets unit tests pass in mock agents
+    without touching global state.
     """
 
     def __init__(
@@ -51,7 +57,7 @@ class PipelineOrchestrator:
         dqn_agent,
         mab_agent,
         ppo_agent,
-        shadow_secret: str,
+        shadow_secret:  str,
         session_secret: str,
     ):
         self._dqn    = dqn_agent
@@ -64,9 +70,7 @@ class PipelineOrchestrator:
 
     def run(self, raw: BiometricInput) -> PipelineOutput:
         """
-        Full 4-stage pipeline. Always returns a PipelineOutput — never raises.
-        Errors within a stage are caught and converted to fallback results,
-        and degraded=True is set on the returned output.
+        Full 4-stage pipeline.  Always returns a PipelineOutput — never raises.
 
         Stage order:
           S1 Biometric → S2 Honeypot → [short-circuit if bot]
@@ -74,89 +78,59 @@ class PipelineOrchestrator:
         """
         degraded = False
 
-        # ── Stage 1: Biometric Interpretation ────────────────────────────────
-        # Translates raw θ / h_exp / latent_vector into a classified result.
-        # Failure here is serious — we fall back to a safe HUMAN/LOW guess so
-        # the rest of the pipeline still runs (don't lock out real users).
+        # ── Stage 1: Biometric Interpretation ─────────────────────────────────
+        # Failure here is serious — fall back to HUMAN/LOW so real users are
+        # never locked out by an instrumentation error.
         try:
             bio = s1.run(raw)
-            logger.debug(
-                "[S1] verdict=%s conf=%s θ=%.3f",
-                bio.verdict, bio.confidence, bio.theta,
-            )
+            logger.debug("[S1] verdict=%s conf=%s θ=%.3f", bio.verdict, bio.confidence, bio.theta)
         except Exception as exc:
-            logger.error("[S1] FAILED: %s — using safe defaults", exc)
+            logger.error("[S1] FAILED: %s — safe defaults applied", exc)
             bio      = _safe_bio(raw)
             degraded = True
 
-        # ── Stage 2: Honeypot Classification ─────────────────────────────────
-        # Routes confirmed bots / high-confidence suspects into shadow mode.
-        # MAB picks the deception arm; low MAB counts → degraded flag.
+        # ── Stage 2: Honeypot Classification ──────────────────────────────────
+        # Low MAB confidence (cold-start) sets degraded but does NOT abort.
         try:
             honeypot = s2.run(bio, self._mab, self._shadow, raw.ip_address)
             if honeypot.mab_confidence == Confidence.LOW:
-                # MAB is still learning — mark as degraded but continue
                 degraded = True
-            logger.debug(
-                "[S2] shadow=%s arm=%d mab_conf=%s",
-                honeypot.should_shadow,
-                honeypot.mab_arm_selected,
-                honeypot.mab_confidence,
-            )
+            logger.debug("[S2] shadow=%s arm=%d mab_conf=%s",
+                         honeypot.should_shadow, honeypot.mab_arm_selected,
+                         honeypot.mab_confidence)
         except Exception as exc:
             logger.error("[S2] FAILED: %s — no shadow routing", exc)
             honeypot = _safe_honeypot(bio)
             degraded = True
 
-        # ── Bot short-circuit ─────────────────────────────────────────────────
-        # Bots get a synthetic shadow token and an ECONOMY governor preset
-        # (cheapest hashing so we don't waste server resources on them).
-        # Stages 3 and 4 are intentionally skipped — no point profiling a bot.
+        # ── Bot short-circuit ──────────────────────────────────────────────────
+        # Bots get ECONOMY (cheapest hashing) — no point profiling them further.
         if honeypot.should_shadow:
             gov   = _economy_governor()
             token = honeypot.synthetic_token or _make_session_token(
-                # Guard: synthetic_token should always be set when
-                # should_shadow=True, but generate a fallback just in case
-                # (e.g. if _safe_honeypot accidentally sets should_shadow=True).
                 uid    = "bot_" + secrets.token_hex(6),
                 lv     = raw.latent_vector,
                 secret = self._sess,
             )
-            logger.info(
-                "[PIPELINE] Bot short-circuit — shadow=True arm=%d",
-                honeypot.mab_arm_selected,
-            )
-            return _assemble(
-                raw      = raw,
-                bio      = bio,
-                honeypot = honeypot,
-                gov      = gov,
-                watchdog = None,
-                token    = token,
-                degraded = degraded,
-            )
+            logger.info("[PIPELINE] Bot short-circuit — shadow=True arm=%d",
+                        honeypot.mab_arm_selected)
+            return _assemble(raw, bio, honeypot, gov, None, token, degraded)
 
-        # ── Stage 3: Resource Governor (DQN) ─────────────────────────────────
-        # Selects the Argon2id hardening preset (ECONOMY → PUNISHER).
-        # Hard overrides inside s3.run() handle: bot+overload → ECONOMY,
-        # confirmed bot+healthy server → HARD.
+        # ── Stage 3: Resource Governor (DQN) ──────────────────────────────────
         try:
             gov = s3.run(bio, self._dqn)
             if gov.fallback:
                 degraded = True
-            logger.debug(
-                "[S3] preset=%s conf=%s fallback=%s",
-                gov.preset, gov.confidence, gov.fallback,
-            )
+            logger.debug("[S3] preset=%s conf=%s fallback=%s",
+                         gov.preset, gov.confidence, gov.fallback)
         except Exception as exc:
             logger.error("[S3] FAILED: %s — STANDARD preset", exc)
             gov      = _safe_governor()
             degraded = True
 
-        # ── Stage 4: Session Watchdog (PPO) ──────────────────────────────────
-        # Optional continuous identity-drift check. Only runs when the caller
-        # provides a 32-dim latent vector (first /score call usually won't).
-        # Non-fatal: a failure here sets degraded=True but does not abort.
+        # ── Stage 4: Session Watchdog (PPO) ───────────────────────────────────
+        # Optional: only runs when a 32-dim latent vector is present.
+        # Non-fatal: failure sets degraded=True but does not abort.
         watchdog: Optional[WatchdogResult] = None
         try:
             if raw.latent_vector and len(raw.latent_vector) == 32:
@@ -166,16 +140,14 @@ class PipelineOrchestrator:
                     trust_score   = 1.0,   # new session starts fully trusted
                     ppo_agent     = self._ppo,
                 )
-                logger.debug(
-                    "[S4] action=%s trust=%.3f e_rec=%.3f conf=%s",
-                    watchdog.action, watchdog.trust_score,
-                    watchdog.e_rec, watchdog.confidence,
-                )
+                logger.debug("[S4] action=%s trust=%.3f e_rec=%.3f conf=%s",
+                             watchdog.action, watchdog.trust_score,
+                             watchdog.e_rec, watchdog.confidence)
         except Exception as exc:
             logger.warning("[S4] FAILED (non-critical): %s", exc)
             degraded = True
 
-        # ── Token ─────────────────────────────────────────────────────────────
+        # ── Token ──────────────────────────────────────────────────────────────
         uid   = "usr_" + secrets.token_hex(6)
         token = _make_session_token(uid, raw.latent_vector, self._sess)
 
@@ -190,14 +162,13 @@ class PipelineOrchestrator:
         trust_score:   float,
     ) -> WatchdogResult:
         """
-        Standalone watchdog call used by the /session/verify heartbeat endpoint.
+        Standalone watchdog call used by the /session/verify heartbeat.
         Always returns a WatchdogResult (never raises).
         """
         try:
             return s4.run(latent_vector, e_rec, trust_score, self._ppo)
         except Exception as exc:
             logger.error("[S4-standalone] FAILED: %s", exc)
-            # Mirror the same fallback path used inside stage4_watchdog itself
             action, conf, reason = s4._fallback_rules(e_rec, trust_score)
             return WatchdogResult(
                 action      = action,
@@ -215,15 +186,8 @@ class PipelineOrchestrator:
 
 
 # ── Fallback constructors ──────────────────────────────────────────────────────
-# Each mirrors the shape that the corresponding stage would have produced,
-# but uses conservative safe values so the rest of the pipeline can proceed.
 
 def _safe_bio(raw: BiometricInput) -> BiometricResult:
-    """
-    Stage-1 fallback. Assumes HUMAN with LOW confidence — never locks a real
-    user out due to an instrumentation error. Downstream stages will hedge
-    accordingly (LOW confidence propagates through _min_confidence).
-    """
     return BiometricResult(
         theta       = 0.5,
         h_exp       = raw.h_exp,
@@ -237,11 +201,7 @@ def _safe_bio(raw: BiometricInput) -> BiometricResult:
 
 
 def _safe_honeypot(bio: BiometricResult) -> HoneypotResult:
-    """
-    Stage-2 fallback. No shadow routing — benefit of doubt to the user.
-    mab_arm_selected=-1 signals that no arm was chosen (reward reporting
-    skips arm=-1, see update_mab_reward).
-    """
+    """No shadow routing — benefit of the doubt to the user."""
     return HoneypotResult(
         should_shadow    = False,
         synthetic_token  = None,
@@ -253,10 +213,6 @@ def _safe_honeypot(bio: BiometricResult) -> HoneypotResult:
 
 
 def _safe_governor() -> GovernorResult:
-    """
-    Stage-3 fallback. STANDARD preset — never too weak, never too punishing.
-    fallback=True ensures degraded flag is set by the orchestrator.
-    """
     return GovernorResult(
         action      = 1,
         preset      = SecurityPreset.STANDARD,
@@ -269,10 +225,6 @@ def _safe_governor() -> GovernorResult:
 
 
 def _economy_governor() -> GovernorResult:
-    """
-    Bot short-circuit governor. ECONOMY (cheapest) — bots don't deserve our
-    compute. fallback=True because this is always a synthetic/override result.
-    """
     return GovernorResult(
         action      = 0,
         preset      = SecurityPreset.ECONOMY,
@@ -284,52 +236,39 @@ def _economy_governor() -> GovernorResult:
     )
 
 
-# ── Pipeline confidence roll-up ────────────────────────────────────────────────
+# ── Confidence roll-up ────────────────────────────────────────────────────────
 
 _CONF_RANK = {Confidence.HIGH: 2, Confidence.MEDIUM: 1, Confidence.LOW: 0}
 
 
 def _min_confidence(*confs: Confidence) -> Confidence:
-    """
-    Return the lowest confidence across all active stages.
-    A single LOW stage poisons the entire pipeline's confidence rating,
-    surfacing to the ops dashboard for review.
-    """
+    """Lowest confidence wins — a single LOW stage poisons the pipeline rating."""
     return min(confs, key=lambda c: _CONF_RANK[c])
 
 
-# ── Token helper ───────────────────────────────────────────────────────────────
+# ── Token helper ──────────────────────────────────────────────────────────────
 
 def _make_session_token(uid: str, lv: list[float], secret: str) -> str:
     """
-    Produces a tamper-evident session token.
+    Tamper-evident session token.
 
-    Structure (hex-encoded after the random prefix):
-        <8-char random prefix>.<uid>:<unix_ts>:<latent_hash_16>:<hmac_hex>
+    Format (after the random URL-safe prefix):
+        <8-char prefix>.<hex(uid:ts:latent_hash16:hmac_hex)>
 
-    - uid            — unique user identifier for this session
-    - unix_ts        — integer timestamp (seconds); used for expiry checks
-    - latent_hash_16 — first 16 chars of SHA-256 of the latent vector string
-                       representation; ties the token to the biometric snapshot
-    - hmac_hex       — HMAC-SHA256 of the plain payload with session_secret;
-                       server-side verification must recompute and compare
-                       before trusting any token field
-
-    Note: hmac_mod alias is used here to prevent the local variable `hmac`
-    from shadowing the standard-library import.
+    The HMAC ties every token to a specific (uid, timestamp, latent snapshot)
+    tuple.  Server-side verification must recompute the HMAC before trusting
+    any field extracted from the token.
     """
     latent_hash = hashlib.sha256(str(lv).encode()).hexdigest()[:16]
     payload     = f"{uid}:{int(time.time())}:{latent_hash}"
     sig         = hmac_mod.new(
-        secret.encode(),
-        payload.encode(),
-        hashlib.sha256,
+        secret.encode(), payload.encode(), hashlib.sha256,
     ).hexdigest()
     encoded = (payload + ":" + sig).encode().hex()
     return secrets.token_urlsafe(8) + "." + encoded
 
 
-# ── Assemble final PipelineOutput ─────────────────────────────────────────────
+# ── Assemble PipelineOutput ───────────────────────────────────────────────────
 
 def _assemble(
     raw:      BiometricInput,
@@ -340,20 +279,9 @@ def _assemble(
     token:    str,
     degraded: bool,
 ) -> PipelineOutput:
-    """
-    Collect per-stage results into the final contract object.
-
-    Confidence roll-up:
-      - Gather confidence from every stage that actually ran.
-      - Use _min_confidence so a single uncertain stage lowers the whole
-        pipeline's rating (conservative: better to over-flag than under-flag).
-      - Watchdog is excluded from roll-up when it didn't run (latent missing
-        or bot short-circuit) — absence is not uncertainty.
-    """
     confs: list[Confidence] = [bio.confidence, honeypot.confidence, gov.confidence]
     if watchdog is not None:
         confs.append(watchdog.confidence)
-
     overall = _min_confidence(*confs)
 
     return PipelineOutput(

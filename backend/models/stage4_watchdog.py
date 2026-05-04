@@ -1,141 +1,193 @@
 """
-Stage 4 — Session Watchdog (PPO)
-Continuous identity-drift detector. Runs on every heartbeat (not every /score).
-Uses PPO policy to recommend an action from {ok, passive_reauth,
-disable_sensitive_apis, force_logout}.
+pipeline/stage4_watchdog.py  —  Stage 4: Session Watchdog (PPO)
 
-Input contract:  latent_vector (32-dim), e_rec (float), trust_score (float)
-Output contract: WatchdogResult
+Continuous identity-drift detection.  Called:
+  (a) Inline during /score when a 32-dim latent vector is present.
+  (b) Standalone for every /session/verify heartbeat.
+
+PPO input vector (10-dim):
+  [lv_mean, lv_std, lv_max, lv_min,    — latent-vector statistics (4)
+   lv_l2_norm,                           — L2 norm of the latent vector (1)
+   e_rec,                                — autoencoder reconstruction error (1)
+   trust_score,                          — running trust score (1)
+   e_rec_warn, e_rec_crit, trust_crit]  — threshold indicator bits (3)
+
+Action → WatchdogAction mapping:
+  0 → OK
+  1 → PASSIVE_REAUTH
+  2 → DISABLE_SENSITIVE_API
+  (3 → FORCE_LOGOUT via fallback rules only)
+
+Fallback rules (when PPO is unavailable or confidence is LOW):
+  e_rec > EREC_CRITICAL   OR  trust < TRUST_CRITICAL → FORCE_LOGOUT
+  e_rec > EREC_WARN       OR  trust < TRUST_WARN     → PASSIVE_REAUTH
+  otherwise                                           → OK
 """
 from __future__ import annotations
+
+import logging
+from typing import Optional
+
 import numpy as np
-import torch
+
 from .contracts import (
-    WatchdogResult, WatchdogAction, Confidence,
-    EREC_WARN, EREC_CRITICAL, TRUST_WARN, TRUST_CRITICAL,
+    Confidence,
+    EREC_CRITICAL,
+    EREC_WARN,
+    TRUST_CRITICAL,
+    TRUST_WARN,
+    WatchdogAction,
+    WatchdogResult,
 )
 
-# PPO action index → WatchdogAction
-PPO_ACTION_MAP: dict[int, WatchdogAction] = {
+logger = logging.getLogger("entropy_prime.stage4")
+
+_ACTION_MAP: dict[int, WatchdogAction] = {
     0: WatchdogAction.OK,
     1: WatchdogAction.PASSIVE_REAUTH,
     2: WatchdogAction.DISABLE_SENSITIVE_API,
 }
 
-# Hard overrides that bypass PPO entirely
-def _hard_override(e_rec: float, trust: float) -> WatchdogAction | None:
-    if trust < TRUST_CRITICAL and e_rec > EREC_CRITICAL:
-        return WatchdogAction.FORCE_LOGOUT
-    return None
+# PPO confidence threshold: output probability must exceed this to be HIGH
+_HIGH_CONF_PROB = 0.75
+_MED_CONF_PROB  = 0.55
 
 
 def run(
     latent_vector: list[float],
     e_rec:         float,
     trust_score:   float,
-    ppo_agent,                # PPOAgent or None
+    ppo_agent,
 ) -> WatchdogResult:
     """
-    Decision ladder:
-      1. Hard override (trust critical + e_rec critical) → FORCE_LOGOUT
-      2. PPO policy on 10-dim state vector
-      3. Fallback rules when PPO is unavailable or low-confidence
-
-    State vector fed to PPO (10-dim):
-      [e_rec, trust_score, trust_delta_proxy,
-       latent_norm, latent_mean, latent_std,
-       e_rec_gt_warn, e_rec_gt_critical, trust_gt_warn, trust_gt_critical]
+    Run the PPO watchdog and return a WatchdogResult.
+    Falls back to deterministic threshold rules if PPO raises or returns
+    low-confidence output.
     """
-    # ── Hard override ─────────────────────────────────────────────────────────
-    override = _hard_override(e_rec, trust_score)
-    if override is not None:
+    # ── Build state ────────────────────────────────────────────────────────────
+    try:
+        lv    = np.asarray(latent_vector, dtype=np.float32)
+        state = _build_state(lv, e_rec, trust_score)
+    except Exception as exc:
+        logger.warning("[S4] State construction failed: %s — using fallback rules", exc)
+        action, conf, reason = _fallback_rules(e_rec, trust_score)
         return WatchdogResult(
-            action      = override,
+            action      = action,
             trust_score = trust_score,
             e_rec       = e_rec,
-            confidence  = Confidence.HIGH,
-            reason      = "hard_override: critical drift+trust",
+            confidence  = conf,
+            reason      = reason,
         )
 
-    # ── PPO ───────────────────────────────────────────────────────────────────
-    action, conf, reason = _ppo_decision(latent_vector, e_rec, trust_score, ppo_agent)
+    # ── PPO inference ──────────────────────────────────────────────────────────
+    try:
+        action_idx, prob = _ppo_infer(ppo_agent, state)
+        conf             = _prob_to_confidence(prob)
 
-    return WatchdogResult(
-        action      = action,
-        trust_score = trust_score,
-        e_rec       = e_rec,
-        confidence  = conf,
-        reason      = reason,
+        # Low-confidence PPO → defer to rule-based fallback
+        if conf == Confidence.LOW:
+            action, conf, reason = _fallback_rules(e_rec, trust_score)
+            reason = "low_ppo_confidence: " + reason
+        else:
+            action = _ACTION_MAP.get(action_idx, WatchdogAction.OK)
+            reason = f"ppo:action={action_idx} p={prob:.3f}"
+
+        new_trust = _update_trust(trust_score, action)
+        logger.debug("[S4] action=%s trust=%.3f e_rec=%.3f conf=%s", action.value, new_trust, e_rec, conf.value)
+
+        return WatchdogResult(
+            action      = action,
+            trust_score = new_trust,
+            e_rec       = e_rec,
+            confidence  = conf,
+            reason      = reason,
+        )
+
+    except Exception as exc:
+        logger.error("[S4] PPO inference failed: %s — fallback rules", exc)
+        action, conf, reason = _fallback_rules(e_rec, trust_score)
+        return WatchdogResult(
+            action      = action,
+            trust_score = trust_score,
+            e_rec       = e_rec,
+            confidence  = conf,
+            reason      = f"ppo_error_fallback: {reason}",
+        )
+
+
+# ── Exposed for orchestrator standalone call ───────────────────────────────────
+
+def _fallback_rules(
+    e_rec: float, trust_score: float
+) -> tuple[WatchdogAction, Confidence, str]:
+    """
+    Pure threshold logic.  Returns (action, confidence, human-readable reason).
+    Exposed at module level so the orchestrator's except block can reuse it.
+    """
+    if e_rec > EREC_CRITICAL or trust_score < TRUST_CRITICAL:
+        return (
+            WatchdogAction.FORCE_LOGOUT,
+            Confidence.HIGH,
+            f"e_rec={e_rec:.3f}>{EREC_CRITICAL} or trust={trust_score:.3f}<{TRUST_CRITICAL}",
+        )
+    if e_rec > EREC_WARN or trust_score < TRUST_WARN:
+        return (
+            WatchdogAction.PASSIVE_REAUTH,
+            Confidence.MEDIUM,
+            f"e_rec={e_rec:.3f}>{EREC_WARN} or trust={trust_score:.3f}<{TRUST_WARN}",
+        )
+    return (WatchdogAction.OK, Confidence.HIGH, "within_thresholds")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _build_state(lv: np.ndarray, e_rec: float, trust_score: float) -> np.ndarray:
+    """Construct the 10-dim PPO state vector."""
+    lv_mean  = float(np.mean(lv))
+    lv_std   = float(np.std(lv))
+    lv_max   = float(np.max(lv))
+    lv_min   = float(np.min(lv))
+    lv_norm  = float(np.linalg.norm(lv))
+    return np.array(
+        [
+            lv_mean, lv_std, lv_max, lv_min, lv_norm,
+            e_rec, trust_score,
+            float(e_rec > EREC_WARN),
+            float(e_rec > EREC_CRITICAL),
+            float(trust_score < TRUST_CRITICAL),
+        ],
+        dtype=np.float32,
     )
 
 
-# ── Internals ─────────────────────────────────────────────────────────────────
-
-def _build_state(latent_vector: list[float], e_rec: float, trust: float) -> np.ndarray:
-    lv   = np.array(latent_vector, dtype=np.float32) if latent_vector else np.zeros(32)
-    norm = float(np.linalg.norm(lv))
-    mean = float(np.mean(lv))
-    std  = float(np.std(lv))
-    return np.array([
-        e_rec,
-        trust,
-        1.0 - trust,                         # delta proxy (simplified)
-        min(norm / 10.0, 1.0),
-        mean,
-        std,
-        float(e_rec > EREC_WARN),
-        float(e_rec > EREC_CRITICAL),
-        float(trust < TRUST_WARN),
-        float(trust < TRUST_CRITICAL),
-    ], dtype=np.float32)
-
-
-def _ppo_decision(
-    latent_vector: list[float],
-    e_rec: float,
-    trust: float,
-    ppo_agent,
-) -> tuple[WatchdogAction, Confidence, str]:
-    """Returns (action, confidence, reason)."""
-    if ppo_agent is None:
-        return _fallback_rules(e_rec, trust)
-
-    try:
-        state        = _build_state(latent_vector, e_rec, trust)
-        state_tensor = torch.FloatTensor(state).unsqueeze(0)
-        with torch.no_grad():
-            probs = ppo_agent.policy(state_tensor).squeeze()
-        probs_np   = probs.numpy()
-        best_idx   = int(np.argmax(probs_np))
-        best_prob  = float(probs_np[best_idx])
-
-        # Confidence from probability mass on top action
-        if best_prob >= 0.70:
-            conf = Confidence.HIGH
-        elif best_prob >= 0.45:
-            conf = Confidence.MEDIUM
-        else:
-            conf = Confidence.LOW
-
-        # Low-confidence PPO → fall back to rules
-        if conf == Confidence.LOW:
-            fb_action, fb_conf, fb_reason = _fallback_rules(e_rec, trust)
-            return fb_action, fb_conf, f"ppo_low_conf→{fb_reason}"
-
-        action = PPO_ACTION_MAP.get(best_idx, WatchdogAction.PASSIVE_REAUTH)
-        return action, conf, f"ppo p={best_prob:.3f}"
-
-    except Exception as exc:
-        return _fallback_rules(e_rec, trust)
-
-
-def _fallback_rules(e_rec: float, trust: float) -> tuple[WatchdogAction, Confidence, str]:
+def _ppo_infer(ppo_agent, state: np.ndarray) -> tuple[int, float]:
     """
-    Deterministic rule ladder used when PPO is missing or uncertain.
-    Always returns HIGH confidence (rules are unambiguous).
+    Call the PPO agent. Returns (action_index, max_action_probability).
+    Supports agents that return (action, prob), (action,), or just action.
     """
-    if trust < TRUST_CRITICAL or e_rec > EREC_CRITICAL:
-        return WatchdogAction.DISABLE_SENSITIVE_API, Confidence.HIGH, "fallback:critical"
-    if trust < TRUST_WARN or e_rec > EREC_WARN:
-        return WatchdogAction.PASSIVE_REAUTH, Confidence.HIGH, "fallback:warn"
-    return WatchdogAction.OK, Confidence.HIGH, "fallback:ok"
+    result = ppo_agent.select_action(state)
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        action_idx, prob = int(result[0]), float(result[1])
+    else:
+        action_idx = int(result)
+        prob       = 0.6   # assume MEDIUM confidence when prob not returned
+    return action_idx, prob
+
+
+def _prob_to_confidence(prob: float) -> Confidence:
+    if prob >= _HIGH_CONF_PROB:
+        return Confidence.HIGH
+    if prob >= _MED_CONF_PROB:
+        return Confidence.MEDIUM
+    return Confidence.LOW
+
+
+def _update_trust(current: float, action: WatchdogAction) -> float:
+    """Decay trust when action escalates; small recovery on OK."""
+    deltas = {
+        WatchdogAction.OK:                    +0.02,
+        WatchdogAction.PASSIVE_REAUTH:        -0.10,
+        WatchdogAction.DISABLE_SENSITIVE_API: -0.25,
+        WatchdogAction.FORCE_LOGOUT:          -1.00,
+    }
+    return max(0.0, min(1.0, current + deltas.get(action, 0.0)))

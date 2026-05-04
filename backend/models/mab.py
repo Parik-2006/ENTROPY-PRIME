@@ -1,71 +1,83 @@
 """
-MAB (Multi-Armed Bandit) — Honeypot Deceiver (Phase 3)
-Selects deception strategy for shadow-routed bots.
-Exposes counts[] so Stage 2 can derive confidence from sample size.
+models/mab.py  —  Multi-Armed Bandit Agent (Honeypot Arm Selector, Stage 2)
+
+UCB1 bandit for choosing among n_arms deception strategies.
+State is persisted as counts + values (compatible with JSON checkpoint).
 """
 from __future__ import annotations
+
+import logging
+import math
+from typing import Optional
+
 import numpy as np
+
+logger = logging.getLogger("entropy_prime.models.mab")
 
 
 class MABAgent:
     """
-    Input contract  — select_arm():
-        none (stateless selection)
+    Upper Confidence Bound (UCB1) bandit.
 
-    Output contract — select_arm():
-        arm: int in {0 .. n_arms-1}
-
-    Output contract — counts:
-        np.ndarray[float64, shape=(n_arms,)]
-        Stage 2 reads counts[arm] to assess confidence:
-          < 10  → LOW
-          < 50  → MEDIUM
-          ≥ 50  → HIGH
-
-    Update contract — update(arm, reward):
-        arm:    int   — which arm was pulled
-        reward: float — observed reward signal
-                        Positive = deception succeeded (bot kept engaging).
-                        Negative = bot escaped / detected the sandbox.
+    select_arm()  — picks the arm with the highest UCB score.
+    update()      — updates the running average reward for the chosen arm.
     """
 
-    def __init__(self, n_arms: int = 3, epsilon: float = 0.1):
-        self.n_arms  = n_arms
-        self.epsilon = epsilon
-        self.counts  = np.zeros(n_arms, dtype=np.float64)
-        self.values  = np.zeros(n_arms, dtype=np.float64)
+    def __init__(self, n_arms: int = 3):
+        self.n_arms = n_arms
+        self.counts = np.zeros(n_arms, dtype=np.int64)   # pull counts per arm
+        self.values = np.zeros(n_arms, dtype=np.float64)  # avg reward per arm
+        self._total = 0
 
-    # ── Inference ─────────────────────────────────────────────────────────────
+    # ── Arm selection ──────────────────────────────────────────────────────────
 
     def select_arm(self) -> int:
-        """Epsilon-greedy selection."""
-        if np.random.rand() < self.epsilon:
-            return int(np.random.randint(self.n_arms))
-        return int(np.argmax(self.values))
+        """
+        UCB1 selection.  Arms that have never been pulled are tried first
+        (round-robin) to ensure exploration before exploitation.
+        """
+        # Always try an unpulled arm first
+        for arm in range(self.n_arms):
+            if self.counts[arm] == 0:
+                return arm
 
-    # ── Training ──────────────────────────────────────────────────────────────
+        # UCB1 formula: value + sqrt(2 * ln(total) / count)
+        ucb_scores = self.values + np.sqrt(
+            2.0 * math.log(self._total) / (self.counts + 1e-9)
+        )
+        return int(np.argmax(ucb_scores))
 
-    def update(self, chosen_arm: int, reward: float) -> None:
-        """Incremental mean update."""
-        if not (0 <= chosen_arm < self.n_arms):
-            raise ValueError(f"Invalid arm {chosen_arm}; must be in [0, {self.n_arms})")
-        self.counts[chosen_arm] += 1
-        n     = self.counts[chosen_arm]
-        value = self.values[chosen_arm]
-        self.values[chosen_arm] = ((n - 1) / n) * value + (1.0 / n) * reward
+    def update(self, arm: int, reward: float) -> None:
+        """Incremental running-average update (Welford-style)."""
+        if arm < 0 or arm >= self.n_arms:
+            logger.warning("MAB update: invalid arm %d (n_arms=%d)", arm, self.n_arms)
+            return
+        self.counts[arm] += 1
+        self._total      += 1
+        n = self.counts[arm]
+        self.values[arm] += (reward - self.values[arm]) / n
 
     # ── Checkpoint I/O ────────────────────────────────────────────────────────
 
     def state_dict(self) -> dict:
         return {
-            "n_arms":  self.n_arms,
-            "epsilon": self.epsilon,
-            "counts":  self.counts.tolist(),
-            "values":  self.values.tolist(),
+            "n_arms": self.n_arms,
+            "counts": self.counts.tolist(),
+            "values": self.values.tolist(),
+            "total":  int(self._total),
         }
 
     def load_state_dict(self, d: dict) -> None:
-        self.n_arms  = d["n_arms"]
-        self.epsilon = d.get("epsilon", 0.1)
-        self.counts  = np.array(d["counts"], dtype=np.float64)
+        """
+        Restore from a previously saved state_dict.
+        Raises ValueError on shape mismatch so the caller can fall back
+        to cold-start.
+        """
+        if d.get("n_arms", self.n_arms) != self.n_arms:
+            raise ValueError(
+                f"MAB checkpoint has n_arms={d['n_arms']} but agent expects {self.n_arms}"
+            )
+        self.counts  = np.array(d["counts"], dtype=np.int64)
         self.values  = np.array(d["values"], dtype=np.float64)
+        self._total  = int(d.get("total", sum(d["counts"])))
+        logger.debug("MAB state loaded: total_pulls=%d", self._total)

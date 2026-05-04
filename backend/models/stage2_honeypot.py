@@ -1,48 +1,58 @@
 """
-Stage 2 — Honeypot Classifier
-Consumes BiometricResult. If bot/suspect, uses MAB to pick a deception arm
-and issues a synthetic shadow token. Otherwise passes through.
+pipeline/stage2_honeypot.py  —  Stage 2: Honeypot Classification
 
-Input contract:  BiometricResult
-Output contract: HoneypotResult
+Routes confirmed bots and high-confidence suspects into shadow mode.
+A Multi-Armed Bandit (MAB) selects the deception strategy (arm) each time.
+
+Arms:
+  0 — slow honeypot  (Tarpit: delayed responses, fake captchas)
+  1 — mirror honeypot (Echo: reflects plausible-looking data)
+  2 — canary honeypot (Audit: logs everything silently, fast responses)
+
+Shadow tokens are HMAC-signed synthetic session tokens that look identical
+to real ones — bots cannot distinguish themselves via the HTTP response.
 """
 from __future__ import annotations
-import hashlib, hmac, secrets, time
+
+import hashlib
+import hmac
+import logging
+import secrets
+import time
 from typing import Optional
 
 from .contracts import (
-    BiometricResult, HoneypotResult,
-    Confidence, HoneypotVerdict,
-    BOT_THETA_HARD, BOT_THETA_SOFT,
+    BiometricResult,
+    BOT_THETA_HARD,
+    BOT_THETA_SOFT,
+    Confidence,
+    HoneypotResult,
+    HoneypotVerdict,
 )
 
+logger = logging.getLogger("entropy_prime.stage2")
 
-# ── Deception arms (MAB arms map to these) ────────────────────────────────────
-DECEPTION_ARMS = [
-    "fake_data_feed",       # arm 0: serve plausible fake JSON responses
-    "slow_drip",            # arm 1: add artificial latency + partial data
-    "canary_token_inject",  # arm 2: embed trackable canary tokens in responses
-]
+# MAB arm confidence threshold: if the winning arm has been selected fewer
+# than MIN_ARM_PULLS times the result is LOW confidence (still learning).
+_MIN_ARM_PULLS = 10
 
 
 def run(
-    bio: BiometricResult,
-    mab_agent,              # MABAgent instance (may be None → fallback)
+    bio:        BiometricResult,
+    mab_agent,          # MABAgent instance
     shadow_secret: str,
-    ip_address: str = "?",
+    ip_address:    str = "?",
 ) -> HoneypotResult:
     """
-    Routing logic:
-      BOT    (conf HIGH/MEDIUM) → shadow immediately
-      BOT    (conf LOW)         → shadow with LOW confidence flag
-      SUSPECT (conf HIGH)       → shadow with MEDIUM confidence
-      SUSPECT (conf MEDIUM/LOW) → pass through (benefit of doubt)
-      HUMAN                     → pass through
+    Decide whether to shadow-route the request and, if so, which MAB arm to use.
 
-    MAB fallback: if mab_agent is None or raises, arm 0 is used and
-    mab_confidence is set to LOW.
+    Shadow routing is triggered when:
+      • verdict == BOT   (always)
+      • verdict == SUSPECT  AND  confidence == HIGH or MEDIUM
+
+    A SUSPECT with LOW confidence gets the benefit of the doubt — no shadow.
     """
-    should_shadow = _routing_decision(bio)
+    should_shadow = _should_shadow(bio)
 
     if not should_shadow:
         return HoneypotResult(
@@ -51,13 +61,19 @@ def run(
             verdict          = bio.verdict,
             confidence       = bio.confidence,
             mab_arm_selected = -1,
-            mab_confidence   = Confidence.LOW,
+            mab_confidence   = Confidence.HIGH,  # no MAB needed → deterministically not shadowed
         )
 
-    # ── MAB: pick deception arm ───────────────────────────────────────────────
+    # ── Select MAB arm ────────────────────────────────────────────────────────
     arm, mab_conf = _select_arm(mab_agent)
 
-    token = _make_synthetic_token(shadow_secret, ip_address, arm)
+    # ── Generate synthetic shadow token ───────────────────────────────────────
+    token = _make_shadow_token(ip_address, arm, shadow_secret)
+
+    logger.info(
+        "[S2] Shadow routing: verdict=%s θ=%.3f arm=%d mab_conf=%s",
+        bio.verdict.value, bio.theta, arm, mab_conf.value,
+    )
 
     return HoneypotResult(
         should_shadow    = True,
@@ -71,48 +87,56 @@ def run(
 
 def update_mab_reward(mab_agent, arm: int, reward: float) -> None:
     """
-    Called after a shadow session ends to give the MAB its reward signal.
-    Safe to call with mab_agent=None (no-op).
+    Feed reward back to the MAB after a shadow session ends.
+    arm=-1 (error/fallback path) is silently ignored.
     """
-    if mab_agent is None or arm < 0:
+    if arm < 0:
         return
     try:
         mab_agent.update(arm, reward)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[S2] MAB reward update failed for arm=%d: %s", arm, exc)
 
 
-# ── Internals ─────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _routing_decision(bio: BiometricResult) -> bool:
+def _should_shadow(bio: BiometricResult) -> bool:
     if bio.verdict == HoneypotVerdict.BOT:
-        # Shadow all bots regardless of confidence
         return True
-    if bio.verdict == HoneypotVerdict.SUSPECT and bio.confidence == Confidence.HIGH:
-        # High-confidence suspect → shadow
+    if bio.verdict == HoneypotVerdict.SUSPECT and bio.confidence in (
+        Confidence.HIGH, Confidence.MEDIUM
+    ):
         return True
     return False
 
 
 def _select_arm(mab_agent) -> tuple[int, Confidence]:
-    if mab_agent is None:
-        return 0, Confidence.LOW
+    """
+    Ask the MAB for the best arm and derive a confidence from pull counts.
+    Falls back to arm 0 if the MAB raises.
+    """
     try:
-        arm = int(mab_agent.select_arm())
-        # Reflect MAB's own certainty: if counts are low, it's guessing
-        counts = mab_agent.counts
-        if counts[arm] < 10:
-            conf = Confidence.LOW
-        elif counts[arm] < 50:
+        arm = mab_agent.select_arm()
+        # Infer confidence from how many times this arm has been pulled
+        pulls = int(getattr(mab_agent, "counts", [0] * 3)[arm])
+        if pulls >= _MIN_ARM_PULLS:
+            conf = Confidence.HIGH
+        elif pulls > 0:
             conf = Confidence.MEDIUM
         else:
-            conf = Confidence.HIGH
+            conf = Confidence.LOW  # cold-start arm
         return arm, conf
-    except Exception:
+    except Exception as exc:
+        logger.warning("[S2] MAB select_arm failed (%s) — defaulting to arm 0", exc)
         return 0, Confidence.LOW
 
 
-def _make_synthetic_token(secret: str, ip: str, arm: int) -> str:
-    payload = f"shadow:{ip}:{arm}:{time.time():.3f}"
+def _make_shadow_token(ip: str, arm: int, secret: str) -> str:
+    """
+    Synthetic session token that mimics the real token format.
+    HMAC-signed with the shadow secret so it cannot be replayed against real endpoints.
+    """
+    payload = f"shadow:{ip}:{arm}:{int(time.time())}"
     sig     = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"ep_shadow_{secrets.token_urlsafe(32)}.{sig[:16]}"
+    encoded = (payload + ":" + sig).encode().hex()
+    return secrets.token_urlsafe(8) + "." + encoded

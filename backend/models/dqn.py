@@ -1,22 +1,35 @@
 """
-DQN (Deep Q-Network) — RL Governor (Phase 2)
-Exposes select_action() and q_values() so Stage 3 can measure
-Q-spread for confidence estimation.
+models/dqn.py  —  Deep Q-Network Agent (Resource Governor, Stage 3)
+
+A minimal DQN for selecting among 4 Argon2id presets.
+State  : [theta, server_load, is_suspect]  (3-dim)
+Actions: 0=ECONOMY, 1=STANDARD, 2=HARD, 3=PUNISHER
+
+In production, weights are loaded from a checkpoint trained offline.
+When no checkpoint is present the network uses random initialisation
+(still functional — the hard overrides in stage3_governor.py handle
+the most important cases deterministically).
 """
 from __future__ import annotations
+
+import logging
+import random
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
+
+logger = logging.getLogger("entropy_prime.models.dqn")
 
 
-class DQN(nn.Module):
+class _QNetwork(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 128), nn.ReLU(),
-            nn.Linear(128, 128),       nn.ReLU(),
-            nn.Linear(128, action_dim),
+            nn.Linear(state_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64),        nn.ReLU(),
+            nn.Linear(64, action_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -25,74 +38,48 @@ class DQN(nn.Module):
 
 class DQNAgent:
     """
-    Input contract  — select_action / q_values:
-        state: np.ndarray[float32, shape=(3,)]
-               [theta, h_exp, server_load]  all in [0, 1]
+    Greedy-inference DQN (no training loop exposed here — train offline).
 
-    Output contract — select_action:
-        action: int in {0, 1, 2, 3}
-
-    Output contract — q_values:
-        np.ndarray[float32, shape=(action_dim,)]
-        Used by Stage 3 to derive confidence from Q-spread.
+    select_action() is called at request time; it is intentionally
+    epsilon-greedy with a very small epsilon so the trained policy dominates.
     """
 
-    def __init__(self, state_dim: int = 3, action_dim: int = 4, lr: float = 1e-3):
+    def __init__(self, state_dim: int = 3, action_dim: int = 4, epsilon: float = 0.05):
         self.state_dim  = state_dim
         self.action_dim = action_dim
-        self.model      = DQN(state_dim, action_dim)
-        self.optimizer  = optim.Adam(self.model.parameters(), lr=lr)
-        self.criterion  = nn.MSELoss()
+        self.epsilon    = epsilon
+        self.q_net      = _QNetwork(state_dim, action_dim)
+        self.q_net.eval()   # inference mode by default
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def select_action(self, state: np.ndarray) -> int:
-        """Greedy action selection (no exploration)."""
-        with torch.no_grad():
-            q = self.model(torch.FloatTensor(state))
-        return int(torch.argmax(q).item())
-
-    def q_values(self, state: np.ndarray) -> np.ndarray:
         """
-        Return raw Q-values for all actions.
-        Stage 3 uses max(Q) - min(Q) as a confidence proxy.
+        Return the greedy action (or a random one with probability epsilon).
+        Thread-safe: no shared mutable state is written here.
         """
-        with torch.no_grad():
-            q = self.model(torch.FloatTensor(state))
-        return q.numpy()
+        if random.random() < self.epsilon:
+            return random.randrange(self.action_dim)
 
-    # ── Training ──────────────────────────────────────────────────────────────
-
-    def train_step(
-        self,
-        state:      np.ndarray,
-        action:     int,
-        reward:     float,
-        next_state: np.ndarray,
-        done:       bool,
-        gamma:      float = 0.99,
-    ) -> float:
-        s  = torch.FloatTensor(state)
-        s2 = torch.FloatTensor(next_state)
-        q  = self.model(s)
         with torch.no_grad():
-            nq = self.model(s2)
-        target          = q.clone().detach()
-        target[action]  = reward + (0.0 if done else gamma * torch.max(nq).item())
-        loss = self.criterion(q, target)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return float(loss.item())
+            t = torch.FloatTensor(state).unsqueeze(0)
+            q = self.q_net(t)
+            return int(q.argmax(dim=1).item())
 
     # ── Checkpoint I/O ────────────────────────────────────────────────────────
 
     def load_checkpoint(self, path: str) -> None:
+        """
+        Load network weights from a .pt file.
+        Raises on corrupt or shape-mismatched files so the caller can log and
+        fall back to random weights.
+        """
         ckpt = torch.load(path, map_location="cpu")
-        # Support both bare state_dict and wrapped {"q_net": ...} format
-        sd = ckpt.get("q_net", ckpt)
-        # Remap keys from train.py's QNetwork (which uses .net.*) to DQN
-        self.model.load_state_dict(sd, strict=False)
+        # Support both raw state_dict and wrapped checkpoints
+        state_dict = ckpt.get("q_net", ckpt) if isinstance(ckpt, dict) else ckpt
+        self.q_net.load_state_dict(state_dict)
+        self.q_net.eval()
+        logger.debug("DQN weights loaded from %s", path)
 
     def save_checkpoint(self, path: str) -> None:
-        torch.save({"q_net": self.model.state_dict()}, path)
+        torch.save({"q_net": self.q_net.state_dict()}, path)

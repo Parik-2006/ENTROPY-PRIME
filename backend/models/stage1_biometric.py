@@ -1,73 +1,97 @@
 """
-Stage 1 — Biometric Interpreter
-Translates raw θ / h_exp / latent_vector into a classified BiometricResult.
-No ML model needed here: pure rule-based with confidence bands.
+pipeline/stage1_biometric.py  —  Stage 1: Biometric Interpretation
+
+Translates raw θ (humanity score) and h_exp (entropy) into a classified
+BiometricResult with an explicit confidence band.
+
+Decision logic
+──────────────
+  θ < BOT_THETA_HARD  → BOT  / HIGH confidence
+  θ < BOT_THETA_SOFT  → SUSPECT
+    │ θ < midpoint    → MEDIUM confidence
+    └ else             → LOW confidence (borderline)
+  θ ≥ BOT_THETA_SOFT  → HUMAN
+    │ θ > 0.85        → HIGH confidence
+    └ else             → MEDIUM confidence
+
+Server load is passed through unchanged for downstream stages.
 """
 from __future__ import annotations
+
+import logging
+
 from .contracts import (
-    BiometricInput, BiometricResult,
-    Confidence, HoneypotVerdict,
-    BOT_THETA_HARD, BOT_THETA_SOFT,
+    BiometricInput,
+    BiometricResult,
+    BOT_THETA_HARD,
+    BOT_THETA_SOFT,
+    Confidence,
+    HoneypotVerdict,
 )
 
+logger = logging.getLogger("entropy_prime.stage1")
 
-def run(inp: BiometricInput) -> BiometricResult:
+_SUSPECT_MID = (BOT_THETA_HARD + BOT_THETA_SOFT) / 2  # 0.20
+
+
+def run(raw: BiometricInput) -> BiometricResult:
     """
-    Input:  BiometricInput
-    Output: BiometricResult
-
-    Confidence rules:
-      HIGH   — θ far from boundaries (< 0.05 or > 0.60)
-      MEDIUM — θ in [0.05, 0.15) or [0.50, 0.60)
-      LOW    — θ in the contested band [0.15, 0.50)
-
-    Latent vector missing → confidence capped at MEDIUM.
+    Classify the incoming signal and return a BiometricResult.
+    Never raises — any unexpected value produces a LOW-confidence HUMAN result
+    so real users are never locked out by instrumentation noise.
     """
-    theta = float(inp.theta)
-    h_exp = float(inp.h_exp)
+    theta = float(raw.theta)
+    h_exp = float(raw.h_exp)
 
-    # ── Verdict ───────────────────────────────────────────────────────────────
-    if theta < BOT_THETA_HARD:
-        verdict    = HoneypotVerdict.BOT
-        is_bot     = True
-        is_suspect = False
-    elif theta < BOT_THETA_SOFT:
-        verdict    = HoneypotVerdict.SUSPECT
-        is_bot     = False
-        is_suspect = True
-    else:
-        verdict    = HoneypotVerdict.HUMAN
-        is_bot     = False
-        is_suspect = False
+    try:
+        if theta < BOT_THETA_HARD:
+            return BiometricResult(
+                theta       = theta,
+                h_exp       = h_exp,
+                server_load = raw.server_load,
+                verdict     = HoneypotVerdict.BOT,
+                confidence  = Confidence.HIGH,
+                is_bot      = True,
+                is_suspect  = False,
+                note        = f"θ={theta:.3f} < BOT_THETA_HARD={BOT_THETA_HARD}",
+            )
 
-    # ── Confidence ────────────────────────────────────────────────────────────
-    has_latent = bool(inp.latent_vector) and len(inp.latent_vector) == 32
+        if theta < BOT_THETA_SOFT:
+            conf = (
+                Confidence.MEDIUM if theta < _SUSPECT_MID
+                else Confidence.LOW   # borderline — less certain
+            )
+            return BiometricResult(
+                theta       = theta,
+                h_exp       = h_exp,
+                server_load = raw.server_load,
+                verdict     = HoneypotVerdict.SUSPECT,
+                confidence  = conf,
+                is_bot      = False,
+                is_suspect  = True,
+                note        = f"θ={theta:.3f} in suspect band",
+            )
 
-    if theta < 0.05 or theta > 0.60:
-        conf = Confidence.HIGH
-    elif (0.05 <= theta < 0.15) or (0.50 <= theta < 0.60):
-        conf = Confidence.MEDIUM
-    else:
-        conf = Confidence.LOW
+        # Confirmed human
+        conf = Confidence.HIGH if theta > 0.85 else Confidence.MEDIUM
+        return BiometricResult(
+            theta       = theta,
+            h_exp       = h_exp,
+            server_load = raw.server_load,
+            verdict     = HoneypotVerdict.HUMAN,
+            confidence  = conf,
+            is_bot      = False,
+            is_suspect  = False,
+            note        = "",
+        )
 
-    # Missing latent vector degrades confidence one step
-    if not has_latent and conf == Confidence.HIGH:
-        conf = Confidence.MEDIUM
-
-    note_parts = []
-    if not has_latent:
-        note_parts.append("no latent vector")
-    if inp.server_load > 0.85:
-        note_parts.append(f"server_load={inp.server_load:.2f}")
-    note = "; ".join(note_parts)
-
-    return BiometricResult(
-        theta       = theta,
-        h_exp       = h_exp,
-        server_load = float(inp.server_load),
-        verdict     = verdict,
-        confidence  = conf,
-        is_bot      = is_bot,
-        is_suspect  = is_suspect,
-        note        = note,
-    )
+    except Exception as exc:
+        logger.error("[S1] Unexpected error: %s — returning safe HUMAN/LOW", exc)
+        return BiometricResult(
+            theta       = 0.5,
+            h_exp       = h_exp,
+            server_load = raw.server_load,
+            verdict     = HoneypotVerdict.HUMAN,
+            confidence  = Confidence.LOW,
+            note        = f"error_fallback: {exc}",
+        )
