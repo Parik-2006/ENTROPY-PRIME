@@ -167,6 +167,7 @@ export class UserBehavioralProfile {
     this.driftHistory.push(drift)
     if (this.driftHistory.length > 100) this.driftHistory.shift()
 
+    console.log(`[BehavioralProfile] Updated drift: ${drift.toFixed(3)}, sampleCount: ${this.sampleCount}`)
     return drift
   }
 
@@ -578,6 +579,8 @@ export class EntropyPrimeClient {
       const drift = this.behavioralProfile.update(Array.from(featureVec))
       this._featureSampleCount++
 
+      console.log(`[LiveEval] theta=${this.theta.toFixed(3)}, drift=${drift.toFixed(3)}, samples=${this._featureSampleCount}`)
+
       this._onUpdate?.({
         type: 'score',
         theta: this.theta,
@@ -585,7 +588,9 @@ export class EntropyPrimeClient {
         selectedFeatures: this.featureSelector.selectedIndices,
         featureNames: this.featureSelector.selectedIndices.map(i => FEATURE_NAMES[i]),
       })
-    } catch {}
+    } catch (e) {
+      console.error('Live eval error:', e)
+    }
   }
 
   _persistProfile() {
@@ -662,7 +667,10 @@ export class EntropyPrimeClient {
         return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
       }
       
-      const tensor = tf.tensor2d(keyboardData, [1, CNN_SEQ_LEN, 1])
+      const tensor = tf.tensor3d(
+        [keyboardData.map(value => [value])],
+        [1, CNN_SEQ_LEN, 1],
+      )
       const prediction = this.cnn.predict(tensor)
       const latentArr = await prediction.data()
       tensor.dispose()

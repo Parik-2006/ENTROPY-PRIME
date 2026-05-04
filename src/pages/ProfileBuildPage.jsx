@@ -4,6 +4,69 @@ import { useAuth } from '../context/AuthContext'
 import styles from './DashboardPage.module.css'
 
 /**
+ * Sidebar navigation component
+ */
+function Sidebar({ active }) {
+  const { user, logout, trustScore } = useAuth()
+  const navigate = useNavigate()
+
+  const trustColor = trustScore > 0.7 ? '#00ffa3' : trustScore > 0.4 ? '#ffb800' : '#ff3b5c'
+
+  return (
+    <aside className={styles.sidebar}>
+      <div className={styles.sideTop}>
+        <div className={styles.sideLogo}>
+          <span className={styles.sideLogoMark}>EP</span>
+          <div>
+            <div className={styles.sideLogoName}>ENTROPY PRIME</div>
+            <div className={styles.sideLogoSub}>v1.0 ACTIVE</div>
+          </div>
+        </div>
+
+        {/* Trust meter */}
+        <div className={styles.trustMeter}>
+          <div className={styles.trustLabel}>SESSION TRUST</div>
+          <div className={styles.trustBar}>
+            <div className={styles.trustFill}
+              style={{ width: (trustScore * 100) + '%', background: trustColor }} />
+          </div>
+          <div className={styles.trustVal} style={{ color: trustColor }}>
+            {(trustScore * 100).toFixed(1)}%
+          </div>
+        </div>
+
+        <nav className={styles.nav}>
+          {[
+            { id: 'profile-build', label: 'PROFILE BUILD', icon: '◈', path: '/profile-build' },
+            { id: 'dashboard', label: 'DASHBOARD', icon: '◉', path: '/dashboard' },
+            { id: 'threats',   label: 'THREAT INTEL', icon: '◉', path: '/threats' },
+          ].map(item => (
+            <button key={item.id}
+              className={`${styles.navItem} ${active === item.id ? styles.navActive : ''}`}
+              onClick={() => navigate(item.path)}
+            >
+              <span className={styles.navIcon}>{item.icon}</span>
+              {item.label}
+            </button>
+          ))}
+        </nav>
+      </div>
+
+      <div className={styles.sideBottom}>
+        <div className={styles.userChip}>
+          <div className={styles.userAvatar}>{user?.email?.[0]?.toUpperCase() ?? 'U'}</div>
+          <div>
+            <div className={styles.userEmail}>{user?.email}</div>
+            <div className={styles.userId}>{user?.id}</div>
+          </div>
+        </div>
+        <button className={styles.logoutBtn} onClick={logout}>DISCONNECT</button>
+      </div>
+    </aside>
+  )
+}
+
+/**
  * Post-login profile building & threat detection demo page.
  * User types normally to build their profile, then can deliberately
  * type abnormally or let someone else type to trigger re-auth.
@@ -17,6 +80,13 @@ export default function ProfileBuildPage() {
   const [driftHistory, setDriftHistory] = useState([])
   const [recentEvent, setRecentEvent] = useState(null)
 
+  // Compute profile stability once at render time
+  const isProfileStable = profileStats && profileStats.sampleCount >= 50
+  const profileProgress = profileStats ? Math.min(profileStats.sampleCount / 50, 1) : 0
+
+  // Debug profile stability
+  console.log(`[ProfileBuildPage] profileStats.sampleCount=${profileStats?.sampleCount}, isProfileStable=${isProfileStable}`)
+
   // Redirect if no user
   useEffect(() => {
     if (!user) navigate('/login')
@@ -25,16 +95,20 @@ export default function ProfileBuildPage() {
   // Track drift in real-time and trigger re-auth if it spikes (only after profile is stable)
   useEffect(() => {
     const id = setInterval(() => {
-      if (liveDrift !== null) {
+      if (liveDrift !== null && liveDrift !== undefined) {
         setDriftHistory(prev => [...prev.slice(-99), { time: Date.now(), drift: liveDrift }])
+        
+        // Debug logging
+        console.log(`[Drift Check] liveDrift=${liveDrift.toFixed(2)}, isProfileStable=${isProfileStable}, threshold=0.5`)
         
         // Only flag for re-auth AFTER profile is stable (50+ samples)
         // Before that, just show the drift value as informational
-        if (isProfileStable && liveDrift > 2.0) {
+        if (isProfileStable && liveDrift > 0.5) {  // Even lower threshold for testing
+          console.log(`🚨 TRIGGER RE-AUTH: Drift ${liveDrift.toFixed(2)} > 0.5`)
           setIsReauthRequired(true)
           setRecentEvent({
             type: 'anomaly',
-            message: `⚠ ANOMALY DETECTED: Drift ${liveDrift.toFixed(2)} exceeds threshold (2.0)`,
+            message: `⚠ ANOMALY DETECTED: Drift ${liveDrift.toFixed(2)} exceeds threshold (0.5)`,
             severity: 'critical'
           })
         }
@@ -66,12 +140,12 @@ export default function ProfileBuildPage() {
     }
   }, [profileStats, navigate])
 
-  const profileProgress = profileStats ? Math.min(profileStats.sampleCount / 50, 1) : 0
-  const isProfileStable = profileStats && profileStats.sampleCount >= 50
-
   return (
     <div className={styles.page}>
       <div className={styles.scanline} />
+      
+      {/* Sidebar */}
+      <Sidebar active="profile-build" />
 
       {/* Left panel */}
       <div className={styles.left} style={{ padding: '40px', maxWidth: '400px' }}>
@@ -223,6 +297,8 @@ export default function ProfileBuildPage() {
             <textarea
               value={practiceText}
               onChange={(e) => setPracticeText(e.target.value)}
+              onFocus={() => console.log('Textarea focused - keystrokes should be captured')}
+              onBlur={() => console.log('Textarea blurred')}
               placeholder="Type naturally... or deliberately type FAST to trigger anomaly detection"
               style={{
                 width: '100%',

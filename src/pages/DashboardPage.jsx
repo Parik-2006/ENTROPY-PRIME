@@ -37,6 +37,7 @@ function Sidebar({ active }) {
 
         <nav className={styles.nav}>
           {[
+            { id: 'profile-build', label: 'PROFILE BUILD', icon: '◈', path: '/profile-build' },
             { id: 'dashboard', label: 'DASHBOARD', icon: '◈', path: '/dashboard' },
             { id: 'threats',   label: 'THREAT INTEL', icon: '◉', path: '/threats' },
           ].map(item => (
