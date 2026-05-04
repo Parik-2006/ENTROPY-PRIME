@@ -693,14 +693,27 @@ export class EntropyPrimeClient {
         return randomVec
       }
       
-      // Use proper CNN input with all 8 features
+      // Build CNN input tensor [1, 50, 8]
       const tensor = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
-      const prediction = this.cnn.predict(tensor)
-      const latentArr = await prediction.data()
-      tensor.dispose()
-      prediction.dispose()
       
-      const result = Array.from(latentArr)
+      // Flatten to [1, 400] for autoencoder input
+      const flattened = tensor.reshape([1, CNN_SEQ_LEN * CNN_FEATURES])
+      tensor.dispose()
+      
+      // Use encoder to generate 32-dim latent vector
+      const enc = this.watchdog?._enc
+      if (!enc) {
+        console.warn('[getLatentVector] Encoder not available')
+        flattened.dispose()
+        return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
+      }
+      
+      const encoded = enc.predict(flattened)
+      const result = Array.from(await encoded.data())
+      
+      flattened.dispose()
+      encoded.dispose()
+      
       console.log('[getLatentVector] Generated vector length:', result.length, 'values:', result.slice(0, 5), '...')
       
       // Ensure exactly LATENT_DIM dimensions
