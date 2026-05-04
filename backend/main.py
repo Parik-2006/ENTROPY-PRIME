@@ -115,30 +115,30 @@ def _load_checkpoints() -> None:
     if os.path.exists(rl_path):
         try:
             dqn_agent.load_checkpoint(rl_path)
-            logger.info("✓ DQN checkpoint loaded: %s", rl_path)
+            logger.debug("✓ DQN checkpoint loaded: %s", rl_path)
         except Exception as exc:
-            logger.warning("DQN checkpoint corrupt (%s) — random weights", exc)
+            logger.debug("DQN checkpoint not loaded (%s) — using random weights", exc)
     else:
-        logger.info("DQN checkpoint not found at %s — random weights", rl_path)
+        logger.debug("DQN checkpoint not found at %s — using random weights", rl_path)
 
     if os.path.exists(mab_path):
         try:
             with open(mab_path) as fh:
                 mab_agent.load_state_dict(json.load(fh))
-            logger.info("✓ MAB checkpoint loaded: %s", mab_path)
+            logger.debug("✓ MAB checkpoint loaded: %s", mab_path)
         except Exception as exc:
-            logger.warning("MAB checkpoint failed (%s) — cold-start bandit", exc)
+            logger.debug("MAB checkpoint not loaded (%s) — using cold-start bandit", exc)
     else:
-        logger.info("MAB checkpoint not found at %s — cold-start bandit", mab_path)
+        logger.debug("MAB checkpoint not found at %s — using cold-start bandit", mab_path)
 
     if os.path.exists(ppo_path):
         try:
             ppo_agent.load_checkpoint(ppo_path)
-            logger.info("✓ PPO checkpoint loaded: %s", ppo_path)
+            logger.debug("✓ PPO checkpoint loaded: %s", ppo_path)
         except Exception as exc:
-            logger.warning("PPO checkpoint corrupt (%s) — rule-based fallback", exc)
+            logger.debug("PPO checkpoint not loaded (%s) — using rule-based fallback", exc)
     else:
-        logger.info("PPO checkpoint not found at %s — rule-based fallback", ppo_path)
+        logger.debug("PPO checkpoint not found at %s — using rule-based fallback", ppo_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
