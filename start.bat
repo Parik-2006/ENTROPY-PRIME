@@ -35,15 +35,20 @@ start "Entropy Prime Backend" cmd /k "cd backend && call .\venv\Scripts\activate
 echo Waiting for backend to start...
 timeout /t 5 /nobreak > nul
 
+echo Starting Frontend...
+start "Entropy Prime Frontend" cmd /k "echo Frontend starting... && npm run dev"
+
 echo.
 echo ================================================
-echo    ENTROPY PRIME BACKEND STARTUP COMPLETE
+echo    ENTROPY PRIME STARTUP COMPLETE
 echo ================================================
 echo.
+echo 🌐 Frontend: http://localhost:3001
 echo 🔧 Backend API: http://localhost:8000
 echo 📚 API Docs: http://localhost:8000/docs
 echo 🗄️  MongoDB: localhost:27017
 echo.
-echo Backend and MongoDB running.
+echo Close this window to stop all servers.
+echo Individual server windows will stay open.
 echo.
 pause
