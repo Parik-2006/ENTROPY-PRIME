@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useAuth } from '../context/AuthContext'
-import { submitScore, hashPassword } from '../services/api'
+import { submitScore, hashPassword, loginUser, registerUser } from '../services/api'
 import styles from './LoginPage.module.css'
 
 // ── Live signal bar ──────────────────────────────────────────────────────────
@@ -151,6 +151,21 @@ export default function LoginPage() {
       const { theta, hExp } = await ep.evaluate(password)
       const latentVector    = await ep.getLatentVector()
 
+      setPhase('authenticating')
+
+      // Try to login first; if user doesn't exist, register them
+      let authData
+      try {
+        authData = await loginUser({ email, plainPassword: password })
+      } catch (loginErr) {
+        // User doesn't exist; register them
+        if (loginErr.message?.includes('Invalid email')) {
+          authData = await registerUser({ email, plainPassword: password })
+        } else {
+          throw loginErr
+        }
+      }
+
       setPhase('hashing')
 
       const scoreData = await submitScore({
@@ -161,8 +176,8 @@ export default function LoginPage() {
       const hashData = await hashPassword({ plainPassword: password, theta, hExp })
       setHashInfo(hashData)
 
-      const userData = { id: 'usr_' + Date.now(), email, theta, hExp }
-      login(userData, scoreData.session_token)
+      const userData = { id: authData.user_id, email: authData.email, theta, hExp }
+      login(userData, authData.session_token)
 
       setResult({ ...scoreData, theta, hExp })
       setPhase('done')
@@ -280,8 +295,10 @@ export default function LoginPage() {
 
           {/* Form */}
           <div className={styles.form}>
-            <label className={styles.label}>EMAIL</label>
+            <label htmlFor="email" className={styles.label}>EMAIL</label>
             <input
+              id="email"
+              name="email"
               className={styles.input}
               type="email"
               placeholder="operator@entropy.io"
@@ -291,8 +308,10 @@ export default function LoginPage() {
               autoComplete="off"
             />
 
-            <label className={styles.label}>PASSWORD</label>
+            <label htmlFor="password" className={styles.label}>PASSWORD</label>
             <input
+              id="password"
+              name="password"
               className={styles.input}
               type="password"
               placeholder="••••••••••••"

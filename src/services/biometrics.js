@@ -235,7 +235,7 @@ export class KeyboardCollector {
       const down = this._keyDownTs[e.code]
       if (down === undefined) return
       const dwell  = now - down
-      const flight = this._lastKeyUp !== null ? down - this._lastKeyUp : 0
+        const flight = this._lastKeyUp !== null ? Math.max(0, down - this._lastKeyUp) : 0
       // Bigram: track pair with previous key
       const prevCode = this._lastCode
       this._lastCode = e.code

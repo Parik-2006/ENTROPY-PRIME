@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react'
 import { EntropyPrimeClient } from '../services/biometrics'
-import { sendWatchdogHeartbeat, saveUserBiometricProfile } from '../services/api'
+import { sendWatchdogHeartbeat, logoutUser } from '../services/api'
 
 const AuthCtx = createContext(null)
 
@@ -103,12 +103,6 @@ export function AuthProvider({ children }) {
 
         // Periodically sync profile to server (every 5th heartbeat)
         if (Math.random() < 0.2) {
-          await saveUserBiometricProfile({
-            userId:         user.id,
-            profileStats:   pStats,
-            featureMeans:   pStats.featureMeans,
-            selectedFeatures: pStats.selectedFeatures,
-          }).catch(() => {})
         }
       } catch {}
     }, 30_000)
@@ -132,6 +126,10 @@ export function AuthProvider({ children }) {
     // Persist profile before logout
     if (clientRef.current) {
       clientRef.current._persistProfile?.()
+    }
+    const token = localStorage.getItem('ep_token')
+    if (token) {
+      logoutUser(token).catch(console.error)
     }
     localStorage.removeItem('ep_token')
     localStorage.removeItem('ep_user')
@@ -173,3 +171,5 @@ export function AuthProvider({ children }) {
 }
 
 export const useAuth = () => useContext(AuthCtx)
+
+
