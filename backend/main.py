@@ -22,7 +22,7 @@ v3.1.0 changes
     - Clamps reward to [-1.0, 1.0] (belt-and-suspenders on top of Pydantic).
 • /auth/logout: unchanged; session_token in body.
 """
-from __future__ import annotations
+
 
 import json
 import logging

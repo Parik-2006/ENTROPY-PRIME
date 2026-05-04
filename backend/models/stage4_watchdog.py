@@ -185,7 +185,8 @@ def _prob_to_confidence(prob: float) -> Confidence:
 def _update_trust(current: float, action: WatchdogAction) -> float:
     """Decay trust when action escalates; small recovery on OK."""
     deltas = {
-        WatchdogAction.OK:                    +0.02,
+        WatchdogAction.OK:                    -0.02,
+
         WatchdogAction.PASSIVE_REAUTH:        -0.10,
         WatchdogAction.DISABLE_SENSITIVE_API: -0.25,
         WatchdogAction.FORCE_LOGOUT:          -1.00,

@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.pytest_cache/
+test_out.txt
+test_out2.txt
+venv/
+.gemini/

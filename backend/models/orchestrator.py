@@ -65,6 +65,19 @@ class PipelineOrchestrator:
         self._ppo    = ppo_agent
         self._shadow = shadow_secret
         self._sess   = session_secret
+ 
+    @property
+    def dqn(self): return self._dqn
+ 
+    @property
+    def mab(self): return self._mab
+ 
+    @property
+    def ppo(self): return self._ppo
+ 
+    @ppo.setter
+    def ppo(self, val): self._ppo = val
+
 
     # ── Public API ────────────────────────────────────────────────────────────
 

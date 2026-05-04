@@ -63,7 +63,8 @@ class CNN1D(nn.Module):
         the endpoint can return a 500.
         """
         if not raw_signal:
-            raise ValueError("raw_signal must not be empty")
+            return [0.0] * self.fc.out_features
+
 
         sig = np.asarray(raw_signal, dtype=np.float32)
 

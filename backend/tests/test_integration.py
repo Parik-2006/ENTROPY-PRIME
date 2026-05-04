@@ -91,6 +91,10 @@ class _AsyncDB:
             self._cols[name] = _make_async_collection(self._db[name])
         return self._cols[name]
 
+    def __getattr__(self, name):
+        return self[name]
+
+
 
 # ── shared mongomock instance (reset between test sessions) ─────────────────
 _mock_client = MockMongoClient()
@@ -220,7 +224,7 @@ class TestScoringScenarios:
 
     async def test_human_score_standard_or_light_preset(self, app_client: AsyncClient):
         body = (await app_client.post("/score", json=HUMAN_SCORE_PAYLOAD)).json()
-        assert body["action_label"] in ("light", "standard", "hard", "paranoid")
+        assert body["action_label"] in ("economy", "standard", "hard", "punisher")
 
     async def test_human_score_has_session_token(self, app_client: AsyncClient):
         body = (await app_client.post("/score", json=HUMAN_SCORE_PAYLOAD)).json()
@@ -649,7 +653,7 @@ class TestDegradedModeFallback:
         Bots should never receive an error page — that breaks the deception.
         """
         import main as app_module
-        import pipeline.stage1_biometric as s1_mod
+        import models.stage1_biometric as s1_mod
 
         original_run = s1_mod.run
         s1_mod.run = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated s1 failure"))
@@ -664,7 +668,7 @@ class TestDegradedModeFallback:
 
     async def test_score_degraded_when_governor_raises(self, app_client: AsyncClient):
         """Stage 3 (governor/DQN) failure → degraded=True, STANDARD preset fallback."""
-        import pipeline.stage3_governor as s3_mod
+        import models.stage3_governor as s3_mod
 
         original_run = s3_mod.run
         s3_mod.run = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("dqn exploded"))
@@ -678,7 +682,7 @@ class TestDegradedModeFallback:
 
     async def test_score_degraded_when_honeypot_raises(self, app_client: AsyncClient):
         """Stage 2 (honeypot/MAB) failure → degraded result but no crash."""
-        import pipeline.stage2_honeypot as s2_mod
+        import models.stage2_honeypot as s2_mod
 
         original_run = s2_mod.run
         s2_mod.run = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("mab crashed"))
@@ -775,8 +779,8 @@ class TestEdgeCases:
     async def test_score_server_overload_caps_preset(self, app_client: AsyncClient):
         payload = {**HUMAN_SCORE_PAYLOAD, "server_load": 0.92}
         body    = (await app_client.post("/score", json=payload)).json()
-        # With server overload the governor caps to STANDARD or LIGHT
-        assert body["action_label"] in ("light", "standard")
+        # With server overload the governor caps to STANDARD or ECONOMY
+        assert body["action_label"] in ("economy", "standard")
 
     async def test_multiple_bot_requests_accumulate_honeypot(self, app_client: AsyncClient):
         for _ in range(5):
