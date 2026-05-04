@@ -600,14 +600,34 @@ export class EntropyPrimeClient {
   }
 
   async evaluate(password = '') {
-    const t    = buildCNNInput(
-      this.keyboard.getWindow(), this.pointer.getWindow(), this.keyboard
-    )
-    const s    = this.cnn.predict(t)
-    this.theta = (await s.data())[0]
-    t.dispose(); s.dispose()
-    this.hExp  = computeExpectationEntropy(password)
-    return { theta: this.theta, hExp: this.hExp }
+    try {
+      const keyEvents = this.keyboard.getWindow(CNN_SEQ_LEN)
+      const pointerEvents = this.pointer.getWindow(CNN_SEQ_LEN)
+      
+      // Need minimum events to produce valid tensor
+      if (keyEvents.length < 5) {
+        console.log('[evaluate] Not enough keyboard events:', keyEvents.length)
+        return { theta: 0.5, hExp: 0.0 }
+      }
+      
+      const t    = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
+      const s    = this.cnn.predict(t)
+      const thetaRaw = (await s.data())[0]
+      t.dispose(); s.dispose()
+      
+      // Validate theta is in valid range
+      this.theta = isFinite(thetaRaw) ? Math.max(0, Math.min(1, thetaRaw)) : 0.5
+      this.hExp  = computeExpectationEntropy(password)
+      
+      // Validate hExp
+      this.hExp = isFinite(this.hExp) ? Math.max(0, Math.min(1, this.hExp)) : 0.0
+      
+      console.log(`[evaluate] theta=${this.theta.toFixed(3)}, hExp=${this.hExp.toFixed(3)}`)
+      return { theta: this.theta, hExp: this.hExp }
+    } catch (e) {
+      console.error('[evaluate] Error:', e)
+      return { theta: 0.5, hExp: 0.0 }
+    }
   }
 
   async getLatentVector() {

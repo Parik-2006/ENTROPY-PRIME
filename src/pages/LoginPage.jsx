@@ -144,11 +144,22 @@ export default function LoginPage() {
 
   const handleSubmit = useCallback(async () => {
     if (!email || !password) { setError('Email and password required.'); return }
+    if (!epReady) { setError('Biometrics engine not ready. Please wait...'); return }
     setError('')
     setPhase('scanning')
     try {
       const ep = getClient()
+      if (!ep) { setError('Biometrics engine not initialized'); return }
+      
       const { theta, hExp } = await ep.evaluate(password)
+      
+      // Validate values before submitting
+      if (!isFinite(theta) || !isFinite(hExp)) {
+        setError('Invalid biometric values. Please type more naturally and try again.')
+        setPhase('idle')
+        return
+      }
+      
       const latentVector    = await ep.getLatentVector()
 
       setPhase('authenticating')
@@ -168,6 +179,7 @@ export default function LoginPage() {
 
       setPhase('hashing')
 
+      console.log('[LoginPage] Submitting score:', { theta, hExp, latentVectorLen: latentVector.length })
       const scoreData = await submitScore({
         theta, hExp, latentVector,
         serverLoad: 0.4 + Math.random() * 0.3,

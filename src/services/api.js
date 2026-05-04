@@ -22,7 +22,11 @@ async function req(path, method = 'GET', body = null) {
 
   const res  = await fetch(BACKEND_URL + path, opts)
   const data = await res.json()
-  if (!res.ok) throw new Error(data.detail || `API error ${res.status}`)
+  if (!res.ok) {
+    const errorMsg = data.detail || `API error ${res.status}`
+    console.error(`[API] ${res.status} ${path}:`, data)
+    throw new Error(errorMsg)
+  }
   return data
 }
 
