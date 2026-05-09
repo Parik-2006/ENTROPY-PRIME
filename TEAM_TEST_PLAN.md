@@ -49,6 +49,8 @@ If needed, the frontend is started with `npm run dev` and the backend with `pyth
 - Verify that wrong typing behavior triggers warning and re-auth.
 - Write down the exact steps and results.
 
+Ganesh, please focus on the first-user typing flow. Start the app, let one user type normally for a few minutes so the baseline pattern can be learned, and then test what happens when the same user deliberately types fast with random alphabets. The app should treat that as suspicious, show a warning, and ask for re-authentication. Please keep the steps simple, check whether the baseline is saved correctly, and note any place where the behavior is too weak, too slow, or not clear enough for a normal tester.
+
 ### Ved
 
 - Test continuous monitoring while the user stays logged in.
@@ -56,12 +58,16 @@ If needed, the frontend is started with `npm run dev` and the backend with `pyth
 - Verify that a different person typing causes re-auth.
 - Suggest improvements if the monitoring is too slow or too strict.
 
+Ved, please focus on the continuous monitoring flow while a user stays logged in. The app should keep checking the current typing pattern against the stored user pattern, not just once but all the time. Test the case where another person starts typing and the pattern changes, then confirm the app notices the difference and triggers re-authentication. If the detection is too strict, too slow, or confusing, suggest a simple improvement that makes the system easier to trust and easier to test.
+
 ### Vivek
 
 - Build and run the bot script for honeypot testing.
 - Keep the app running in a separate terminal/tab.
 - Verify that the honeypot is triggered for bot-like behavior.
 - Check that the returned data is fake and safe.
+
+Vivek, please focus on the honeypot and bot test. Run the real app in one terminal or tab and run a simple bot script in another terminal or tab to imitate suspicious behavior. The app should detect the bot-like activity, trigger the honeypot, and return fake or safe data instead of real sensitive data. Please verify that the honeypot behaves like the app from the outside, but does not leak anything important, and record any change needed to make the bot test more reliable.
 
 ## 4) What to improve after testing
 
