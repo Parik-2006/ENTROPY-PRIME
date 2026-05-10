@@ -105,7 +105,8 @@ function ChartTip({ active, payload }) {
 
 // ── Main dashboard ───────────────────────────────────────────────────────────
 export default function DashboardPage() {
-  const { user, liveTheta, trustScore, anomaly, epReady, getClient } = useAuth()
+  const navigate = useNavigate()
+  const { user, liveTheta, trustScore, anomaly, epReady, getClient, sessionSecurity, logout } = useAuth()
 
   const [chartData, setChartData] = useState([])
   const [kbStats,   setKbStats]   = useState({ avgDwell: 0, avgFlight: 0, count: 0 })
@@ -113,6 +114,11 @@ export default function DashboardPage() {
   const [health,    setHealth]    = useState(null)
   const [anchored,  setAnchored]  = useState(false)
   const [argonInfo, setArgonInfo] = useState(null)
+
+  const handleReauthAndNavigate = useCallback(() => {
+    logout()
+    navigate('/login')
+  }, [logout, navigate])
 
   // Boot anchor
   useEffect(() => {
@@ -151,13 +157,41 @@ export default function DashboardPage() {
 
   const theta = liveTheta ?? 0
   const eRec  = getClient()?.watchdog?.lastERec ?? 0
+  const securityStatus = sessionSecurity?.status ?? 'ok'
+  const sensitiveAccess = sessionSecurity?.sensitiveAccess !== false
+
+  const securityLabel = {
+    ok: 'TRUSTED',
+    reauth_required: 'RE-AUTH REQUIRED',
+    restricted: 'RESTRICTED',
+    locked: 'LOCKED',
+  }[securityStatus] ?? 'UNKNOWN'
+
+  const securityColor = {
+    ok: '#00ffa3',
+    reauth_required: 'var(--warn)',
+    restricted: 'var(--warn)',
+    locked: 'var(--danger)',
+  }[securityStatus] ?? 'var(--text3)'
+
+  const showReauthOverlay = securityStatus === 'reauth_required' || securityStatus === 'locked'
+  const overlayTitle = securityStatus === 'locked'
+    ? 'Session locked'
+    : 'Suspicious activity detected'
+  const overlayMessage = securityStatus === 'locked'
+    ? 'Your session has been blocked by the watchdog. Please re-authenticate to continue.'
+    : 'Please re-authenticate to continue.'
 
   const phaseStatus = (n) => {
     if (!epReady) return 'idle'
     if (n === 1) return theta > 0.3 ? 'active' : 'alert'
     if (n === 2) return 'active'
     if (n === 3) return theta < 0.1 ? 'alert' : 'active'
-    if (n === 4) return eRec > 0.18 ? 'warn' : 'active'
+    if (n === 4) {
+      if (securityStatus === 'locked' || securityStatus === 'reauth_required') return 'alert'
+      if (securityStatus === 'restricted' || eRec > 0.18) return 'warn'
+      return 'active'
+    }
   }
 
   return (
@@ -213,6 +247,10 @@ export default function DashboardPage() {
             value={(trustScore * 100).toFixed(1) + '%'}
             color={trustScore > 0.7 ? '#00ffa3' : trustScore > 0.4 ? '#ffb800' : '#ff3b5c'}
             sub="Session integrity" />
+          <StatCard icon="S" label="SESSION STATE"
+            value={securityLabel}
+            color={securityColor}
+            sub={sensitiveAccess ? 'Sensitive access enabled' : 'Sensitive access disabled'} />
           <StatCard icon="K" label="KEYSTROKES"
             value={kbStats.count}
             color="var(--accent)"
@@ -221,6 +259,28 @@ export default function DashboardPage() {
             value={ptStats.count || 0}
             color="var(--accent)"
             sub={`Jitter: ${(ptStats.avgJitter || 0).toFixed(1)}`} />
+        </div>
+
+        <div className={`${styles.accessPanel} ${!sensitiveAccess ? styles.accessPanelLocked : ''}`}>
+          <div>
+            <div className={styles.accessTitle}>CONTINUOUS AUTHORIZATION</div>
+            <div className={styles.accessText}>
+              {sessionSecurity?.reason || 'Watchdog is monitoring this session.'}
+            </div>
+          </div>
+          <div className={styles.accessActions}>
+            <button className={styles.sensitiveBtn} disabled={!sensitiveAccess}>
+              EXPORT REPORT
+            </button>
+            <button className={styles.sensitiveBtn} disabled={!sensitiveAccess}>
+              CHANGE POLICY
+            </button>
+            {!sensitiveAccess && (
+              <button className={styles.reauthBtn} onClick={logout}>
+                RE-AUTHENTICATE
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Charts */}
@@ -268,6 +328,24 @@ export default function DashboardPage() {
           </div>
         </div>
       </main>
+
+      {showReauthOverlay && (
+        <div className={styles.reauthOverlay} role="alertdialog" aria-modal="true">
+          <div className={styles.reauthModal}>
+            <div className={styles.reauthKicker}>{overlayTitle}</div>
+            <div className={styles.reauthTitle}>Please re-authenticate to continue</div>
+            <div className={styles.reauthMessage}>
+              {overlayMessage}handleReauthAndNavigate
+            </div>
+            <div className={styles.reauthMeta}>
+              {sessionSecurity?.reason || 'Session watchdog has requested a fresh login.'}
+            </div>
+            <button className={styles.reauthPrimary} onClick={logout}>
+              RE-AUTHENTICATE
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

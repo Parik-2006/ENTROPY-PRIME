@@ -4,10 +4,23 @@
  */
 import * as tf from '@tensorflow/tfjs'
 
+<<<<<<< Updated upstream
 const CNN_SEQ_LEN  = 50
 const CNN_FEATURES = 4   // dwell, flight, speed, jitter
 const LATENT_DIM   = 32
 const EREC_THRESH  = 0.18
+=======
+// ── Constants ──────────────────────────────────────────────────────────────
+const CNN_SEQ_LEN   = 50
+const CNN_FEATURES  = 8   // expanded: dwell, flight, speed, jitter, accel, rhythm, pressure_proxy, pause
+const LATENT_DIM    = 32
+const EREC_THRESH   = 0.25 // increased from 0.20 for even less sensitivity
+const PROFILE_WIN   = 200 // rolling window for per-user profile update
+const DRIFT_ALPHA   = 0.01 // reduced from 0.02 for much slower, stable adaptation
+const FEAT_K        = 6   // top-K features selected per user
+const ANOMALY_BUFFER = 5  // increased from 3: require 5 consecutive anomalies
+const EREC_ALPHA    = 0.10 // reduced from 0.15 for stronger smoothing of spikes
+>>>>>>> Stashed changes
 
 // ─── Zipf Entropy ─────────────────────────────────────────────────────────────
 export function computeExpectationEntropy(password) {
@@ -25,7 +38,193 @@ export function computeExpectationEntropy(password) {
   return maxH > 0 ? Math.min(H_obs / maxH, 1.0) : 0
 }
 
+<<<<<<< Updated upstream
 // ─── Keyboard Collector ───────────────────────────────────────────────────────
+=======
+// ── Feature Names (8 dimensions) ─────────────────────────────────────────────
+export const FEATURE_NAMES = [
+  'dwell_norm',      // key press duration
+  'flight_norm',     // inter-key gap
+  'speed_norm',      // pointer speed
+  'jitter_norm',     // pointer micro-tremor
+  'accel_norm',      // pointer acceleration magnitude
+  'rhythm_norm',     // keystroke rhythm consistency (CV of dwell)
+  'pause_norm',      // long pauses between bursts
+  'bigram_norm',     // common bigram dwell ratio
+]
+
+// ── Per-User Feature Selector ─────────────────────────────────────────────────
+/**
+ * Tracks per-user feature variance and selects the K most discriminative
+ * features based on coefficient of variation (high CV = high signal).
+ * Updated online using an exponential moving average.
+ */
+export class UserFeatureSelector {
+  constructor(k = FEAT_K) {
+    this.k = k
+    this.means   = new Float32Array(CNN_FEATURES).fill(0.5)
+    this.m2s     = new Float32Array(CNN_FEATURES).fill(0.1)  // variance accumulator
+    this.n       = 0
+    this._selected = Array.from({ length: CNN_FEATURES }, (_, i) => i) // initial: all
+  }
+
+  /**
+   * Welford online update of mean + variance per feature
+   */
+  update(featureVec) {
+    this.n++
+    for (let i = 0; i < CNN_FEATURES; i++) {
+      const delta  = featureVec[i] - this.means[i]
+      this.means[i] += delta / this.n
+      const delta2 = featureVec[i] - this.means[i]
+      this.m2s[i]  += delta * delta2
+    }
+    // Recompute selected features every 20 observations
+    if (this.n % 20 === 0) this._reselect()
+  }
+
+  _reselect() {
+    const cvs = Array.from({ length: CNN_FEATURES }, (_, i) => {
+      const variance = this.n > 1 ? this.m2s[i] / (this.n - 1) : 0
+      const std = Math.sqrt(variance)
+      return this.means[i] > 0 ? std / this.means[i] : 0 // CV
+    })
+    // Top-K by CV
+    this._selected = cvs
+      .map((cv, i) => ({ cv, i }))
+      .sort((a, b) => b.cv - a.cv)
+      .slice(0, this.k)
+      .map(x => x.i)
+      .sort((a, b) => a - b) // keep original order
+  }
+
+  get selectedIndices() { return this._selected }
+
+  /**
+   * Return only the selected feature subset from a full vector
+   */
+  project(featureVec) {
+    return this._selected.map(i => featureVec[i])
+  }
+
+  toJSON() {
+    return {
+      means: Array.from(this.means),
+      m2s:   Array.from(this.m2s),
+      n:     this.n,
+      selected: this._selected,
+    }
+  }
+
+  static fromJSON(obj) {
+    if (!obj) return new UserFeatureSelector()
+    const sel = new UserFeatureSelector()
+    sel.means    = new Float32Array(obj.means)
+    sel.m2s      = new Float32Array(obj.m2s)
+    sel.n        = obj.n
+    sel._selected = obj.selected
+    return sel
+  }
+}
+
+// ── Behavioral Profile ────────────────────────────────────────────────────────
+/**
+ * Per-user EMA profile over feature vectors.
+ * Detects behavioral drift using Mahalanobis-lite distance.
+ */
+export class UserBehavioralProfile {
+  constructor() {
+    this.emaProfile  = null           // Float32Array of CNN_FEATURES
+    this.emaVariance = null           // Float32Array — rolling variance
+    this.sampleCount = 0
+    this.driftHistory = []            // last 100 drift scores
+    this.lastDrift    = 0
+    this.driftSmooth  = 0             // EMA-smoothed drift for stability
+  }
+
+  /**
+   * Update EMA profile with new feature vector.
+   * Returns drift score relative to current profile.
+   */
+  update(featureVec) {
+    const vec = Float32Array.from(featureVec)
+
+    if (!this.emaProfile) {
+      this.emaProfile  = new Float32Array(vec)
+      this.emaVariance = new Float32Array(CNN_FEATURES).fill(0.08) // increased from 0.05 for even more stability
+      this.sampleCount = 1
+      return 0
+    }
+
+    this.sampleCount++
+    const alpha = DRIFT_ALPHA
+
+    // Compute per-feature deviation before updating profile
+    let drift = 0
+    for (let i = 0; i < CNN_FEATURES; i++) {
+      const diff = vec[i] - this.emaProfile[i]
+      const variance = Math.max(this.emaVariance[i], 0.01) // enforce minimum variance
+      const std  = Math.sqrt(variance) + 1e-8
+      drift += (diff / std) ** 2
+      // EMA update with reduced alpha for stability
+      this.emaProfile[i]  = (1 - alpha) * this.emaProfile[i]  + alpha * vec[i]
+      this.emaVariance[i] = (1 - alpha) * this.emaVariance[i] + alpha * diff * diff
+    }
+    drift = Math.sqrt(drift / CNN_FEATURES) // normalized Mahalanobis-lite
+
+    // Smooth drift with EMA to suppress temporary spikes (much stronger smoothing)
+    this.driftSmooth = this.driftSmooth === 0 ? drift : 0.2 * this.driftSmooth + 0.8 * drift
+    this.lastDrift = this.driftSmooth
+    this.driftHistory.push(this.driftSmooth)
+    if (this.driftHistory.length > 100) this.driftHistory.shift()
+
+    console.log(`[BehavioralProfile] Updated drift: ${drift.toFixed(3)}, sampleCount: ${this.sampleCount}`)
+    return drift
+  }
+
+  /**
+   * Baseline drift threshold: mean + 2σ of observed drift history.
+   * Adapts per-user over time.
+   */
+  get adaptiveThreshold() {
+    if (this.driftHistory.length < 30) return 3.5 // extended warm-up: very permissive
+    const mean = this.driftHistory.reduce((s, v) => s + v, 0) / this.driftHistory.length
+    const std  = Math.sqrt(
+      this.driftHistory.reduce((s, v) => s + (v - mean) ** 2, 0) / this.driftHistory.length
+    )
+    // increased from 3*std to 4*std for much more tolerance to natural variation
+    return Math.max(1.5, mean + 4 * std)
+  }
+
+  get isDrifting() {
+    // increased from 50 to 100 samples for longer calibration
+    return this.sampleCount > 100 && this.lastDrift > this.adaptiveThreshold
+  }
+
+  toJSON() {
+    return {
+      emaProfile:   this.emaProfile ? Array.from(this.emaProfile) : null,
+      emaVariance:  this.emaVariance ? Array.from(this.emaVariance) : null,
+      sampleCount:  this.sampleCount,
+      driftHistory: this.driftHistory,
+      lastDrift:    this.lastDrift,
+    }
+  }
+
+  static fromJSON(obj) {
+    const p = new UserBehavioralProfile()
+    if (!obj) return p
+    if (obj.emaProfile)  p.emaProfile  = new Float32Array(obj.emaProfile)
+    if (obj.emaVariance) p.emaVariance = new Float32Array(obj.emaVariance)
+    p.sampleCount  = obj.sampleCount  || 0
+    p.driftHistory = obj.driftHistory || []
+    p.lastDrift    = obj.lastDrift    || 0
+    return p
+  }
+}
+
+// ── Keyboard Collector (expanded) ─────────────────────────────────────────────
+>>>>>>> Stashed changes
 export class KeyboardCollector {
   constructor() {
     this._events = []
@@ -163,6 +362,13 @@ export class SessionWatchdog {
     this._timer    = null
     this.trustScore = 1.0
     this.lastERec   = 0
+<<<<<<< Updated upstream
+=======
+    this.lastDrift  = 0
+    this.eRecSmooth = 0              // EMA for e_rec stability
+    this.anomalyCount = 0            // counter for consecutive anomalies
+    this.lastAnomalyTime = 0         // timestamp of last anomaly
+>>>>>>> Stashed changes
   }
   async anchorIdentity(vectors) {
     const latents = await Promise.all(
@@ -180,17 +386,49 @@ export class SessionWatchdog {
   async _verifyVector(vector) {
     const t = tf.tensor2d([vector], [1, vector.length])
     const r = this._ae.predict(t)
-    const eRec = (await tf.losses.meanSquaredError(t.flatten(), r.flatten()).data())[0]
+    const eRecRaw = (await tf.losses.meanSquaredError(t.flatten(), r.flatten()).data())[0]
     t.dispose(); r.dispose()
+<<<<<<< Updated upstream
     this.lastERec = eRec
     if (eRec > EREC_THRESH) {
       const strength = Math.min((eRec - EREC_THRESH) / EREC_THRESH, 1)
       this.trustScore = Math.max(0, this.trustScore - 0.15 * strength)
       this._onAnomaly({ eRec, trustScore: this.trustScore })
+=======
+
+    // Smooth e_rec with EMA to reduce spike sensitivity (stronger smoothing)
+    this.eRecSmooth = this.eRecSmooth === 0 ? eRecRaw : 0.20 * this.eRecSmooth + 0.80 * eRecRaw
+    this.lastERec = this.eRecSmooth
+    this.lastDrift = behavioralProfile?.lastDrift ?? 0
+
+    const now = Date.now()
+    const timeSinceLastAnomaly = now - this.lastAnomalyTime
+
+    // Much more tolerant threshold: only flag sustained, strong anomalies
+    const baseThreshold = EREC_THRESH
+    const isAnomaly = this.eRecSmooth > baseThreshold && (behavioralProfile?.isDrifting ?? false)
+
+    if (isAnomaly) {
+      this.anomalyCount++
+      this.lastAnomalyTime = now
+
+      // Only trigger callback if 5+ consecutive anomalies within 3 seconds
+      if (this.anomalyCount >= ANOMALY_BUFFER && timeSinceLastAnomaly < 3000) {
+        const strength = Math.min((this.eRecSmooth - baseThreshold) / Math.max(baseThreshold, 0.01), 1)
+        // very slow trust decay: reduced from 0.04 to 0.02
+        this.trustScore = Math.max(0, this.trustScore - 0.02 * Math.max(strength, 0.15))
+        this._onAnomaly({ eRec: this.eRecSmooth, trustScore: this.trustScore, drift: this.lastDrift })
+      }
+>>>>>>> Stashed changes
     } else {
+      // Reset anomaly counter on clean signal
+      if (timeSinceLastAnomaly > 5000) {
+        this.anomalyCount = 0
+      }
+      // restore trust more aggressively when session is clean
       this.trustScore = Math.min(1.0, this.trustScore + 0.02)
     }
-    return { eRec, trustScore: this.trustScore }
+    return { eRec: this.eRecSmooth, trustScore: this.trustScore }
   }
 }
 
