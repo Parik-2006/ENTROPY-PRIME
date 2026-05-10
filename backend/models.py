@@ -22,6 +22,36 @@ FEATURE_NAMES = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SaaS & Multi-Tenant Models
+# ─────────────────────────────────────────────────────────────────────────────
+class Tenant(BaseModel):
+    id: Optional[str] = Field(default=None, alias="_id")
+    name: str
+    admin_email: EmailStr
+    subscription_tier: str = "free"  # free, pro, enterprise
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    is_active: bool = True
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str, datetime: lambda v: v.isoformat()}
+
+class Site(BaseModel):
+    id: Optional[str] = Field(default=None, alias="_id")
+    tenant_id: str
+    site_name: str
+    domain: str  # e.g., "example.com"
+    key_digest: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    is_active: bool = True
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str, datetime: lambda v: v.isoformat()}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # User Models
 # ─────────────────────────────────────────────────────────────────────────────
 class UserCreate(BaseModel):
@@ -39,6 +69,7 @@ class UserLogin(BaseModel):
 
 class User(BaseModel):
     id: Optional[str]  = Field(default=None, alias="_id")
+    tenant_id: Optional[str] = None  # Link to the owning tenant
     email: str
     password_hash: str
     created_at: datetime  = Field(default_factory=datetime.utcnow)
@@ -71,6 +102,8 @@ class UserResponse(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 class Session(BaseModel):
     id: Optional[str] = Field(default=None, alias="_id")
+    tenant_id: Optional[str] = None
+    site_id: Optional[str] = None
     user_id: str
     session_token: str
     latent_vector: List[float] = Field(default_factory=lambda: [0.0] * 32)
@@ -149,6 +182,8 @@ class BiometricProfile(BaseModel):
     Combines raw sample history, per-user feature selector, and behavioral EMA pattern.
     """
     id: Optional[str] = Field(default=None, alias="_id")
+    tenant_id: Optional[str] = None
+    site_id: Optional[str] = None
     user_id: str
 
     # Per-user feature selector state (Welford online stats)
@@ -190,6 +225,8 @@ class BiometricProfile(BaseModel):
 class DriftEvent(BaseModel):
     """Single drift detection event logged for forensics."""
     id: Optional[str] = Field(default=None, alias="_id")
+    tenant_id: Optional[str] = None
+    site_id: Optional[str] = None
     user_id: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     drift_score:        float
@@ -237,6 +274,8 @@ class FeatureSelectionSnapshot(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 class HoneypotEntry(BaseModel):
     id: Optional[str] = Field(default=None, alias="_id")
+    tenant_id: Optional[str] = None
+    site_id: Optional[str] = None
     timestamp:  datetime = Field(default_factory=datetime.utcnow)
     user_agent: str
     theta:      float

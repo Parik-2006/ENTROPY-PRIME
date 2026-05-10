@@ -63,11 +63,10 @@ class Database:
                     logger.warning(f"Failed to connect to real MongoDB after {self.max_retries} attempts")
                     logger.info("Falling back to mongomock (in-memory) for development...")
                     try:
-                        import mongomock
-                        sync_client = mongomock.MongoClient()
-                        self.client = sync_client
-                        self.db = sync_client[db_name]
-                        logger.info(f"✓ Using mongomock database: {db_name} (development/test mode)")
+                        from mongomock_motor import AsyncMongoMockClient as MockClient
+                        self.client = MockClient()
+                        self.db = self.client[db_name]
+                        logger.info(f"✓ Using mongomock_motor database: {db_name} (development/test mode)")
                         return
                     except Exception as mock_err:
                         logger.error(f"Failed to initialize mongomock: {mock_err}")
@@ -81,37 +80,73 @@ class Database:
     async def _create_indexes(self):
         """Create database indexes for performance and data integrity."""
         try:
+            await self.db.tenants.create_index("admin_email", unique=True)
+            await self.db.sites.create_index("key_digest", unique=True)
+            await self.db.sites.create_index("tenant_id")
             await self.db.users.create_index("email", unique=True)
-            await self.db.users.create_index([("created_at", DESCENDING)])
-            await self.db.sessions.create_index("session_token", unique=True)
-            await self.db.sessions.create_index("user_id")
-            await self.db.sessions.create_index(
-                [("expires_at", ASCENDING)], expireAfterSeconds=0
-            )
-            await self.db.honeypot.create_index([("timestamp", DESCENDING)])
-            await self.db.honeypot.create_index("ip_address")
-            await self.db.biometric_profiles.create_index("user_id", unique=True)
-            await self.db.biometric_profiles.create_index([("updated_at", DESCENDING)])
-            await self.db.drift_events.create_index("user_id")
-            await self.db.drift_events.create_index([("timestamp", DESCENDING)])
-            await self.db.drift_events.create_index(
-                [("timestamp", ASCENDING)], expireAfterSeconds=60 * 60 * 24 * 30
-            )
-            await self.db.feature_selections.create_index("user_id")
-            await self.db.feature_selections.create_index([("recorded_at", DESCENDING)])
+            await self.db.users.create_index("tenant_id")
+            await self.db.sessions.create_index("tenant_id")
+            await self.db.sessions.create_index("site_id")
+            await self.db.biometric_profiles.create_index("tenant_id")
+            await self.db.biometric_profiles.create_index("site_id")
             logger.info("✓ All database indexes created")
         except Exception as e:
             logger.error(f"Index creation error: {e}", exc_info=True)
             raise
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tenant & Site Operations
+# ─────────────────────────────────────────────────────────────────────────────
+async def create_tenant(db: AsyncIOMotorDatabase, name: str, admin_email: str, tier: str = "free") -> str:
+    tenant_doc = {
+        "name": name,
+        "admin_email": admin_email.lower(),
+        "subscription_tier": tier,
+        "created_at": datetime.utcnow(),
+        "is_active": True,
+    }
+    result = await db.tenants.insert_one(tenant_doc)
+    return str(result.inserted_id)
+
+async def get_tenant_by_id(db: AsyncIOMotorDatabase, tenant_id: str) -> Optional[dict]:
+    try:
+        tenant = await db.tenants.find_one({"_id": ObjectId(tenant_id)})
+        if tenant:
+            tenant["_id"] = str(tenant["_id"])
+        return tenant
+    except Exception:
+        return None
+
+async def create_site(db: AsyncIOMotorDatabase, tenant_id: str, name: str, domain: str, key_digest: str) -> str:
+    site_doc = {
+        "tenant_id": tenant_id,
+        "site_name": name,
+        "domain": domain.lower(),
+        "key_digest": key_digest,
+        "created_at": datetime.utcnow(),
+        "is_active": True,
+    }
+    result = await db.sites.insert_one(site_doc)
+    return str(result.inserted_id)
+
+async def get_site_by_api_key(db: AsyncIOMotorDatabase, key_digest: str) -> Optional[dict]:
+    site = await db.sites.find_one({"key_digest": key_digest, "is_active": True})
+    if site:
+        site["_id"] = str(site["_id"])
+    return site
+
+# ─────────────────────────────────────────────────────────────────────────────
 # User Operations
 # ─────────────────────────────────────────────────────────────────────────────
-async def user_exists(db: AsyncIOMotorDatabase, email: str) -> bool:
-    return await db.users.find_one({"email": email.lower()}) is not None
+async def user_exists(db: AsyncIOMotorDatabase, email: str, tenant_id: Optional[str] = None) -> bool:
+    query = {"email": email.lower()}
+    if tenant_id:
+        query["tenant_id"] = tenant_id
+    return await db.users.find_one(query) is not None
 
-async def create_user(db: AsyncIOMotorDatabase, email: str, password_hash: str) -> str:
+async def create_user(db: AsyncIOMotorDatabase, email: str, password_hash: str, tenant_id: Optional[str] = None) -> str:
     user_doc = {
+        "tenant_id":      tenant_id,
         "email":          email.lower(),
         "password_hash":  password_hash,
         "created_at":     datetime.utcnow(),
@@ -165,9 +200,13 @@ async def create_session(
     user_id: str,
     session_token: str,
     latent_vector: list,
+    tenant_id: Optional[str] = None,
+    site_id: Optional[str] = None,
     expires_in_minutes: int = 30,
 ) -> str:
     session_doc = {
+        "tenant_id":     tenant_id,
+        "site_id":       site_id,
         "user_id":       user_id,
         "session_token": session_token,
         "latent_vector": latent_vector,
@@ -272,6 +311,8 @@ async def upsert_biometric_profile(
     adaptive_threshold: float,
     feature_means: List[float],
     selected_features: List[str],
+    tenant_id: Optional[str] = None,
+    site_id: Optional[str] = None,
     ema_profile: Optional[List[float]] = None,
     ema_variance: Optional[List[float]] = None,
 ) -> str:
@@ -279,6 +320,8 @@ async def upsert_biometric_profile(
     update_doc = {
         "$set": {
             "user_id":           user_id,
+            "tenant_id":         tenant_id,
+            "site_id":           site_id,
             "sample_count":      sample_count,
             "last_drift":        last_drift,
             "adaptive_threshold": adaptive_threshold,
@@ -407,10 +450,14 @@ async def log_drift_event(
     e_rec: float,
     selected_features: List[str],
     action: str,
+    tenant_id: Optional[str] = None,
+    site_id: Optional[str] = None,
     session_token: str = "",
 ):
     event = {
         "user_id":           user_id,
+        "tenant_id":         tenant_id,
+        "site_id":           site_id,
         "timestamp":         datetime.utcnow(),
         "drift_score":       drift_score,
         "adaptive_threshold": adaptive_threshold,
@@ -494,10 +541,14 @@ async def store_honeypot_entry(
     user_agent: str,
     theta: float,
     ip_address: str,
+    tenant_id: Optional[str] = None,
+    site_id: Optional[str] = None,
     path: str = "/",
     headers: dict = None,
 ):
     entry = {
+        "tenant_id":  tenant_id,
+        "site_id":    site_id,
         "timestamp":  datetime.utcnow(),
         "user_agent": user_agent,
         "theta":      theta,

@@ -67,6 +67,8 @@ from pipeline.contracts  import WatchdogAction, SecurityPreset
 from pipeline            import stage1_biometric as s1
 from pipeline            import stage3_governor  as s3
 from pipeline.orchestrator import _make_session_token
+from middleware.auth import attach_db, SiteCtx
+from services.auth_service import load_jwt_public_key
 
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -152,7 +154,38 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Entropy Prime v3.1 starting up…")
 
     await db_handler.connect_to_mongo()
+    attach_db(db_handler.db)      # SaaS: Bind DB to auth service
+    load_jwt_public_key()          # SaaS: Load admin RSA keys
     _load_checkpoints()
+    
+    # Auto-seed test data in development
+    if os.environ.get("ENVIRONMENT") == "development":
+        from database import create_tenant, create_site
+        import hmac, hashlib
+        
+        # Check if already seeded (for mongomock)
+        try:
+            if not await db_handler.db.tenants.find_one({"admin_email": "admin@test.com"}):
+                tenant_id = await create_tenant(db_handler.db, "Test Corp", "admin@test.com", "pro")
+                
+                raw_api_key = "test-sdk-key-123"
+                api_key_secret = os.environ.get("EP_API_KEY_SECRET", "dev-only-api-key-secret-change-me")
+                key_digest = hmac.new(
+                    api_key_secret.encode(),
+                    raw_api_key.encode(),
+                    hashlib.sha256
+                ).hexdigest()
+                
+                await create_site(
+                    db_handler.db, 
+                    tenant_id, 
+                    "Test Site", 
+                    "localhost", 
+                    key_digest
+                )
+                logger.info("🌱 Database seeded with test tenant and site")
+        except Exception as e:
+            logger.warning(f"Seeding failed (likely non-writable DB): {e}")
 
     orchestrator = PipelineOrchestrator(
         dqn_agent     = dqn_agent,
@@ -342,6 +375,11 @@ class LogoutReq(BaseModel):
     session_token: str
 
 
+class TelemetryReq(BaseModel):
+    userId: str
+    events: list[dict]
+    timestamp: int
+
 class BiometricExtractReq(BaseModel):
     raw_signal: list[float]
 
@@ -413,6 +451,21 @@ async def score(req: ScoreReq, request: Request):
         response["mab_arm"] = result.honeypot.mab_arm_selected
 
     return response
+
+
+@app.post("/telemetry")
+async def telemetry(req: TelemetryReq, site: SiteCtx):
+    """
+    Receives batch telemetry from the SDK.
+    Authenticated via X-API-Key (SiteCtx).
+    """
+    logger.info(
+        "[Telemetry] Received %d events from site=%s (tenant=%s) for user=%s",
+        len(req.events), site.site_id, site.tenant_id, req.userId
+    )
+    # In a real implementation, this would feed into Stage 1 (Biometric)
+    # For now, we just acknowledge receipt.
+    return {"status": "ok", "received": len(req.events)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

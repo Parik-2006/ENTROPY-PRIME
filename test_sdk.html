@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Entropy Prime SDK Test</title>
+    <style>
+        body { font-family: sans-serif; padding: 40px; background: #0f172a; color: white; }
+        .card { background: #1e293b; padding: 20px; border-radius: 12px; max-width: 500px; margin: auto; }
+        input { width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #334155; background: #0f172a; color: white; }
+        button { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; }
+        #status { margin-top: 20px; font-size: 0.9em; color: #94a3b8; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Entropy Prime Test</h1>
+        <p>Type something below to generate biometric events.</p>
+        <input type="text" id="test-input" placeholder="Start typing...">
+        <button onclick="console.log('Interaction logged')">Click Me</button>
+        <div id="status">Telemetry will be sent every 5 seconds...</div>
+    </div>
+
+    <!-- Entropy Prime SDK -->
+    <script src="public/sdk/entropy.js" data-api-key="test-sdk-key-123" data-auto-init></script>
+    <script>
+        // Optional: Manual initialization with specific user
+        // Entropy.init({ userId: 'test_user_alpha' });
+    </script>
+</body>
+</html>
