@@ -66,7 +66,7 @@ from typing import Annotated, Optional
 
 from fastapi import Depends, HTTPException, Request, status
 
-from services.auth_service import (
+from ..services.auth_service import (
     AdminClaims,
     SiteContext,
     get_site_by_api_key,

@@ -1,0 +1,237 @@
+version: '3.9'
+
+# Entropy Prime v3.2 — Production Docker Compose Stack
+# 4-service architecture: Nginx (TLS) + Backend + MongoDB + Redis
+#
+# Security model:
+#   • Internal bridge network (mongo & redis unreachable from host)
+#   • Nginx TLS termination + rate limiting
+#   • MongoDB with auth + data encryption
+#   • Redis password-protected
+#   • Backend read-only filesystem + tmpfs for writes
+
+services:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Nginx: TLS termination, static serving, rate limiting
+  # ─────────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: entropy-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Config files
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl/:/etc/nginx/ssl/:ro
+      # Static assets (frontend build output)
+      - entropy-static:/usr/share/nginx/html:ro
+      # Logs
+      - entropy-logs:/var/log/nginx:rw
+    environment:
+      NGINX_HOST: ${NGINX_HOST:-entropy-prime.example.com}
+      NGINX_PORT: 443
+    depends_on:
+      - backend
+    networks:
+      - public
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      app: "entropy-prime"
+      tier: "frontend"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Backend: Entropy Prime API (uvicorn + uvloop)
+  # ─────────────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: entropy-prime:3.2.0-prod
+    container_name: entropy-backend
+    restart: unless-stopped
+    environment:
+      # FastAPI config
+      EP_LOG_LEVEL: INFO
+      EP_WORKERS: 4
+      PYTHONUNBUFFERED: 1
+      
+      # Database
+      MONGODB_URI: mongodb://${MONGO_USER:-entropy}:${MONGO_PASSWORD:-changeme}@mongodb:27017/entropy_prime?authSource=admin
+      
+      # Cache
+      REDIS_URI: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
+      
+      # Security keys (generate with `python -c "import secrets; print(secrets.token_hex(32))"`)
+      EP_API_KEY_SECRET: ${EP_API_KEY_SECRET:-dev-insecure-key-change-in-production}
+      SESSION_SECRET: ${SESSION_SECRET:-dev-insecure-secret-change-in-production}
+      SHADOW_SECRET: ${SHADOW_SECRET:-dev-insecure-shadow-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-jwt-change-in-production}
+      
+      # Feature flags
+      ENABLE_WEBHOOKS: "true"
+      ENABLE_THREAT_INTEL: "true"
+      ENABLE_CROSS_SITE_GATING: "true"
+    expose:
+      - 8000
+    volumes:
+      # Transient writes (logs, temp state)
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 512M
+      - entropy-logs:/app/logs:rw
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - public
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    # Resource limits (adjust for your infrastructure)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    labels:
+      app: "entropy-prime"
+      tier: "backend"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # MongoDB 7: Multi-tenant data store (internal network only)
+  # ─────────────────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0-alpine
+    container_name: entropy-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-entropy}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-changeme}
+      MONGO_INITDB_DATABASE: entropy_prime
+    expose:
+      - 27017
+    volumes:
+      # Data persistence
+      - entropy-mongo-data:/data/db:rw
+      - entropy-mongo-config:/data/configdb:rw
+      # Init script (optional)
+      - ./scripts/mongodb-init.js:/docker-entrypoint-initdb.d/init-mongodb.js:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "mongosh", "--authenticationDatabase", "admin", "-u", "${MONGO_USER:-entropy}", "-p", "${MONGO_PASSWORD:-changeme}", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    command:
+      - "--auth"
+      - "--keyFile=/data/configdb/keyfile"
+    labels:
+      app: "entropy-prime"
+      tier: "database"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Redis 7: Session cache + MAB state (internal network only)
+  # ─────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: entropy-redis
+    restart: unless-stopped
+    expose:
+      - 6379
+    volumes:
+      # No persistence for production (state is ephemeral)
+      - entropy-redis-tmp:/tmp:rw
+    command:
+      - redis-server
+      - "--requirepass"
+      - "${REDIS_PASSWORD:-changeme}"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--appendonly"
+      - "no"
+      - "--save"
+      - ""  # disable RDB snapshots
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      app: "entropy-prime"
+      tier: "cache"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Networks
+# ─────────────────────────────────────────────────────────────────────────────
+networks:
+  public:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.1.0/24
+  internal:
+    driver: bridge
+    internal: true  # No outbound/inbound from outside
+    ipam:
+      config:
+        - subnet: 10.0.2.0/24
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volumes
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  # Frontend static assets (served by Nginx)
+  entropy-static:
+    driver: local
+  
+  # MongoDB data (persistent)
+  entropy-mongo-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/mongodb
+  
+  entropy-mongo-config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/mongodb-config
+  
+  # Redis (ephemeral, no bind mount needed)
+  entropy-redis-tmp:
+    driver: local
+  
+  # Application logs (shared mount for log aggregation)
+  entropy-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/logs

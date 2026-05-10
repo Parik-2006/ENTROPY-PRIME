@@ -36,6 +36,7 @@ from .contracts import (
     WatchdogAction,
     WatchdogResult,
 )
+from .stage2_honeypot import ChallengeConfig
 from . import stage1_biometric as s1
 from . import stage2_honeypot  as s2
 from . import stage3_governor  as s3
@@ -314,4 +315,5 @@ def _assemble(
         watchdog            = watchdog,
         pipeline_confidence = overall,
         degraded            = degraded,
+        challenge           = honeypot.challenge,
     )

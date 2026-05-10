@@ -5,6 +5,8 @@ import LoginPage    from './pages/LoginPage'
 import ProfileBuildPage from './pages/ProfileBuildPage'
 import DashboardPage from './pages/DashboardPage'
 import ThreatPage   from './pages/ThreatPage'
+import AdminDashboard from './pages/AdminDashboard'
+import SiteManagement from './pages/SiteManagement'
 
 function PrivateRoute({ children }) {
   const { user, loading } = useAuth()
@@ -43,6 +45,12 @@ export default function App() {
           }/>
           <Route path="/threats" element={
             <PrivateRoute><ThreatPage /></PrivateRoute>
+          }/>
+          <Route path="/admin" element={
+            <PrivateRoute><AdminDashboard /></PrivateRoute>
+          }/>
+          <Route path="/sites" element={
+            <PrivateRoute><SiteManagement /></PrivateRoute>
           }/>
           <Route path="*" element={<Navigate to="/login" replace />}/>
         </Routes>

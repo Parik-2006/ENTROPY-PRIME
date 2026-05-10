@@ -1,80 +1,183 @@
-version: '3.8'
+# =============================================================
+#  docker-compose.prod.yml — Entropy Prime Production Stack
+#
+#  Services:
+#    nginx     — TLS termination, static file serving, rate limiting
+#    backend   — FastAPI + ML inference (4 workers)
+#    mongodb   — Honeypot & session persistence
+#    redis     — Rate-limit state + session cache
+#
+#  Usage:
+#    EP_DOMAIN=auth.example.com \
+#    EP_SESSION_SECRET=$(openssl rand -hex 64) \
+#    docker-compose -f docker-compose.prod.yml up -d
+# =============================================================
+
+version: "3.9"
+
+# ── Shared secrets & config ───────────────────────────────────
+x-backend-env: &backend-env
+  EP_ENV: production
+  EP_SESSION_SECRET: ${EP_SESSION_SECRET:?Set EP_SESSION_SECRET env var}
+  EP_RL_CHECKPOINT: /app/checkpoints/governor.pt
+  EP_HONEYPOT_ENABLED: "true"
+  EP_MONGO_URI: mongodb://mongo_user:${MONGO_PASSWORD:?Set MONGO_PASSWORD}@mongodb:27017/entropy?authSource=admin
+  EP_REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD}@redis:6379/0
+  EP_CORS_ORIGINS: "https://${EP_DOMAIN:?Set EP_DOMAIN}"
+  PYTHONUNBUFFERED: "1"
 
 services:
-  # MongoDB for data persistence
-  mongodb:
-    image: mongo:7
-    container_name: entropy-prime-mongodb
-    restart: always
-    ports:
-      - "${MONGODB_PORT:-27017}:27017"
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme}
-      MONGO_INITDB_DATABASE: entropy_prime
-    volumes:
-      - mongodb_data:/data/db
-      - mongodb_config:/data/configdb
-    networks:
-      - entropy-prime-net
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 1G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
 
-  # FastAPI Backend with Orchestration
+  # ── Nginx reverse proxy / TLS ────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: entropy_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro          # Mount your TLS certs here
+      - frontend_dist:/usr/share/nginx/html:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - frontend_net
+      - backend_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── FastAPI backend ───────────────────────────────────────────
   backend:
     build:
-      context: ./backend
+      context: .
       dockerfile: Dockerfile
+      target: production
       args:
-        PYTHON_VERSION: "3.11"
-    container_name: entropy-prime-backend
-    restart: always
-    ports:
-      - "${BACKEND_PORT:-8000}:8000"
+        VITE_API_URL: https://${EP_DOMAIN:-localhost}/api
+    container_name: entropy_backend
+    restart: unless-stopped
     environment:
-      MONGODB_URL: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-changeme}@mongodb:27017/entropy_prime?authSource=admin
-      MONGODB_DB_NAME: entropy_prime
-      EP_SESSION_SECRET: ${EP_SESSION_SECRET}
-      EP_SHADOW_SECRET: ${EP_SHADOW_SECRET}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      PYTHONUNBUFFERED: "1"
+      <<: *backend-env
+    volumes:
+      - ./checkpoints:/app/checkpoints:ro
+    expose:
+      - "8000"
     depends_on:
       mongodb:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
-      - entropy-prime-net
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2G
-        reservations:
-          cpus: '1.0'
-          memory: 1G
+      - backend_net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/__pycache__
 
-networks:
-  entropy-prime-net:
-    driver: bridge
+  # ── MongoDB ───────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: entropy_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo_user
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      MONGO_INITDB_DATABASE: entropy
+    volumes:
+      - mongo_data:/data/db
+      - ./mongo/init.js:/docker-entrypoint-initdb.d/init.js:ro
+    expose:
+      - "27017"
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
+  # ── Redis ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: entropy_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    expose:
+      - "6379"
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+# ── Named volumes ─────────────────────────────────────────────
 volumes:
-  mongodb_data:
-  mongodb_config:
+  mongo_data:
+    driver: local
+  frontend_dist:
+    driver: local
+  nginx_logs:
+    driver: local
 
+# ── Networks ──────────────────────────────────────────────────
+networks:
+  frontend_net:
+    driver: bridge
+  backend_net:
+    driver: bridge
+    internal: true   # MongoDB and Redis are not reachable from outside

@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+.env.production
 
 # Dependencies
 node_modules/
@@ -9,6 +10,7 @@ venv/
 env/
 .venv/
 ENV/
+/opt/backend-deps/
 
 # Python
 __pycache__/
@@ -48,6 +50,64 @@ pnpm-debug.log*
 .idea/
 *.swp
 *.swo
+*.vim
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.min.js
+*.min.css
+
+# SDK bundler outputs (git-ignored; rebuild from source)
+public/sdk/entropy.min.js
+public/sdk/entropy.esm.min.js
+public/sdk/entropy.min.js.br
+public/sdk/entropy.min.js.gz
+public/sdk/entropy.d.ts
+public/sdk/sdk-manifest.json
+
+# Docker & production
+docker-compose.override.yml
+.dockerignore
+data/
+data/mongodb/
+data/mongodb-config/
+data/logs/
+
+# nginx SSL certificates (git-ignored for security)
+nginx/ssl/
+nginx/*.cert
+nginx/*.key
+nginx/*.pem
+
+# Database files (local development)
+*.db
+*.sqlite
+*.sqlite3
+
+# Checkpoint files (unless committed intentionally)
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+
+# OS files
+.DS_Store
+Thumbs.db
+*~
+.vscode/extensions/
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+*.tmp
+*.bak
+
+# Package lock files (optional, uncomment if you want to version them)
+# package-lock.json
+# yarn.lock
 *~
 .DS_Store
 .project

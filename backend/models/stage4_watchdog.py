@@ -26,7 +26,7 @@ Fallback rules (when PPO is unavailable or confidence is LOW):
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
@@ -40,6 +40,9 @@ from .contracts import (
     WatchdogResult,
 )
 
+if TYPE_CHECKING:
+    from ..services.watchdog_services import WatchdogService
+
 logger = logging.getLogger("entropy_prime.stage4")
 
 _ACTION_MAP: dict[int, WatchdogAction] = {
@@ -51,6 +54,84 @@ _ACTION_MAP: dict[int, WatchdogAction] = {
 # PPO confidence threshold: output probability must exceed this to be HIGH
 _HIGH_CONF_PROB = 0.75
 _MED_CONF_PROB  = 0.55
+
+
+async def run_with_threat_gate(
+    latent_vector:  list[float],
+    e_rec:          float,
+    trust_score:    float,
+    ppo_agent,
+    fingerprint:    str,
+    ip_address:     Optional[str],
+    watchdog_svc:   "WatchdogService",
+    tenant_id:      str,
+) -> WatchdogResult:
+    """
+    Async wrapper that gates the PPO watchdog with cross-site threat intelligence.
+    
+    Flow:
+      1. Check is_globally_flagged() — if true, return FORCE_LOGOUT immediately
+      2. Run the synchronous PPO watchdog via run()
+      3. Ingest the result to update global threat state
+    
+    Parameters
+    ──────────
+    latent_vector — 32-dim biometric signal
+    e_rec — autoencoder reconstruction error
+    trust_score — current session trust (DB-persisted baseline)
+    ppo_agent — the PPO model for inference
+    fingerprint — raw browser fingerprint string (hashed internally)
+    ip_address — optional client IP for IP-level flagging
+    watchdog_svc — WatchdogService instance (stateless, injectable)
+    tenant_id — site_id for threat ingestion
+    
+    Returns
+    ───────
+    WatchdogResult with action set to FORCE_LOGOUT if globally flagged,
+    otherwise the PPO or fallback verdict.
+    """
+    # ── Gate 1: Cross-site threat check ───────────────────────────────────────
+    gate_result = await watchdog_svc.is_globally_flagged(fingerprint, ip_address)
+    if gate_result.globally_flagged:
+        logger.warning(
+            "[S4] GLOBAL THREAT GATE TRIP: fp=%.8s ip=%s score=%.2f tenants=%d",
+            gate_result.fingerprint_hash, ip_address,
+            gate_result.cumulative_score, gate_result.tenant_count,
+        )
+        return WatchdogResult(
+            action      = WatchdogAction.FORCE_LOGOUT,
+            trust_score = 0.0,  # Zero trust for globally flagged identity
+            e_rec       = e_rec,
+            confidence  = Confidence.HIGH,
+            reason      = f"globally_flagged: {gate_result.reason}",
+        )
+
+    # ── Gate 2: Run per-session PPO ───────────────────────────────────────────
+    result = run(
+        latent_vector = latent_vector,
+        e_rec         = e_rec,
+        trust_score   = trust_score,
+        ppo_agent     = ppo_agent,
+    )
+
+    # ── Gate 3: Ingest result to update cross-site state ──────────────────────
+    try:
+        intel = await watchdog_svc.ingest(
+            tenant_id  = tenant_id,
+            fingerprint = fingerprint,
+            ip_address = ip_address,
+            result     = result,
+        )
+        logger.debug(
+            "[S4] Threat ingested: fp=%.8s action=%s score=%.2f tenants=%d",
+            intel.fingerprint_hash, result.action.value,
+            intel.cumulative_score, intel.tenant_count,
+        )
+    except Exception as exc:
+        # Non-critical: if threat ingestion fails, still return the per-session result
+        logger.error("[S4] Threat ingestion failed: %s", exc)
+
+    return result
 
 
 def run(
@@ -185,7 +266,7 @@ def _prob_to_confidence(prob: float) -> Confidence:
 def _update_trust(current: float, action: WatchdogAction) -> float:
     """Decay trust when action escalates; small recovery on OK."""
     deltas = {
-        WatchdogAction.OK:                    -0.02,
+        WatchdogAction.OK:                    +0.02,
 
         WatchdogAction.PASSIVE_REAUTH:        -0.10,
         WatchdogAction.DISABLE_SENSITIVE_API: -0.25,
