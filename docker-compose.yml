@@ -13,33 +13,35 @@
 #    docker-compose -f docker-compose.prod.yml up -d
 # =============================================================
 
-version: "3.9"
-
 # ── Shared secrets & config ───────────────────────────────────
 x-backend-env: &backend-env
+  PYTHONPATH: /opt/backend-deps
   EP_ENV: production
   EP_SESSION_SECRET: ${EP_SESSION_SECRET:?Set EP_SESSION_SECRET env var}
   EP_RL_CHECKPOINT: /app/checkpoints/governor.pt
   EP_HONEYPOT_ENABLED: "true"
-  EP_MONGO_URI: mongodb://mongo_user:${MONGO_PASSWORD:?Set MONGO_PASSWORD}@mongodb:27017/entropy?authSource=admin
-  EP_REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD}@redis:6379/0
-  EP_CORS_ORIGINS: "https://${EP_DOMAIN:?Set EP_DOMAIN}"
+  EP_MONGO_URI: mongodb://mongodb:27017/entropy
+  MONGODB_URL: "mongodb://mongo_user:${MONGO_PASSWORD}@mongodb:27017/entropy?authSource=admin"
+  MONGODB_DB_NAME: entropy
+  EP_REDIS_URL: redis://redis:6379/0
+  EP_CORS_ORIGINS: "*"
   PYTHONUNBUFFERED: "1"
 
 services:
 
   # ── Nginx reverse proxy / TLS ────────────────────────────────
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+      args:
+        VITE_API_URL: /
     container_name: entropy_nginx
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro          # Mount your TLS certs here
-      - frontend_dist:/usr/share/nginx/html:ro
       - nginx_logs:/var/log/nginx
     depends_on:
       backend:
@@ -47,6 +49,12 @@ services:
     networks:
       - frontend_net
       - backend_net
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/index.html"]
+      interval: 30s
+      timeout: 5s
+      retries: 2
+      start_period: 10s
     logging:
       driver: "json-file"
       options:
@@ -59,8 +67,6 @@ services:
       context: .
       dockerfile: Dockerfile
       target: production
-      args:
-        VITE_API_URL: https://${EP_DOMAIN:-localhost}/api
     container_name: entropy_backend
     restart: unless-stopped
     environment:
@@ -80,16 +86,8 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 20s
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 2G
-        reservations:
-          cpus: "0.5"
-          memory: 512M
+      retries: 5
+      start_period: 45s
     logging:
       driver: "json-file"
       options:

@@ -29,7 +29,7 @@ for cmd in node npm terser tsc brotli gzip sha256sum; do
 done
 
 # Step 2: Identify entry point
-ENTRY_FILE="${SDK_SRC}/index.js"
+ENTRY_FILE="${SDK_SRC}/entropy.js"
 if [[ ! -f "$ENTRY_FILE" ]]; then
     echo "  ❌ Entry point not found: $ENTRY_FILE"
     exit 1
@@ -82,7 +82,7 @@ echo "📦 Creating ESM variant (entropy.esm.min.js)..."
 ESM_FILE="${OUT_DIR}/entropy.esm.js"
 # For ESM, just export the API object
 cat > "$ESM_FILE" <<'EOF'
-export { default as EntropyPrime } from './index.js';
+export { default as EntropyPrime } from './entropy.js';
 EOF
 
 if command -v terser &>/dev/null; then

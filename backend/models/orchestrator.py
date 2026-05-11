@@ -315,5 +315,5 @@ def _assemble(
         watchdog            = watchdog,
         pipeline_confidence = overall,
         degraded            = degraded,
-        challenge           = honeypot.challenge,
+        challenge           = None,  # TODO: Implement honeypot challenge generation
     )

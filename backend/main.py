@@ -927,8 +927,8 @@ async def register(req: UserCreate, request: Request):
         theta=0.9, h_exp=0.9, server_load=0.4,
         user_agent="", latent_vector=[], ip_address="register",
     )
-    bio = s1.run(bio_raw)
-    gov = s3.run(bio, dqn_agent)
+    bio = s1.run_legacy(bio_raw)
+    gov = s3.run(bio, dqn_agent, ppo_agent)
 
     ph            = PasswordHasher(memory_cost=gov.memory_kb, time_cost=gov.time_cost, parallelism=gov.parallelism)
     password_hash = ph.hash(req.plain_password)
@@ -1068,8 +1068,8 @@ async def pw_hash(req: PwHashReq, user_id: Optional[str] = None):
         theta=req.theta, h_exp=req.h_exp, server_load=0.5,
         user_agent="", latent_vector=[], ip_address="hash",
     )
-    bio = s1.run(bio_raw)
-    gov = s3.run(bio, dqn_agent)
+    bio = s1.run_legacy(bio_raw)
+    gov = s3.run(bio, dqn_agent, ppo_agent)
     ph  = PasswordHasher(memory_cost=gov.memory_kb, time_cost=gov.time_cost, parallelism=gov.parallelism)
     t0  = time.perf_counter()
     h   = ph.hash(req.plain_password)

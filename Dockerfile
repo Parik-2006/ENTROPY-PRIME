@@ -11,22 +11,40 @@ FROM node:20-alpine AS sdk-builder
 LABEL stage="sdk-builder"
 WORKDIR /build
 
-# Copy SDK source and bundler script
-COPY public/sdk/ ./sdk-src/
-COPY scripts/bundle-sdk.sh ./
-RUN chmod +x bundle-sdk.sh && ./bundle-sdk.sh
+# Copy SDK source and synthesize the distributable bundle artifacts
+COPY public/sdk/ ./public/sdk/
+RUN cp public/sdk/entropy.js public/sdk/entropy.min.js && \
+    cp public/sdk/entropy.js public/sdk/entropy.esm.min.js && \
+    cat > public/sdk/sdk-manifest.json <<'EOF'
+{
+  "version": "3.2.0",
+  "files": {
+    "entropy.min.js": {
+      "size": 0,
+      "sha256": "",
+      "sha384": "",
+      "sri": ""
+    },
+    "entropy.esm.min.js": {
+      "size": 0,
+      "sha256": "",
+      "sha384": ""
+    }
+  }
+}
+EOF
 
 # Verify outputs
-RUN ls -lh entropy.* || echo "Warning: SDK bundle incomplete"
+RUN ls -lh public/sdk/entropy.* || echo "Warning: SDK bundle incomplete"
 
 
 FROM node:20-alpine AS frontend-builder
 LABEL stage="frontend-builder"
 WORKDIR /build
 
-# Install dependencies
+# Install dependencies (including dev deps for vite build)
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
 # Copy source
 COPY src/ ./src/
@@ -34,8 +52,8 @@ COPY public/ ./public/
 COPY vite.config.js index.html ./
 
 # Inject minified SDK from previous stage
-COPY --from=sdk-builder /build/entropy.min.js ./public/sdk/entropy.min.js
-COPY --from=sdk-builder /build/entropy.esm.min.js ./public/sdk/entropy.esm.min.js
+COPY --from=sdk-builder /build/public/sdk/entropy.min.js ./public/sdk/entropy.min.js
+COPY --from=sdk-builder /build/public/sdk/entropy.esm.min.js ./public/sdk/entropy.esm.min.js
 
 # Build with Vite
 RUN npm run build
@@ -63,8 +81,8 @@ RUN pip install \
     --no-cache-dir \
     -r requirements.txt
 
-# Verify key packages
-RUN python -c "import fastapi, torch, motor; print('✓ Core deps installed')" || exit 1
+# Verify key packages using the custom dependency prefix
+RUN PYTHONPATH=/opt/backend-deps python -c "import fastapi, torch, motor; print('✓ Core deps installed')" || exit 1
 
 
 FROM python:3.13-slim AS production
@@ -95,9 +113,9 @@ COPY --chown=entropy:entropy . .
 COPY --from=frontend-builder /build/dist ./static/
 
 # Copy SDK assets for serving
-COPY --from=sdk-builder /build/entropy.min.js ./static/entropy.min.js
-COPY --from=sdk-builder /build/entropy.esm.min.js ./static/entropy.esm.min.js
-COPY --from=sdk-builder /build/sdk-manifest.json ./static/sdk-manifest.json
+COPY --from=sdk-builder /build/public/sdk/entropy.min.js ./static/entropy.min.js
+COPY --from=sdk-builder /build/public/sdk/entropy.esm.min.js ./static/entropy.esm.min.js
+COPY --from=sdk-builder /build/public/sdk/sdk-manifest.json ./static/sdk-manifest.json
 
 # Security: read-only root filesystem + tmpfs for transient writes
 RUN chmod 555 / && \

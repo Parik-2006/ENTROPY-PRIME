@@ -7,7 +7,7 @@
  * are surfaced so the UI can reflect model certainty.
  */
 
-const BACKEND_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const BACKEND_URL = import.meta.env.VITE_API_URL || (typeof window !== 'undefined' ? '' : 'http://localhost:8000')
 
 // ── Core fetch wrapper ────────────────────────────────────────────────────────
 
@@ -20,7 +20,8 @@ async function req(path, method = 'GET', body = null) {
   if (token) opts.headers['Authorization'] = `Bearer ${token}`
   if (body)  opts.body = JSON.stringify(body)
 
-  const res  = await fetch(BACKEND_URL + path, opts)
+  const url = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) + path : BACKEND_URL + path
+  const res  = await fetch(url, opts)
   const data = await res.json()
   if (!res.ok) {
     // Format error message
