@@ -83,6 +83,33 @@ export async function submitScore({ theta, hExp, latentVector, userAgent, server
   return req('/score', 'POST', payload)
 }
 
+/**
+ * Persist the active user's biometric profile after typing in the profile-build page.
+ */
+export async function syncBiometricProfile({
+  theta,
+  hExp,
+  latentVector,
+  practiceText,
+  keyboardStats,
+  pointerStats,
+  profileStats,
+  liveDrift,
+  serverLoad,
+} = {}) {
+  return req('/biometric/profile', 'POST', {
+    theta,
+    h_exp: hExp,
+    latent_vector: latentVector ?? [],
+    practice_text: practiceText ?? '',
+    keyboard_stats: keyboardStats ?? {},
+    pointer_stats: pointerStats ?? {},
+    profile_stats: profileStats ?? {},
+    live_drift: liveDrift,
+    server_load: serverLoad ?? 0.5,
+  })
+}
+
 // ── Password ──────────────────────────────────────────────────────────────────
 
 /**

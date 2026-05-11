@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { submitScore, syncBiometricProfile } from '../services/api'
 import styles from './DashboardPage.module.css'
 
 /**
@@ -73,12 +74,14 @@ function Sidebar({ active }) {
  */
 export default function ProfileBuildPage() {
   const navigate = useNavigate()
-  const { user, logout, getClient, profileStats, liveDrift, anomaly } = useAuth()
+  const { user, logout, getClient, profileStats, liveDrift, anomaly, epReady } = useAuth()
 
   const [practiceText, setPracticeText] = useState('')
   const [isReauthRequired, setIsReauthRequired] = useState(false)
   const [driftHistory, setDriftHistory] = useState([])
   const [recentEvent, setRecentEvent] = useState(null)
+  const syncTimerRef = useRef(null)
+  const lastSyncedTextRef = useRef('')
 
   // Compute profile stability once at render time
   const isProfileStable = profileStats && profileStats.sampleCount >= 50
@@ -139,6 +142,66 @@ export default function ProfileBuildPage() {
       navigate('/dashboard')
     }
   }, [profileStats, navigate])
+
+  useEffect(() => {
+    if (!user || !epReady) return
+
+    const typedText = practiceText.trim()
+    if (typedText.length < 10) return
+
+    if (typedText === lastSyncedTextRef.current) return
+
+    if (syncTimerRef.current) {
+      clearTimeout(syncTimerRef.current)
+    }
+
+    syncTimerRef.current = setTimeout(async () => {
+      try {
+        const ep = getClient()
+        if (!ep) return
+
+        const { theta, hExp } = await ep.evaluate(typedText)
+        const latentVector = await ep.getLatentVector()
+        const keyboardStats = ep.getKeyboardStats()
+        const pointerStats = ep.getPointerStats()
+        const liveProfileStats = ep.getProfileStats()
+
+        await submitScore({
+          theta,
+          hExp,
+          latentVector,
+          serverLoad: 0.35,
+        })
+
+        await syncBiometricProfile({
+          theta,
+          hExp,
+          latentVector,
+          practiceText: typedText,
+          keyboardStats,
+          pointerStats,
+          profileStats: liveProfileStats,
+          liveDrift,
+          serverLoad: 0.35,
+        })
+
+        lastSyncedTextRef.current = typedText
+        setRecentEvent({
+          type: 'sync',
+          message: `✓ Pattern saved for ${typedText.length} typed characters`,
+          severity: 'info',
+        })
+      } catch (e) {
+        console.error('[ProfileBuildPage] profile sync failed:', e)
+      }
+    }, 1000)
+
+    return () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current)
+      }
+    }
+  }, [practiceText, user, epReady, getClient, liveDrift])
 
   return (
     <div className={styles.page}>

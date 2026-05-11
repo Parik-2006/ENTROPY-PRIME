@@ -55,6 +55,7 @@ from typing import Annotated, Any, Optional
 
 import numpy as np
 import torch
+from bson import ObjectId
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -68,7 +69,7 @@ from .database import (
     user_exists, create_user, get_user_by_email, get_user_by_id,
     update_last_login, update_user_security_level,
     create_session, get_session, invalidate_session, update_session_trust_score,
-    store_biometric_sample, get_biometric_profile,
+    store_biometric_sample, get_biometric_profile, upsert_biometric_profile,
     store_honeypot_entry, get_honeypot_signatures, get_honeypot_count,
 )
 
@@ -434,6 +435,24 @@ class TelemetryReq(BaseModel):
 
 class BiometricExtractReq(BaseModel):
     raw_signal: list[float]
+
+
+class BiometricProfileSyncReq(BaseModel):
+    theta:         float              = Field(..., ge=0.0, le=1.0)
+    h_exp:         float              = Field(..., ge=0.0, le=1.0)
+    latent_vector: list[float]        = Field(default_factory=list)
+    practice_text: str                = ""
+    keyboard_stats: dict[str, Any]    = Field(default_factory=dict)
+    pointer_stats:  dict[str, Any]    = Field(default_factory=dict)
+    profile_stats:  dict[str, Any]    = Field(default_factory=dict)
+    live_drift:     float | None      = None
+    server_load:    float             = Field(0.5, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.latent_vector and len(self.latent_vector) != 32:
+            raise ValueError("latent_vector must be empty or exactly 32-dim")
+        return self
 
 
 # ── Webhook endpoint models ───────────────────────────────────────────────────
@@ -1226,6 +1245,87 @@ async def get_biometric_profile_api(user_id: str, session: ActiveSession):
     except Exception as exc:
         logger.error("[Biometric] Profile fetch error: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to retrieve profile")
+
+
+@app.post("/biometric/profile")
+async def sync_biometric_profile(req: BiometricProfileSyncReq, session: ActiveSession, request: Request):
+    """
+    Persist the active user's biometric typing pattern.
+
+    The profile-build page calls this while the user types, so MongoDB stores
+    both the summary stats and the rolling sample history for that user.
+    """
+    user_id = session["user_id"]
+    ip = _client_ip(request)
+
+    keyboard_stats = req.keyboard_stats or {}
+    pointer_stats = req.pointer_stats or {}
+    profile_stats = req.profile_stats or {}
+
+    dwell = float(keyboard_stats.get("avgDwell", 0.0) or 0.0)
+    flight = float(keyboard_stats.get("avgFlight", 0.0) or 0.0)
+    rhythm = float(keyboard_stats.get("rhythm", 0.0) or 0.0)
+    pause = float(keyboard_stats.get("avgPause", 0.0) or 0.0)
+    speed = float(pointer_stats.get("avgSpeed", 0.0) or 0.0)
+    jitter = float(pointer_stats.get("avgJitter", 0.0) or 0.0)
+    accel = float(pointer_stats.get("avgAccel", 0.0) or 0.0)
+    bigram = float(req.h_exp)
+
+    try:
+        await store_biometric_sample(
+            db_handler.db,
+            user_id   = user_id,
+            theta     = req.theta,
+            h_exp     = req.h_exp,
+            dwell     = dwell,
+            flight    = flight,
+            speed     = speed,
+            jitter    = jitter,
+            accel     = accel,
+            rhythm    = rhythm,
+            pause     = pause,
+            bigram    = bigram,
+            device_ip = ip,
+        )
+
+        summary = {
+            "sample_count":       int(profile_stats.get("sampleCount", 0) or 0),
+            "last_drift":         float(profile_stats.get("lastDrift", req.live_drift or 0.0) or 0.0),
+            "adaptive_threshold":  float(profile_stats.get("adaptiveThreshold", 0.0) or 0.0),
+            "selected_features":  profile_stats.get("selectedFeatures", []),
+            "feature_means":      profile_stats.get("featureMeans", []),
+            "updated_at":         datetime.utcnow(),
+            "source":             "profile-build",
+        }
+
+        await upsert_biometric_profile(
+            db_handler.db,
+            user_id            = user_id,
+            sample_count       = summary["sample_count"],
+            last_drift         = summary["last_drift"],
+            adaptive_threshold = summary["adaptive_threshold"],
+            feature_means      = summary["feature_means"],
+            selected_features  = summary["selected_features"],
+            ema_profile        = profile_stats.get("emaProfile"),
+            ema_variance       = profile_stats.get("emaVariance"),
+        )
+
+        await db_handler.db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"biometric_profile": summary, "updated_at": datetime.utcnow()}},
+        )
+
+        profile = await get_biometric_profile(db_handler.db, user_id)
+        return {
+            "success": True,
+            "user_id": user_id,
+            "profile": profile,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[Biometric] Profile sync failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to store biometric profile")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
