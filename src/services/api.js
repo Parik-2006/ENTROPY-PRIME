@@ -17,7 +17,7 @@ async function req(path, method = 'GET', body = null) {
     headers: { 'Content-Type': 'application/json' },
   }
   const token = localStorage.getItem('ep_token')
-  if (token) opts.headers['Authorization'] = `Bearer ${token}`
+  if (token) opts.headers['X-Session-Token'] = token
   if (body)  opts.body = JSON.stringify(body)
 
   const url = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) + path : BACKEND_URL + path

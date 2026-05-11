@@ -72,6 +72,8 @@ function Sidebar({ active }) {
  * User types normally to build their profile, then can deliberately
  * type abnormally or let someone else type to trigger re-auth.
  */
+import { getBiometricCollector, resetBiometricCollector } from '../services/biometricCollector'
+
 export default function ProfileBuildPage() {
   const navigate = useNavigate()
   const { user, logout, getClient, profileStats, liveDrift, anomaly, epReady } = useAuth()
@@ -80,15 +82,29 @@ export default function ProfileBuildPage() {
   const [isReauthRequired, setIsReauthRequired] = useState(false)
   const [driftHistory, setDriftHistory] = useState([])
   const [recentEvent, setRecentEvent] = useState(null)
+  const [collectorState, setCollectorState] = useState(null)
   const syncTimerRef = useRef(null)
   const lastSyncedTextRef = useRef('')
+  const collectorRef = useRef(null)
+
+  // Initialize collector on mount
+  useEffect(() => {
+    collectorRef.current = getBiometricCollector()
+    return () => {
+      // Keep collector for lifecycle, don't reset on unmount
+    }
+  }, [])
 
   // Compute profile stability once at render time
   const isProfileStable = profileStats && profileStats.sampleCount >= 50
   const profileProgress = profileStats ? Math.min(profileStats.sampleCount / 50, 1) : 0
+  const collectionProgress = collectorState ? collectorState.sampleCount / 50 : 0
 
   // Debug profile stability
-  console.log(`[ProfileBuildPage] profileStats.sampleCount=${profileStats?.sampleCount}, isProfileStable=${isProfileStable}`)
+  console.log(
+    `[ProfileBuildPage] serverProfileStats.sampleCount=${profileStats?.sampleCount}, ` +
+    `collectorSampleCount=${collectorState?.sampleCount}, isProfileStable=${isProfileStable}`
+  )
 
   // Redirect if no user
   useEffect(() => {
@@ -158,7 +174,7 @@ export default function ProfileBuildPage() {
     syncTimerRef.current = setTimeout(async () => {
       try {
         const ep = getClient()
-        if (!ep) return
+        if (!ep || !collectorRef.current) return
 
         const { theta, hExp } = await ep.evaluate(typedText)
         const latentVector = await ep.getLatentVector()
@@ -166,6 +182,25 @@ export default function ProfileBuildPage() {
         const pointerStats = ep.getPointerStats()
         const liveProfileStats = ep.getProfileStats()
 
+        // Add current keystroke sample to collector
+        const sample = {
+          theta,
+          hExp,
+          dwell: keyboardStats?.avgDwell || 0,
+          flight: keyboardStats?.avgFlight || 0,
+          rhythm: keyboardStats?.rhythm || 0,
+          speed: pointerStats?.avgSpeed || 0,
+          jitter: pointerStats?.avgJitter || 0,
+          accel: pointerStats?.avgAccel || 0,
+          pause: keyboardStats?.avgPause || 0,
+        }
+        collectorRef.current.addSample(sample)
+
+        // Update collector state for UI
+        const newState = collectorRef.current.getState()
+        setCollectorState(newState)
+
+        // Submit score
         await submitScore({
           theta,
           hExp,
@@ -173,28 +208,37 @@ export default function ProfileBuildPage() {
           serverLoad: 0.35,
         })
 
-        await syncBiometricProfile({
+        // Sync with backend
+        const payload = collectorRef.current.getPersistencePayload(
           theta,
           hExp,
           latentVector,
-          practiceText: typedText,
-          keyboardStats,
-          pointerStats,
-          profileStats: liveProfileStats,
-          liveDrift,
-          serverLoad: 0.35,
-        })
+          liveProfileStats
+        )
+
+        await syncBiometricProfile(payload)
 
         lastSyncedTextRef.current = typedText
         setRecentEvent({
           type: 'sync',
-          message: `✓ Pattern saved for ${typedText.length} typed characters`,
+          message: `✓ Synced: ${newState.sampleCount}/${newState.targetSamples || 50} samples collected`,
           severity: 'info',
+        })
+
+        console.log('[ProfileBuildPage] Sync complete:', {
+          collectorSamples: newState.sampleCount,
+          isStable: newState.isStable,
+          progress: (newState.progress * 100).toFixed(1) + '%',
         })
       } catch (e) {
         console.error('[ProfileBuildPage] profile sync failed:', e)
+        setRecentEvent({
+          type: 'error',
+          message: `✗ Sync failed: ${e.message}`,
+          severity: 'error',
+        })
       }
-    }, 1000)
+    }, 1500)
 
     return () => {
       if (syncTimerRef.current) {
