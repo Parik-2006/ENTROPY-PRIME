@@ -12,16 +12,100 @@ Entropy Prime is a prototype “zero-trust” authentication demo that augments 
 
 ## High-level architecture
 
-- **Diagram:** See the architecture image below for a reliable visual (SVG renders in GitHub and local viewers).
-
 ![Architecture diagram](docs/architecture.svg)
 
-This diagram shows the user (browser) talking to `nginx` which either serves static frontend files or proxies API requests to the backend. The backend reads/writes Mongo and uses Redis for short-lived state. Model files are read from `checkpoints/`.
+### Architecture Diagram Breakdown
+
+The diagram is organized into **5 layers** from bottom to top:
+
+1. **Data/State Layer (bottom):**
+   - **MongoDB**: Persistent datastore for users, sessions, authentication logs, honeypot signals, and audit trails. Used by the backend for all CRUD operations.
+   - **Redis Cache**: Fast in-memory store for rate-limiting counters, cached session tokens, and temporary authentication state.
+   - **Model Checkpoints**: Pre-trained ML models (CNN1D, DQN, PPO) stored in the `checkpoints/` folder; loaded at backend startup for inference.
+   - **File System**: Docker volumes for logs, static assets, and persistent data.
+
+2. **API / Business Logic Layer (middle):**
+   - **Auth Module** (`/auth/register`, `/auth/login`, `/auth/logout`): Handles user registration with Argon2 hashing and session token creation.
+   - **Session/Token Management** (`/session/verify`, `/me`): Validates and manages active sessions; queries MongoDB for user details.
+   - **Biometric Pipeline** (`/score` endpoint): Orchestrates the 4-stage inference pipeline (Biometric → Honeypot → Governor → Watchdog).
+   - **Admin APIs** (`/admin/models-status`, `/admin/telemetry`): Debug and monitoring endpoints for developers.
+
+3. **Frontend Layer (top-right):**
+   - React SPA built with Vite; loaded once from nginx and runs entirely in the browser.
+   - Captures user interactions (keystroke/pointer biometrics) via the SDK.
+   - Manages local session tokens and routing between Login, Register, and Dashboard pages.
+   - All API calls are made via the `api.js` fetch wrapper (relative URLs, no CORS issues).
+
+4. **Proxy/Edge Layer (top-center):**
+   - nginx acts as a reverse proxy: static files go to the browser directly, API calls are forwarded to the backend.
+   - Rate-limiting and caching rules ensure API stability and reduce backend load.
+   - HTTPS termination and request routing prevent the SPA catch-all from intercepting API responses.
+
+5. **Client Layer (top-left):**
+   - The user's web browser sends HTTP(S) requests to nginx.
+   - Displays the login form, collects credentials, and submits biometric signals.
+
+### Key Data Flows:
+- **Register/Login**: Browser → nginx → backend → MongoDB (verify credentials) → session_token → frontend (store locally)
+- **Biometric Score**: Frontend → nginx → backend → runs 4 stages in parallel or sequence → queries MongoDB/Redis as needed → returns JSON
+- **Model Inference**: Backend loads .pt files on startup; during `/score`, each stage reads from loaded models in RAM.
 
 ---
 
-## Login + Scoring sequence (simple steps)
+## Login + Scoring sequence
+
 ![Login + Scoring sequence](docs/sequence.svg)
+
+### Sequence Diagram Explanation
+
+This diagram shows the **step-by-step message flow** during a user login and biometric scoring session:
+
+#### Step 1: Load Login Page
+- User opens `http://localhost/login` (or navigates to it).
+- Browser sends HTTP GET to nginx.
+- nginx proxies to backend SPA handler, which returns `index.html`.
+- Frontend JS loads, initializing the React app and biometric SDK.
+
+#### Step 2: User Enters Credentials
+- User types email and password into the login form.
+- **Simultaneously**, the biometric SDK (in the browser) captures keystroke timings, pointer movements, and patterns.
+- These signals are stored locally in the frontend and will be sent later to `/score`.
+
+#### Step 3: Submit Login Credentials
+- User clicks "Submit" or presses Enter.
+- Frontend calls `POST /auth/login` with email and plain password.
+- nginx intercepts and proxies to the backend (`POST /auth/login`).
+- Backend:
+  1. Looks up the user by email in MongoDB.
+  2. Retrieves the stored Argon2 hash.
+  3. Verifies the plain password against the hash using `PasswordHasher().verify()`.
+  4. If match: creates a session in MongoDB and returns `200 { session_token, user_id, email }`.
+  5. If no match: returns `401 { detail: "Invalid credentials" }`.
+- nginx proxies the response back to the frontend.
+- Frontend displays success/error message.
+
+#### Step 4: Submit Biometric Score (if login succeeded)
+- After successful login, the frontend calls `POST /score` with:
+  - The collected biometric signals (keystroke timing, pointer data).
+  - The latent vector computed by the SDK.
+  - User agent, server load, and other metadata.
+- nginx proxies to backend `/score` handler.
+- Backend **orchestrator** runs the 4-stage pipeline **in sequence**:
+  - **Stage 1 (Biometric)**: CNN1D extracts features (theta, h_exp) from keystroke/pointer signals.
+  - **Stage 2 (Honeypot)**: MAB classifier decides if user should be shadowed or routed to a synthetic challenge.
+  - **Stage 3 (Governor)**: DQN/PPO selects Argon2 parameters and behavioral actions.
+  - **Stage 4 (Watchdog)**: Continuous monitoring for identity drift; recommends actions (ok, passive_reauth, etc.).
+- Backend returns `PipelineOutput` containing:
+  - `session_token`, `humanity_score`, `entropy_score`, `action_label`.
+  - Per-stage results and confidence scores.
+  - Recommended next actions for the UI.
+- Frontend receives the response, stores the session token, and updates the UI (dashboard, threat alerts, etc.).
+
+### Key Takeaways:
+- **nginx acts as a transparent proxy**: the frontend doesn't know it's being routed; it just sends requests to relative URLs.
+- **Authentication happens before biometric scoring**: the `/score` endpoint is only called after a successful login.
+- **Biometric data is completely optional**: the login flow works without biometrics; the `/score` endpoint is a secondary enrichment.
+- **All communication is JSON**: the backend speaks only JSON; HTML is only returned for static assets (via nginx).
 
 ---
 
