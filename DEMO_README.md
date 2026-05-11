@@ -12,52 +12,16 @@ Entropy Prime is a prototype “zero-trust” authentication demo that augments 
 
 ## High-level architecture
 
-```mermaid
-graph LR
-  Browser[Browser (User)] -->|HTTP(S)| NGINX[nginx reverse proxy]
-  NGINX -->|serves| Frontend[Static site (Vite build)]
-  NGINX -->|proxies /auth, /score, /api| Backend[FastAPI backend]
-  Backend --> Mongo[MongoDB (users, sessions, honeypot)]
-  Backend --> Redis[Redis (rate-limit, cache)]
-  Backend --> Checkpoints[Model checkpoints (files)]
-  Frontend --> SDK[public/sdk/entropy.js]
-  Browser -->|keystroke data| Frontend
-  Frontend -->|POST /auth/login, /score| NGINX
-```
+- **Diagram:** See the architecture image below for a reliable visual (SVG renders in GitHub and local viewers).
+
+![Architecture diagram](docs/architecture.svg)
 
 This diagram shows the user (browser) talking to `nginx` which either serves static frontend files or proxies API requests to the backend. The backend reads/writes Mongo and uses Redis for short-lived state. Model files are read from `checkpoints/`.
 
 ---
 
 ## Login + Scoring sequence (simple steps)
-
-```mermaid
-sequenceDiagram
-  participant U as User/Browser
-  participant FE as Frontend (React/Vite)
-  participant NG as nginx
-  participant BE as Backend (FastAPI)
-  participant DB as MongoDB
-  participant RD as Redis
-
-  U->>FE: Open /login (index.html + JS)
-  U->>FE: Type email + password (keystrokes recorded)
-  FE->>NG: POST /auth/login {email, plain_password}
-  NG->>BE: proxy POST /auth/login
-  BE->>DB: lookup user, verify password
-  DB-->>BE: user document (or not found)
-  BE-->>NG: 200 (success) or 401 (invalid)
-  NG-->>FE: 200/401
-  alt login success
-    FE->>NG: POST /score {biometrics, latent_vector}
-    NG->>BE: proxy POST /score
-    BE->>BE: Stage1 -> Stage2 -> Stage3 -> Stage4
-    BE->>DB: create session document
-    BE-->>NG: PipelineOutput {session_token, scores, action_label}
-    NG-->>FE: PipelineOutput
-    FE: store token, update UI
-  end
-```
+![Login + Scoring sequence](docs/sequence.svg)
 
 ---
 
