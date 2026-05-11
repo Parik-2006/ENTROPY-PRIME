@@ -1,6 +1,6 @@
 # ⚡ ENTROPY PRIME — Zero-Trust Behavioral Biometrics Engine
 
-> **Biological-physics security** — detect bots using neuromuscular jitter and temporal DNA, all without ever sending raw keystrokes to your server.
+> **Study focus:** this project detects bots with browser-side behavioral signals, then uses those signals to score trust, adjust server cost, and route suspicious sessions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
@@ -10,7 +10,7 @@
 
 ## 5-Minute Onboarding
 
-> New customer? Follow these four steps to go from zero to a running authentication system.
+> Follow these four steps to understand the full flow from setup to verification.
 
 ### Step 1 — Clone & configure (1 min)
 
@@ -20,12 +20,12 @@ cd entropy-prime
 
 # Generate required secrets — do this once
 export EP_SESSION_SECRET=$(openssl rand -hex 64)
+export EP_SHADOW_SECRET=$(openssl rand -hex 64)
 export MONGO_PASSWORD=$(openssl rand -hex 24)
 export REDIS_PASSWORD=$(openssl rand -hex 24)
-export EP_DOMAIN=auth.yourdomain.com    # or localhost for local testing
 ```
 
-> **Tip**: Persist these in a `.env` file (already in `.gitignore`) so you don't have to re-export them.
+> **Tip**: Store them in a `.env` file so the same values are reused across local runs and Docker Compose can load them automatically.
 
 ```bash
 # Save to .env (never commit this file)
@@ -41,7 +41,7 @@ EOF
 
 ### Step 2 — Start the stack (1 min)
 
-**Local development** (no TLS, hot-reload):
+**Local development** (no TLS, hot reload):
 ```bash
 chmod +x start.sh && ./start.sh
 # ✓ Backend  → http://localhost:8000
@@ -49,13 +49,21 @@ chmod +x start.sh && ./start.sh
 # ✓ API docs → http://localhost:8000/docs
 ```
 
-**Production** (Docker, with Nginx, Redis, MongoDB):
+**Windows development** (Docker for MongoDB/Redis, separate backend/frontend windows):
 ```bash
-docker-compose -f docker-compose.prod.yml up -d
-# ✓ All services start in ~30 seconds
+start.bat
+# ✓ MongoDB and Redis run from docker-compose.dev.yml
+# ✓ Backend  → http://localhost:8000
+# ✓ Frontend → http://localhost:3000
 ```
 
-Verify everything is healthy:
+**Production** (Docker Compose stack with Nginx, backend, MongoDB, Redis):
+```bash
+docker-compose up -d --build
+# ✓ Uses docker-compose.yml in the repository root
+```
+
+Check the backend health endpoint:
 ```bash
 curl http://localhost:8000/health
 # {"status":"ok","models":{"cnn":"loaded","dqn":"loaded","autoencoder":"loaded"}}
@@ -79,7 +87,7 @@ curl http://localhost:8000/health
   const ep = new EntropyPrime({
     apiUrl: 'https://api.yourdomain.com',
     onScore: (score, label) => {
-      console.log(`Humanity score: ${score.toFixed(2)} → ${label}`);
+      console.log(`Humanity score: ${score.toFixed(2)} -> ${label}`);
     },
     onSession: (token) => {
       // Attach token to your login form submission
@@ -103,7 +111,7 @@ const ep = new EntropyPrime({ apiUrl: import.meta.env.VITE_API_URL });
 ep.attach(formRef.current);
 ```
 
-The SDK captures keystrokes and mouse movements **entirely in the browser** — raw signals never leave the device.
+The SDK captures keystrokes and mouse movements entirely in the browser, so raw signals never leave the device.
 
 ---
 
@@ -122,25 +130,26 @@ curl -X POST http://localhost:8000/verify \
 ```
 
 On your backend, reject requests where `theta < 0.5` or `valid: false`.
+In the containerized stack, the public health URL is proxied through Nginx at `/health`.
 
 ---
 
-That's it — you now have bot detection running on your login page. Read on for architecture details, advanced configuration, and production hardening.
+That is the basic flow: collect signals in the browser, score them, issue a token, then verify that token on the server.
 
 ---
 
 ## Project Overview
 
-Modern authentication is broken. Cookies are stolen. Browser fingerprints are spoofed. ENTROPY PRIME moves the trust anchor to **neuromuscular physics** — the unique, unclonable patterns in how a human being physically interacts with a keyboard and mouse.
+Modern authentication is vulnerable to stolen cookies, replay attacks, and spoofed fingerprints. ENTROPY PRIME shifts trust to browser-observed behavioral signals, then uses those signals to estimate whether the session is likely human.
 
 ### Core Algorithmic Phases
 
 | Phase | Where | What happens |
 |---|---|---|
-| **Biological Gateway** | Browser | Captures dwell/flight times, velocity, jitter. A 1D-CNN outputs a humanity score θ ∈ [0,1]. |
-| **Resource Governor** | Backend | A DQN agent selects Argon2id cost dynamically: expensive for bots, fast for verified humans. |
-| **Offensive Deception** | Backend | Bots (θ < 0.1) receive synthetic session tokens and are silently routed to a honeypot. |
-| **Session Watchdog** | Both | A deep autoencoder anchors a baseline; trust score decays if behaviour changes mid-session. |
+| **Biological Gateway** | Browser | Captures dwell/flight times, velocity, and jitter. A 1D-CNN turns them into a humanity score θ in the range [0,1]. |
+| **Resource Governor** | Backend | A DQN agent chooses Argon2id cost dynamically: heavier for bots, lighter for trusted users. |
+| **Offensive Deception** | Backend | Very low scores (θ < 0.1) are given synthetic tokens and redirected into a honeypot path. |
+| **Session Watchdog** | Both | A deep autoencoder keeps a baseline and lowers trust if session behavior changes midstream. |
 
 ### Privacy Model
 
@@ -154,11 +163,13 @@ Velocity/jitter     ─╯  browser   • H_exp       (1 float)
                                    • latent vec  (32 floats)
 ```
 
-Raw biometric signals are processed in-browser. The server cannot reconstruct keystroke timings or mouse paths from the three numbers it receives.
+Raw biometric signals are processed in-browser. The server only sees compact derived features, not the full keystroke or mouse trace.
 
 ---
 
 ## SDK Reference
+
+Use this section to map the browser API to the main runtime concepts: configuration, capture, scoring, and token handling.
 
 ### Constructor
 
@@ -198,6 +209,8 @@ cat dist/sdk-manifest.json | python3 -m json.tool | grep sha384
 
 ## Backend API
 
+This is the server-side surface area the SDK and your application depend on.
+
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness check; returns model load status |
@@ -215,23 +228,17 @@ Full interactive docs: `http://localhost:8000/docs`
 ### Build the production stack
 
 ```bash
-# Build SDK first (generates entropy.min.js + integrity hashes)
-chmod +x scripts/bundle-sdk.sh
-scripts/bundle-sdk.sh
-
-# Build and start all production services
-EP_DOMAIN=auth.example.com \
-EP_SESSION_SECRET=$(cat .env | grep EP_SESSION_SECRET | cut -d= -f2) \
-MONGO_PASSWORD=$(cat .env | grep MONGO_PASSWORD | cut -d= -f2) \
-REDIS_PASSWORD=$(cat .env | grep REDIS_PASSWORD | cut -d= -f2) \
-docker-compose -f docker-compose.prod.yml up -d --build
+# Build and start the main 4-service production stack
+docker-compose up -d --build
 ```
+
+The root `docker-compose.yml` starts Nginx, the FastAPI backend, MongoDB, and Redis on a shared bridge network. Nginx serves the SPA and reverse-proxies `/api/*`, `/auth/*`, `/admin/*`, `/score`, `/session/*`, `/password/*`, `/honeypot/*`, `/biometric/*`, `/telemetry`, and `/me` to the backend.
 
 ### Pre-train the RL governor (recommended)
 
 ```bash
 python backend/train.py --episodes 200000 --out checkpoints/governor.pt
-# Takes ~20 min on CPU, ~3 min on GPU. Significantly improves hashing cost decisions.
+# Takes about 20 minutes on CPU and about 3 minutes on GPU. This improves hashing-cost decisions.
 ```
 
 ### TLS certificates
@@ -243,14 +250,15 @@ nginx/ssl/privkey.pem
 ```
 
 For automated Let's Encrypt certificates, mount a Certbot volume and add a renewal cron job.
+If you are running the default compose stack exactly as checked in, Nginx is still the entry point for the app and API routes, but TLS configuration is only active once you wire in certificates.
 
 ### Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `EP_SESSION_SECRET` | ✅ | 64-byte hex secret for JWT signing |
-| `EP_DOMAIN` | ✅ | Hostname (used for CORS and TLS) |
-| `MONGO_PASSWORD` | ✅ | MongoDB password |
+| `EP_SESSION_SECRET` | ✅ | Session secret used by the backend |
+| `EP_SHADOW_SECRET` | — | Secondary secret used by the watchdog / shadow paths |
+| `MONGO_PASSWORD` | ✅ | MongoDB root password |
 | `REDIS_PASSWORD` | ✅ | Redis password |
 | `EP_RL_CHECKPOINT` | — | Path to pre-trained DQN weights |
 | `EP_HONEYPOT_ENABLED` | — | `true`/`false` (default `true`) |
@@ -272,22 +280,28 @@ For automated Let's Encrypt certificates, mount a Certbot volume and add a renew
 ## Tech Stack
 
 - **Frontend:** React, Vite, TensorFlow.js, Recharts
-- **Backend:** Python 3.11, FastAPI, PyTorch, Argon2-cffi, uvicorn + uvloop
+- **Backend:** Python 3.13, FastAPI, PyTorch, Argon2-cffi, uvicorn + uvloop
 - **ML:** 1D-CNN (biometrics), DQN (resource governor), Autoencoder (session trust)
-- **Infra:** Docker, Nginx, MongoDB 7, Redis 7
+- **Infra:** Docker Compose, Nginx, MongoDB 7, Redis 7
 
 ---
 
 ## Local Development
 
 ```bash
-# Backend only
+# Linux/macOS: start backend and frontend together
+./start.sh
+
+# Windows: start MongoDB and Redis in Docker, then backend and frontend windows
+start.bat
+
+# Manual backend only
 cd backend
 python3 -m venv ../.venv && source ../.venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 
-# Frontend only (separate terminal)
+# Manual frontend only (separate terminal)
 npm install
 npm run dev    # → http://localhost:3000
 
@@ -301,15 +315,15 @@ scripts/bundle-sdk.sh
 ## Extending the System
 
 - **Real user database:** Replace `uid = "usr_" + secrets.token_hex(6)` in `/score` with a lookup against your user store. Add a `/login` endpoint that verifies the password hash before issuing the session token.
-- **Custom ML models:** Swap the 1D-CNN checkpoint by setting `EP_CNN_CHECKPOINT` and ensuring the input/output shapes match the existing interface.
-- **Webhooks:** Add a `onBotDetected` webhook in `backend/honeypot.py` to pipe threat-intelligence data to your SIEM.
-- **HTTPS in dev:** Use `mkcert` to generate a local CA and point `VITE_API_URL` at `https://localhost:8000`.
+- **Custom ML models:** Swap the 1D-CNN checkpoint by setting `EP_CNN_CHECKPOINT` and keeping the input and output shapes compatible with the current interface.
+- **Webhooks:** Add an `onBotDetected` webhook in `backend/honeypot.py` to send threat-intelligence data to your SIEM.
+- **HTTPS in dev:** Use `mkcert` to create a local CA and point `VITE_API_URL` at `https://localhost:8000`.
 
 ---
 
 ## Contributing
 
-Pull requests and suggestions are welcome. Please open an issue to discuss major changes before submitting a PR.
+Pull requests and suggestions are welcome. Open an issue first for major changes so the design stays aligned.
 
 - **Found a bug?** Open an issue with reproduction steps.
 - **Want to contribute?** Fork the repo and open a PR against `main`.
