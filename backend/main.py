@@ -466,8 +466,13 @@ class BiometricProfileSyncReq(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self):
-        if self.latent_vector and len(self.latent_vector) != 32:
-            raise ValueError("latent_vector must be empty or exactly 32-dim")
+        if self.latent_vector:
+            if len(self.latent_vector) < 32:
+                padded = list(self.latent_vector[:32])
+                padded.extend([0.0] * (32 - len(padded)))
+                object.__setattr__(self, "latent_vector", padded)
+            elif len(self.latent_vector) > 32:
+                object.__setattr__(self, "latent_vector", list(self.latent_vector[:32]))
         return self
 
 
@@ -963,7 +968,7 @@ async def register(req: UserCreate, request: Request):
         user_agent="", latent_vector=[], ip_address="register",
     )
     bio = s1.run_legacy(bio_raw)
-    gov = s3.run(bio, dqn_agent, ppo_agent)
+    gov = s3.run(bio, dqn_agent, gov_ppo_agent)
 
     ph            = PasswordHasher(memory_cost=gov.memory_kb, time_cost=gov.time_cost, parallelism=gov.parallelism)
     password_hash = ph.hash(req.plain_password)
@@ -1111,7 +1116,7 @@ async def pw_hash(req: PwHashReq, user_id: Optional[str] = None):
         user_agent="", latent_vector=[], ip_address="hash",
     )
     bio = s1.run_legacy(bio_raw)
-    gov = s3.run(bio, dqn_agent, ppo_agent)
+    gov = s3.run(bio, dqn_agent, gov_ppo_agent)
     ph  = PasswordHasher(memory_cost=gov.memory_kb, time_cost=gov.time_cost, parallelism=gov.parallelism)
     t0  = time.perf_counter()
     h   = ph.hash(req.plain_password)

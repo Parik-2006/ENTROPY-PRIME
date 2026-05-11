@@ -224,6 +224,7 @@ class HoneypotResult:
     confidence:       Confidence
     mab_arm_selected: int             # -1 → no arm chosen (error/fallback)
     mab_confidence:   Confidence
+    challenge:        Optional["ChallengeConfig"] = None
 
 
 # ── Stage 3: Resource Governor (DQN + PPO) ───────────────────────────────────

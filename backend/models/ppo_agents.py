@@ -152,7 +152,7 @@ class PPOPolicyAgent:
     PPO agent for the Governor's behavioral action selection.
 
     Typical lifecycle:
-      1. Instantiate:  agent = PPOPolicyAgent(state_dim=6, action_dim=4)
+    1. Instantiate:  agent = PPOPolicyAgent(state_dim=5, action_dim=4)
       2. Collect data: action, log_p, value = agent.act(state)
       3. Store in buffer + compute reward + observe done
       4. After rollout: agent.update(buffer)
@@ -165,7 +165,7 @@ class PPOPolicyAgent:
 
     def __init__(
         self,
-        state_dim:  int = 6,
+        state_dim:  int = 5,
         action_dim: int = 4,
         lr:         float = 3e-4,
         device:     Optional[str] = None,

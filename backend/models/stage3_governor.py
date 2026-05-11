@@ -181,7 +181,7 @@ def _run_dqn(
     """Run the DQN and return (action, confidence, fallback_flag)."""
     # Low-confidence classification → conservative STANDARD (hard override)
     if bio.confidence == Confidence.LOW:
-        return _DEFAULT_DQN_ACTION, Confidence.LOW, True
+        return _DEFAULT_DQN_ACTION, Confidence.LOW, False
 
     try:
         state  = _build_dqn_state(bio)
@@ -206,7 +206,10 @@ def _run_ppo(
         return _DEFAULT_PPO_ACTION, True
     try:
         state     = _build_ppo_state(bio, policy)
-        action_idx = int(ppo_agent.select_action(state))
+        action_raw = ppo_agent.select_action(state)
+        if isinstance(action_raw, tuple):
+            action_raw = action_raw[0]
+        action_idx = int(action_raw)
         action_idx = max(0, min(len(_ACTION_ORDER) - 1, action_idx))
         return _ACTION_ORDER[action_idx], False
     except Exception as exc:

@@ -44,7 +44,7 @@ import threading
 from pathlib import Path
 from typing import Dict, Optional
 
-from ..models.ppo_agent import PPOPolicyAgent, RolloutBuffer
+from ..models.ppo_agents import PPOPolicyAgent, RolloutBuffer
 from ..models import stage3_governor as _s3
 from ..pipeline.contracts import (
     BiometricResult,
@@ -199,7 +199,7 @@ class GovernorService:
         dqn_agent:    Optional[object]             = None,
         ppo_agent:    Optional[PPOPolicyAgent]      = None,
         policy_store: Optional[AbstractPolicyStore] = None,
-        ppo_state_dim: int = 6,
+        ppo_state_dim: int = 5,
         ppo_action_dim: int = 4,
     ) -> None:
         self._dqn    = dqn_agent    or _StubDQN()
