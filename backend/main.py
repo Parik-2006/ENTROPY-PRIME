@@ -64,8 +64,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 # ── Database layer ────────────────────────────────────────────────────────────
-from .database import Database
-from .database import (
+from backend.database import Database
+from backend.database import (
     user_exists, create_user, get_user_by_email, get_user_by_id,
     update_last_login, update_user_security_level,
     create_session, get_session, invalidate_session, update_session_trust_score,
@@ -74,31 +74,31 @@ from .database import (
 )
 
 # ── Pydantic auth models ──────────────────────────────────────────────────────
-from .models.pydantic_models import UserCreate, UserLogin
+from backend.models.pydantic_models import UserCreate, UserLogin
 
 # ── ML agents ────────────────────────────────────────────────────────────────
-from .models.dqn   import DQNAgent
-from .models.mab   import MABAgent
-from .models.ppo   import PPOAgent
-from .models.cnn1d import CNN1D
+from backend.models.dqn   import DQNAgent
+from backend.models.mab   import MABAgent
+from backend.models.ppo   import PPOAgent
+from backend.models.cnn1d import CNN1D
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
-from .pipeline import PipelineOrchestrator, BiometricInput
-from .pipeline.contracts  import WatchdogAction, SecurityPreset
-from .pipeline            import stage1_biometric as s1
-from .pipeline            import stage3_governor  as s3
-from .pipeline.orchestrator import _make_session_token
-from .middleware.auth import attach_db, SiteCtx
-from .services.auth_service import load_jwt_public_key
-from .services.watchdog_services import WatchdogService
+from backend.pipeline import PipelineOrchestrator, BiometricInput
+from backend.pipeline.contracts  import WatchdogAction, SecurityPreset
+from backend.pipeline            import stage1_biometric as s1
+from backend.pipeline            import stage3_governor  as s3
+from backend.pipeline.orchestrator import _make_session_token
+from backend.middleware.auth import attach_db, SiteCtx
+from backend.services.auth_service import load_jwt_public_key
+from backend.services.watchdog_services import WatchdogService
 
 # ── Integration API: webhooks + notification service ─────────────────────────
-from .webhooks import (
+from backend.webhooks import (
     WebhookEndpoint,
     WebhookEvent,
     dispatcher,
 )
-from .services.notification_service import (
+from backend.services.notification_service import (
     AlertThresholds,
     NotificationService,
     Severity,
