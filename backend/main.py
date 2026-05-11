@@ -53,6 +53,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
+# ── Ensure parent directory is in path for imports ────────────────────────────
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+
 import numpy as np
 import torch
 from bson import ObjectId
