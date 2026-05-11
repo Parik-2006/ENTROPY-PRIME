@@ -127,8 +127,9 @@ db_handler = Database()
 
 dqn_agent = DQNAgent(state_dim=3,  action_dim=4)
 mab_agent = MABAgent(n_arms=3)
-ppo_agent = PPOAgent(state_dim=10, action_dim=3)
-cnn_model = CNN1D(input_channels=1, out_dim=32)
+gov_ppo_agent = PPOAgent(state_dim=5, action_dim=4)  # Stage 3
+ppo_agent = PPOAgent(state_dim=10, action_dim=3)    # Stage 4
+cnn_model = CNN1D(input_channels=8, out_dim=32)
 
 watchdog_service: Optional[WatchdogService] = None
 orchestrator:     Optional[PipelineOrchestrator] = None
@@ -152,12 +153,14 @@ def _load_checkpoints() -> None:
 
     rl_path  = os.environ.get("EP_RL_CHECKPOINT",  os.path.join(ckpt_dir, "governor.pt"))
     mab_path = os.environ.get("EP_MAB_CHECKPOINT", os.path.join(ckpt_dir, "mab.json"))
+    gov_ppo_path = os.environ.get("EP_GOV_PPO_CHECKPOINT", os.path.join(ckpt_dir, "governor_ppo.pt"))
     ppo_path = os.environ.get("EP_PPO_CHECKPOINT", os.path.join(ckpt_dir, "watchdog.pt"))
 
     for path, loader, label in [
         (rl_path,  lambda p: dqn_agent.load_checkpoint(p),                                  "DQN"),
         (mab_path, lambda p: mab_agent.load_state_dict(json.load(open(p))),                 "MAB"),
-        (ppo_path, lambda p: ppo_agent.load_checkpoint(p),                                  "PPO"),
+        (gov_ppo_path, lambda p: gov_ppo_agent.load_checkpoint(p),                          "GOV_PPO"),
+        (ppo_path, lambda p: ppo_agent.load_checkpoint(p),                                  "WATCHDOG_PPO"),
     ]:
         if os.path.exists(path):
             try:
@@ -207,6 +210,7 @@ async def lifespan(app: FastAPI):
     orchestrator = PipelineOrchestrator(
         dqn_agent      = dqn_agent,
         mab_agent      = mab_agent,
+        gov_ppo_agent  = gov_ppo_agent,
         ppo_agent      = ppo_agent,
         shadow_secret  = SHADOW_SECRET,
         session_secret = SESSION_SECRET,
@@ -322,9 +326,15 @@ class _SessionGuardDep:
     async def __call__(self, request: Any) -> dict:
         token = request.headers.get("X-Session-Token")
         if not token:
+            # Fallback to standard Authorization header
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.removeprefix("Bearer ").strip()
+
+        if not token:
             raise HTTPException(
                 status_code = status.HTTP_401_UNAUTHORIZED,
-                detail      = "Missing X-Session-Token header",
+                detail      = "Missing session token (expected X-Session-Token or Authorization: Bearer)",
                 headers     = {"WWW-Authenticate": "Bearer"},
             )
         try:
@@ -443,8 +453,8 @@ class BiometricExtractReq(BaseModel):
 
 
 class BiometricProfileSyncReq(BaseModel):
-    theta:         float              = Field(..., ge=0.0, le=1.0)
-    h_exp:         float              = Field(..., ge=0.0, le=1.0)
+    theta:         float              = Field(0.5, ge=0.0, le=1.0)
+    h_exp:         float              = Field(0.0, ge=0.0, le=1.0)
     latent_vector: list[float]        = Field(default_factory=list)
     practice_text: str                = ""
     keyboard_stats: dict[str, Any]    = Field(default_factory=dict)
@@ -1043,10 +1053,17 @@ async def login(req: UserLogin, request: Request):
 
 
 @app.post("/auth/logout")
-async def logout(req: LogoutReq):
-    """Invalidate a session.  Token in the request body, never the URL."""
+async def logout(req: Optional[LogoutReq] = None, session_token: Optional[str] = None):
+    """Invalidate a session. Supports token in body or query param."""
+    token = session_token
+    if not token and req:
+        token = req.session_token
+    
+    if not token:
+        raise HTTPException(status_code=422, detail="session_token required")
+
     try:
-        await invalidate_session(db_handler.db, req.session_token)
+        await invalidate_session(db_handler.db, token)
         return {"success": True, "message": "Logged out successfully"}
     except Exception as exc:
         logger.error("[Auth] Logout error: %s", exc)

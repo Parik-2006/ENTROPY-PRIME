@@ -25,6 +25,7 @@ class HoneypotVerdict(str, Enum):
     SUSPECT  = "suspect"   # BOT_THETA_HARD ≤ θ < BOT_THETA_SOFT
     HUMAN    = "human"     # θ ≥ BOT_THETA_SOFT
     LEARNING = "learning"  # user still in learning phase — observe only, never block
+    CHALLENGE = "challenge" # added to support stage 2 challenge logic
 
 
 class SecurityPreset(str, Enum):

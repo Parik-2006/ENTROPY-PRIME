@@ -50,7 +50,7 @@ services:
       - frontend_net
       - backend_net
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/index.html"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:80/index.html"]
       interval: 30s
       timeout: 5s
       retries: 2
@@ -112,16 +112,18 @@ services:
     volumes:
       - mongo_data:/data/db
       - ./mongo/init.js:/docker-entrypoint-initdb.d/init.js:ro
+    ports:
+      - "27017:27017"
     expose:
       - "27017"
     networks:
       - backend_net
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      test: ["CMD", "mongosh", "--authenticationDatabase", "admin", "-u", "mongo_user", "-p", "${MONGO_PASSWORD}", "--eval", "db.adminCommand('ping').ok"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     deploy:
       resources:
         limits:
@@ -144,15 +146,18 @@ services:
       --maxmemory-policy allkeys-lru
       --save ""
       --appendonly no
+    ports:
+      - "6379:6379"
     expose:
       - "6379"
     networks:
       - backend_net
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 15s
       timeout: 5s
       retries: 3
+      start_period: 20s
     deploy:
       resources:
         limits:

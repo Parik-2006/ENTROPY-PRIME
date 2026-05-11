@@ -1,54 +1,62 @@
 @echo off
+cd /d "%~dp0"
+title ENTROPY PRIME - Launcher
+
 echo ================================================
 echo    ENTROPY PRIME - Zero Trust Auth System
+echo    Development Mode
 echo ================================================
 echo.
 
-REM Check if already running
-tasklist /FI "IMAGENAME eq node.exe" 2>NUL | find /I /N "node.exe">NUL
-if %ERRORLEVEL% EQU 0 (
-    echo WARNING: Node.js processes already running. They will be terminated.
-    taskkill /F /IM node.exe >nul 2>&1
+REM ── Stop any stale dev containers first ──────────────────────
+echo [1/4] Cleaning up old dev containers...
+docker-compose -f docker-compose.dev.yml down --remove-orphans >nul 2>&1
+
+REM ── Start MongoDB + Redis via Docker ─────────────────────────
+echo [2/4] Starting MongoDB ^& Redis (Docker)...
+docker-compose -f docker-compose.dev.yml up -d
+if %errorlevel% neq 0 (
+    echo.
+    echo  ERROR: Docker failed to start!
+    echo  Is Docker Desktop running? Please open it and try again.
+    echo.
+    pause
+    exit /b 1
 )
 
-tasklist /FI "IMAGENAME eq python.exe" 2>NUL | find /I /N "python.exe">NUL
-if %ERRORLEVEL% EQU 0 (
-    echo WARNING: Python processes already running. They will be terminated.
-    taskkill /F /IM python.exe >nul 2>&1
-)
+echo.
+echo  Waiting 15s for MongoDB and Redis to be ready...
+ping 127.0.0.1 -n 16 > nul
 
-tasklist /FI "IMAGENAME eq uvicorn.exe" 2>NUL | find /I /N "uvicorn.exe">NUL
-if %ERRORLEVEL% EQU 0 (
-    echo WARNING: Uvicorn processes already running. They will be terminated.
-    taskkill /F /IM uvicorn.exe >nul 2>&1
-)
+REM ── Start Backend in its own window ──────────────────────────
+echo [3/4] Opening Backend terminal window...
+start "ENTROPY PRIME - Backend :8000" cmd /k "%~dp0backend\run-backend.bat"
 
-echo Starting MongoDB...
-start "MongoDB" docker-compose up -d
+echo  Waiting 8s for backend to start...
+ping 127.0.0.1 -n 9 > nul
 
-echo Waiting for MongoDB to initialize...
-timeout /t 8 /nobreak > nul
-
-echo Starting Backend Server...
-start "Entropy Prime Backend" cmd /k "cd backend && set PYTHONPATH=%CD%\.. && set MONGODB_URL=mongodb://admin:changeme@localhost:27017/entropy_prime?authSource=admin && echo Backend starting... && .\venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000"
-
-echo Waiting for backend to start...
-timeout /t 5 /nobreak > nul
-
-echo Starting Frontend...
-start "Entropy Prime Frontend" cmd /k "echo Frontend starting... && npm run dev"
+REM ── Start Frontend in its own window ─────────────────────────
+echo [4/4] Opening Frontend terminal window...
+start "ENTROPY PRIME - Frontend :3000" cmd /k "%~dp0run-frontend.bat"
 
 echo.
 echo ================================================
-echo    ENTROPY PRIME STARTUP COMPLETE
+echo    STARTUP COMPLETE
 echo ================================================
 echo.
-echo 🌐 Frontend: http://localhost:3001
-echo 🔧 Backend API: http://localhost:8000
-echo 📚 API Docs: http://localhost:8000/docs
-echo 🗄️  MongoDB: localhost:27017
+echo   Infrastructure (Docker, hidden):
+echo     MongoDB  ^>  localhost:27017
+echo     Redis    ^>  localhost:6379
 echo.
-echo Close this window to stop all servers.
-echo Individual server windows will stay open.
+echo   Open these in your browser:
+echo     Frontend   -^>  http://localhost:3000
+echo     Backend    -^>  http://localhost:8000
+echo     API Docs   -^>  http://localhost:8000/docs
+echo.
+echo   You should now see 2 new terminal windows:
+echo     [ENTROPY PRIME - Backend :8000]
+echo     [ENTROPY PRIME - Frontend :3000]
+echo.
+echo   To STOP everything, run: stop.bat
 echo.
 pause

@@ -1,0 +1,59 @@
+# =============================================================
+#  docker-compose.dev.yml — Entropy Prime DEV Infrastructure
+#
+#  Only starts MongoDB and Redis.
+#  Backend (FastAPI) and Frontend (Vite) run directly on host
+#  so you can see their terminals and get hot-reload.
+#
+#  Usage:
+#    docker-compose -f docker-compose.dev.yml up -d
+# =============================================================
+
+services:
+
+  # ── MongoDB ───────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: entropy_mongodb_dev
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo_user
+      MONGO_INITDB_ROOT_PASSWORD: viratkohli18
+      MONGO_INITDB_DATABASE: entropy
+    volumes:
+      - mongo_data_dev:/data/db
+      - ./mongo/init.js:/docker-entrypoint-initdb.d/init.js:ro
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--authenticationDatabase", "admin", "-u", "mongo_user", "-p", "viratkohli18", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Redis ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: entropy_redis_dev
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass c60ec64710c3e74ec8ed7fc1f0f6682f997ac952dc52c7f2
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "c60ec64710c3e74ec8ed7fc1f0f6682f997ac952dc52c7f2", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# ── Named volumes ─────────────────────────────────────────────
+volumes:
+  mongo_data_dev:
+    driver: local

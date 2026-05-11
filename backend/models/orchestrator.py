@@ -57,12 +57,14 @@ class PipelineOrchestrator:
         self,
         dqn_agent,
         mab_agent,
+        gov_ppo_agent,
         ppo_agent,
         shadow_secret:  str,
         session_secret: str,
     ):
         self._dqn    = dqn_agent
         self._mab    = mab_agent
+        self._gov    = gov_ppo_agent
         self._ppo    = ppo_agent
         self._shadow = shadow_secret
         self._sess   = session_secret
@@ -96,7 +98,7 @@ class PipelineOrchestrator:
         # Failure here is serious — fall back to HUMAN/LOW so real users are
         # never locked out by an instrumentation error.
         try:
-            bio = s1.run(raw)
+            bio = s1.run_legacy(raw)
             logger.debug("[S1] verdict=%s conf=%s θ=%.3f", bio.verdict, bio.confidence, bio.theta)
         except Exception as exc:
             logger.error("[S1] FAILED: %s — safe defaults applied", exc)
@@ -132,7 +134,7 @@ class PipelineOrchestrator:
 
         # ── Stage 3: Resource Governor (DQN) ──────────────────────────────────
         try:
-            gov = s3.run(bio, self._dqn)
+            gov = s3.run(bio, self._dqn, self._gov)
             if gov.fallback:
                 degraded = True
             logger.debug("[S3] preset=%s conf=%s fallback=%s",
@@ -219,7 +221,7 @@ def _safe_honeypot(bio: BiometricResult) -> HoneypotResult:
     return HoneypotResult(
         should_shadow    = False,
         synthetic_token  = None,
-        verdict          = bio.verdict,
+        verdict          = bio.verdict or HoneypotVerdict.CHALLENGE,
         confidence       = Confidence.LOW,
         mab_arm_selected = -1,
         mab_confidence   = Confidence.LOW,

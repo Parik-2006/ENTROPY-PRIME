@@ -202,6 +202,8 @@ def _run_ppo(
     policy: TenantPolicy,
 ) -> tuple[GovernorAction, bool]:
     """Run the PPO and return (governor_action, fallback_flag)."""
+    if ppo_agent is None:
+        return _DEFAULT_PPO_ACTION, True
     try:
         state     = _build_ppo_state(bio, policy)
         action_idx = int(ppo_agent.select_action(state))
@@ -284,18 +286,7 @@ def _build_ppo_state(bio: BiometricResult, policy: TenantPolicy) -> np.ndarray:
     """
     5-element state vector for the PPO:
       [theta, server_load, is_suspect, is_bot, risk_tolerance]
-
-    risk_tolerance is included so that a single shared PPO checkpoint can
-    serve all tenants — it learns to modulate its behaviour based on the
-    tenant's risk appetite rather than needing a separate model per tenant.
     """
-    verdict_encoded = {
-        HoneypotVerdict.BOT:      0.0,
-        HoneypotVerdict.SUSPECT:  0.33,
-        HoneypotVerdict.LEARNING: 0.66,
-        HoneypotVerdict.HUMAN:    1.0,
-    }.get(bio.verdict, 0.5)
-
     return np.array(
         [
             bio.theta,
@@ -303,7 +294,6 @@ def _build_ppo_state(bio: BiometricResult, policy: TenantPolicy) -> np.ndarray:
             float(bio.is_suspect),
             float(bio.is_bot),
             policy.risk_tolerance,
-            verdict_encoded,
         ],
         dtype=np.float32,
     )
