@@ -12,7 +12,7 @@ Entropy Prime is a prototype “zero-trust” authentication demo that augments 
 
 ## High-level architecture
 
-![Architecture diagram](docs/architecture.svg)
+<img src="docs/architecture.svg" alt="Architecture diagram" width="100%" />
 
 ### Architecture Diagram Breakdown
 
@@ -54,7 +54,7 @@ The diagram is organized into **5 layers** from bottom to top:
 
 ## Login + Scoring sequence
 
-![Login + Scoring sequence](docs/sequence.svg)
+<img src="docs/sequence.svg" alt="Login + Scoring sequence" width="100%" />
 
 ### Sequence Diagram Explanation
 
