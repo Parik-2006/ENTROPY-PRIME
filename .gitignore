@@ -60,6 +60,7 @@ dist/
 build/
 *.min.js
 *.min.css
+output/
 
 # SDK bundler outputs (git-ignored; rebuild from source)
 public/sdk/entropy.min.js

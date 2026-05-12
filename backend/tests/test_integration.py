@@ -9,6 +9,16 @@ Tests the full FastAPI + Orchestrator stack using:
 
 Run with:
     pytest backend/tests -v
+
+v2.1.0 fixes
+────────────
+• _AsyncCursor: added __aiter__ / __anext__ so `async for doc in cursor`
+  (used by threat-intelligence read paths) works correctly in the shim.
+• app_client fixture: added gov_ppo_agent to PipelineOrchestrator kwargs
+  (matches the updated orchestrator signature).
+• TestBiometricProfile (new): exercises POST /biometric/profile end-to-end
+  and asserts all 16 required fields are present in the stored document.
+• _AsyncCollection: added update_many stub used by expire_threats_before.
 """
 from __future__ import annotations
 
@@ -34,8 +44,6 @@ if BACKEND_DIR not in sys.path:
 import mongomock
 from mongomock.mongo_client import MongoClient as MockMongoClient
 
-# We need a mongomock database that exposes async collection methods.
-# We wrap mongomock with AsyncMock-based shims so motor-style awaits work.
 
 def _make_async_collection(sync_col):
     """Wrap a synchronous mongomock collection with async methods."""
@@ -53,19 +61,47 @@ def _make_async_collection(sync_col):
         async def update_one(self, query, update, *args, **kwargs):
             return self._col.update_one(query, update, *args, **kwargs)
 
+        async def update_many(self, query, update, *args, **kwargs):
+            return self._col.update_many(query, update, *args, **kwargs)
+
+        async def delete_many(self, query=None, *args, **kwargs):
+            return self._col.delete_many(query or {}, *args, **kwargs)
+
         async def count_documents(self, query=None, *args, **kwargs):
             return self._col.count_documents(query or {}, *args, **kwargs)
 
+        async def create_index(self, *args, **kwargs):
+            # mongomock accepts create_index but we swallow errors gracefully
+            try:
+                return self._col.create_index(*args, **kwargs)
+            except Exception:
+                pass
+
         def find(self, query=None, *args, **kwargs):
             return _AsyncCursor(self._col.find(query or {}, *args, **kwargs))
+
+        def aggregate(self, pipeline, *args, **kwargs):
+            return _AsyncCursor(self._col.aggregate(pipeline, *args, **kwargs))
+
+        def drop(self):
+            return self._col.drop()
 
     return AsyncCollection(sync_col)
 
 
 class _AsyncCursor:
-    """Minimal async-cursor shim for mongomock sync cursor."""
+    """
+    Minimal async-cursor shim for mongomock sync cursor.
+
+    Supports both:
+      • await cursor.to_list(n)        — used by list-returning helpers
+      • async for doc in cursor: ...   — used by threat-intelligence read paths
+    """
+
     def __init__(self, cursor):
-        self._cur = cursor
+        self._cur    = cursor
+        self._items  = None   # lazily materialised on first iteration
+        self._index  = 0
 
     def sort(self, *args, **kwargs):
         self._cur = self._cur.sort(*args, **kwargs)
@@ -79,11 +115,31 @@ class _AsyncCursor:
         results = list(self._cur)
         return results[:length] if length is not None else results
 
+    # ── async iteration support ───────────────────────────────────────────────
+
+    def __aiter__(self):
+        # Materialise the cursor once so repeated __anext__ calls work
+        if self._items is None:
+            self._items = list(self._cur)
+            self._index = 0
+        return self
+
+    async def __anext__(self):
+        if self._items is None:
+            self._items = list(self._cur)
+            self._index = 0
+        if self._index >= len(self._items):
+            raise StopAsyncIteration
+        item = self._items[self._index]
+        self._index += 1
+        return item
+
 
 class _AsyncDB:
-    """Wraps a mongomock DB to expose async-collection access via []."""
+    """Wraps a mongomock DB to expose async-collection access via attribute / []."""
+
     def __init__(self, db):
-        self._db = db
+        self._db   = db
         self._cols: dict = {}
 
     def __getitem__(self, name):
@@ -92,12 +148,17 @@ class _AsyncDB:
         return self._cols[name]
 
     def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
         return self[name]
 
+    async def command(self, *args, **kwargs):
+        """Stub for db.admin.command('ping') used in connect_to_mongo."""
+        return {"ok": 1}
 
 
 # ── shared mongomock instance (reset between test sessions) ─────────────────
-_mock_client = MockMongoClient()
+_mock_client   = MockMongoClient()
 _mock_async_db = _AsyncDB(_mock_client["entropy_prime"])
 
 
@@ -120,10 +181,11 @@ async def app_client() -> AsyncGenerator[AsyncClient, None]:
     # Wire the shim DB directly into the singleton
     app_module.db_handler.db = _mock_async_db
 
-    # Build the orchestrator (the lifespan would normally do this)
+    # Build the orchestrator — must include gov_ppo_agent (added in v3.2.0)
     app_module.orchestrator = PipelineOrchestrator(
         dqn_agent      = app_module.dqn_agent,
         mab_agent      = app_module.mab_agent,
+        gov_ppo_agent  = app_module.gov_ppo_agent,   # ← was missing in v2.0
         ppo_agent      = app_module.ppo_agent,
         shadow_secret  = app_module.SHADOW_SECRET,
         session_secret = app_module.SESSION_SECRET,
@@ -137,7 +199,9 @@ async def app_client() -> AsyncGenerator[AsyncClient, None]:
 @pytest_asyncio.fixture(autouse=True)
 async def clear_db():
     """Drop all collections before each test for isolation."""
-    for col in ("users", "sessions", "biometrics", "honeypot"):
+    for col in ("users", "sessions", "biometric_profiles", "honeypot",
+                "drift_events", "feature_selections", "threat_intelligence",
+                "threat_broadcasts"):
         _mock_client["entropy_prime"][col].drop()
     yield
 
@@ -146,15 +210,24 @@ async def clear_db():
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-HUMAN_SCORE_PAYLOAD  = {"theta": 0.85, "h_exp": 0.70, "server_load": 0.30,
-                         "user_agent": "Mozilla/5.0", "latent_vector": [0.5] * 32}
-BOT_SCORE_PAYLOAD    = {"theta": 0.03, "h_exp": 0.95, "server_load": 0.20,
-                         "user_agent": "python-requests/2.28", "latent_vector": [0.01] * 32}
+HUMAN_SCORE_PAYLOAD   = {"theta": 0.85, "h_exp": 0.70, "server_load": 0.30,
+                          "user_agent": "Mozilla/5.0", "latent_vector": [0.5] * 32}
+BOT_SCORE_PAYLOAD     = {"theta": 0.03, "h_exp": 0.95, "server_load": 0.20,
+                          "user_agent": "python-requests/2.28", "latent_vector": [0.01] * 32}
 SUSPECT_SCORE_PAYLOAD = {"theta": 0.18, "h_exp": 0.60, "server_load": 0.45,
                           "user_agent": "Mozilla/5.0", "latent_vector": [0.2] * 32}
 
 TEST_EMAIL    = "integration@example.com"
 TEST_PASSWORD = "S3cur3P@ssw0rd!"
+
+# All 16 fields the biometric_profiles document must contain
+REQUIRED_PROFILE_FIELDS = {
+    "sample_count", "last_drift", "adaptive_threshold",
+    "selected_features", "feature_means",
+    "avg_theta", "avg_h_exp", "avg_dwell", "avg_flight",
+    "avg_speed", "avg_jitter", "avg_accel", "avg_rhythm",
+    "samples", "created_at", "updated_at",
+}
 
 
 async def _register(client: AsyncClient, email=TEST_EMAIL, pw=TEST_PASSWORD) -> dict:
@@ -167,6 +240,45 @@ async def _login(client: AsyncClient, email=TEST_EMAIL, pw=TEST_PASSWORD) -> dic
     r = await client.post("/auth/login", json={"email": email, "plain_password": pw})
     assert r.status_code == 200, f"Login failed: {r.text}"
     return r.json()
+
+
+async def _sync_profile(
+    client: AsyncClient,
+    token: str,
+    *,
+    theta: float = 0.75,
+    h_exp: float = 0.60,
+    sample_count: int = 10,
+) -> dict:
+    """Helper: POST /biometric/profile with a realistic payload."""
+    payload = {
+        "theta":  theta,
+        "h_exp":  h_exp,
+        "keyboard_stats": {
+            "avgDwell":  80.0,
+            "avgFlight": 120.0,
+            "rhythm":    0.85,
+            "avgPause":  200.0,
+        },
+        "pointer_stats": {
+            "avgSpeed":  350.0,
+            "avgJitter": 12.0,
+            "avgAccel":  5.0,
+        },
+        "profile_stats": {
+            "sampleCount":       sample_count,
+            "lastDrift":         0.05,
+            "adaptiveThreshold": 1.8,
+            "selectedFeatures":  ["dwell_norm", "flight_norm", "speed_norm"],
+            "featureMeans":      [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        },
+    }
+    r = await client.post(
+        "/biometric/profile",
+        json=payload,
+        headers={"X-Session-Token": token},
+    )
+    return r
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,9 +307,7 @@ class TestServerHealth:
             headers={"Origin": "http://localhost:3000",
                      "Access-Control-Request-Method": "GET"},
         )
-        # FastAPI CORS middleware responds to OPTIONS preflight
         assert r.status_code in (200, 204)
-        # The app must echo back an allow-origin header
         assert "access-control-allow-origin" in r.headers
 
     async def test_models_status_endpoint(self, app_client: AsyncClient):
@@ -243,7 +353,6 @@ class TestScoringScenarios:
         assert body["shadow_mode"] is True
 
     async def test_bot_score_returns_200_always(self, app_client: AsyncClient):
-        """Bots always receive HTTP 200 (shadow token, not rejection)."""
         r = await app_client.post("/score", json=BOT_SCORE_PAYLOAD)
         assert r.status_code == 200
 
@@ -254,7 +363,6 @@ class TestScoringScenarios:
 
     async def test_bot_score_mab_arm_in_response(self, app_client: AsyncClient):
         body = (await app_client.post("/score", json=BOT_SCORE_PAYLOAD)).json()
-        # mab_arm is only present when shadow_mode=True and arm >= 0
         if body["shadow_mode"]:
             assert "mab_arm" in body
             assert 0 <= body["mab_arm"] < 3
@@ -284,7 +392,7 @@ class TestScoringScenarios:
         assert r.status_code == 422
 
     async def test_score_invalid_latent_vector_rejected(self, app_client: AsyncClient):
-        bad = {**HUMAN_SCORE_PAYLOAD, "latent_vector": [0.1] * 10}  # not 32-dim
+        bad = {**HUMAN_SCORE_PAYLOAD, "latent_vector": [0.1] * 10}
         r   = await app_client.post("/score", json=bad)
         assert r.status_code == 422
 
@@ -295,7 +403,6 @@ class TestScoringScenarios:
 
     async def test_watchdog_block_in_response_when_latent_present(self, app_client: AsyncClient):
         body = (await app_client.post("/score", json=HUMAN_SCORE_PAYLOAD)).json()
-        # latent_vector is present so watchdog should run
         assert "watchdog" in body
         assert body["watchdog"]["action"] in ("ok", "passive_reauth",
                                                "disable_sensitive_api", "force_logout")
@@ -312,7 +419,7 @@ class TestAuthentication:
         assert r.status_code == 201
 
     async def test_register_response_fields(self, app_client: AsyncClient):
-        body = (await _register(app_client))
+        body = await _register(app_client)
         for field in ("success", "user_id", "email", "session_token", "security_level"):
             assert field in body
 
@@ -341,20 +448,19 @@ class TestAuthentication:
 
     async def test_login_returns_session_token(self, app_client: AsyncClient):
         await _register(app_client)
-        body = (await _login(app_client))
+        body = await _login(app_client)
         assert isinstance(body["session_token"], str)
         assert len(body["session_token"]) > 10
 
     async def test_logout_success(self, app_client: AsyncClient):
         await _register(app_client)
-        login_body   = await _login(app_client)
+        login_body    = await _login(app_client)
         session_token = login_body["session_token"]
         r = await app_client.post("/auth/logout", json={"session_token": session_token})
         assert r.status_code == 200
         assert r.json()["success"] is True
 
     async def test_logout_invalidates_session(self, app_client: AsyncClient):
-        """After logout, /me with the same token must return 401."""
         await _register(app_client)
         login_body    = await _login(app_client)
         session_token = login_body["session_token"]
@@ -363,7 +469,7 @@ class TestAuthentication:
         assert r.status_code == 401
 
     async def test_me_with_valid_token(self, app_client: AsyncClient):
-        reg  = await _register(app_client)
+        reg   = await _register(app_client)
         token = reg["session_token"]
         r = await app_client.get("/me", headers={"X-Session-Token": token})
         assert r.status_code == 200
@@ -380,19 +486,18 @@ class TestAuthentication:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Full Session Flow  (Register → Login → Heartbeat → Logout)
+# 4. Full Session Flow
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestSessionFlow:
     async def test_register_then_login_gives_different_tokens(self, app_client: AsyncClient):
         reg   = await _register(app_client)
         login = await _login(app_client)
-        # Login always issues a fresh token
         assert reg["session_token"] != login["session_token"]
 
     async def test_heartbeat_with_healthy_session(self, app_client: AsyncClient):
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {
             "session_token": login["session_token"],
             "user_id":       login["user_id"],
@@ -404,7 +509,7 @@ class TestSessionFlow:
 
     async def test_heartbeat_returns_action(self, app_client: AsyncClient):
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {"session_token": login["session_token"], "user_id": login["user_id"],
                    "latent_vector": [0.5] * 32, "e_rec": 0.05}
         body = (await app_client.post("/session/verify", json=payload)).json()
@@ -414,18 +519,17 @@ class TestSessionFlow:
 
     async def test_heartbeat_decays_trust_score(self, app_client: AsyncClient):
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {"session_token": login["session_token"], "user_id": login["user_id"],
                    "latent_vector": [0.5] * 32, "e_rec": 0.05}
         body = (await app_client.post("/session/verify", json=payload)).json()
-        # Trust score should be < 1.0 after decay
         assert body["trust_score"] < 1.0
 
     async def test_heartbeat_with_critical_e_rec_force_logout(self, app_client: AsyncClient):
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {"session_token": login["session_token"], "user_id": login["user_id"],
-                   "latent_vector": [0.5] * 32, "e_rec": 0.90}  # way above critical 0.35
+                   "latent_vector": [0.5] * 32, "e_rec": 0.90}
         body = (await app_client.post("/session/verify", json=payload)).json()
         assert body["action"] == "force_logout"
         assert body["session_invalidated"] is True
@@ -433,12 +537,10 @@ class TestSessionFlow:
     async def test_heartbeat_after_force_logout_returns_401(self, app_client: AsyncClient):
         await _register(app_client)
         login = await _login(app_client)
-        # Trigger force logout
         await app_client.post("/session/verify", json={
             "session_token": login["session_token"], "user_id": login["user_id"],
             "latent_vector": [0.5] * 32, "e_rec": 0.90,
         })
-        # Subsequent heartbeat with same token must fail
         r = await app_client.post("/session/verify", json={
             "session_token": login["session_token"], "user_id": login["user_id"],
             "latent_vector": [0.5] * 32, "e_rec": 0.05,
@@ -447,16 +549,16 @@ class TestSessionFlow:
 
     async def test_heartbeat_user_id_mismatch_401(self, app_client: AsyncClient):
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {"session_token": login["session_token"],
-                   "user_id": "000000000000000000000000",  # wrong user
+                   "user_id":       "000000000000000000000000",
                    "latent_vector": [0.5] * 32, "e_rec": 0.05}
         r = await app_client.post("/session/verify", json=payload)
         assert r.status_code == 401
 
     async def test_heartbeat_bogus_token_401(self, app_client: AsyncClient):
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {"session_token": "not_a_real_token", "user_id": login["user_id"],
                    "latent_vector": [0.5] * 32, "e_rec": 0.05}
         r = await app_client.post("/session/verify", json=payload)
@@ -464,39 +566,32 @@ class TestSessionFlow:
 
     async def test_heartbeat_invalid_latent_dim_422(self, app_client: AsyncClient):
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {"session_token": login["session_token"], "user_id": login["user_id"],
-                   "latent_vector": [0.1] * 10, "e_rec": 0.05}  # wrong dim
+                   "latent_vector": [0.1] * 10, "e_rec": 0.05}
         r = await app_client.post("/session/verify", json=payload)
         assert r.status_code == 422
 
     async def test_full_session_chain(self, app_client: AsyncClient):
-        """Register → Login → Heartbeat (healthy) → Logout → /me 401"""
-        # 1. Register
         reg = await _register(app_client)
         assert reg["success"] is True
 
-        # 2. Login
-        login = await _login(app_client)
+        login   = await _login(app_client)
         token   = login["session_token"]
         user_id = login["user_id"]
 
-        # 3. Heartbeat
         hb_r = await app_client.post("/session/verify", json={
             "session_token": token, "user_id": user_id,
             "latent_vector": [0.5] * 32, "e_rec": 0.05,
         })
         assert hb_r.status_code == 200
 
-        # 4. /me still works
         me_r = await app_client.get("/me", headers={"X-Session-Token": token})
         assert me_r.status_code == 200
 
-        # 5. Logout
         lo_r = await app_client.post("/auth/logout", json={"session_token": token})
         assert lo_r.status_code == 200
 
-        # 6. /me now 401
         me_r2 = await app_client.get("/me", headers={"X-Session-Token": token})
         assert me_r2.status_code == 401
 
@@ -571,8 +666,7 @@ class TestBiometricExtract:
 
     async def test_biometric_profile_wrong_user_403(self, app_client: AsyncClient):
         reg  = await _register(app_client, "alice@test.com")
-        reg2 = await _register(app_client, "bob@test.com",   "P@ssw0rd2")
-        # alice tries to read bob's profile
+        reg2 = await _register(app_client, "bob@test.com", "P@ssw0rd2")
         r = await app_client.get(
             f"/biometric/profile/{reg2['user_id']}",
             headers={"X-Session-Token": reg["session_token"]},
@@ -581,7 +675,183 @@ class TestBiometricExtract:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Password Utilities
+# 7. Biometric Profile Persistence  (new in v2.1.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBiometricProfile:
+    """
+    End-to-end tests for POST /biometric/profile.
+
+    Each test verifies a specific aspect of the persistence contract:
+      • Route requires authentication
+      • Successful sync returns HTTP 200 with success=True
+      • The returned profile contains all 16 required fields
+      • The MongoDB document also contains all 16 required fields
+      • user_id is always taken from the session (cannot be spoofed)
+      • Repeated syncs accumulate the sample ring-buffer
+      • EMA averages stay in a plausible range after several syncs
+    """
+
+    async def test_sync_requires_auth(self, app_client: AsyncClient):
+        r = await app_client.post("/biometric/profile", json={"theta": 0.5, "h_exp": 0.5})
+        assert r.status_code == 401
+
+    async def test_sync_returns_200(self, app_client: AsyncClient):
+        reg = await _register(app_client)
+        r   = await _sync_profile(app_client, reg["session_token"])
+        assert r.status_code == 200
+
+    async def test_sync_response_success_flag(self, app_client: AsyncClient):
+        reg  = await _register(app_client)
+        body = (await _sync_profile(app_client, reg["session_token"])).json()
+        assert body["success"] is True
+
+    async def test_sync_response_user_id_matches_session(self, app_client: AsyncClient):
+        reg  = await _register(app_client)
+        body = (await _sync_profile(app_client, reg["session_token"])).json()
+        assert body["user_id"] == reg["user_id"]
+
+    async def test_sync_response_profile_present(self, app_client: AsyncClient):
+        reg  = await _register(app_client)
+        body = (await _sync_profile(app_client, reg["session_token"])).json()
+        assert "profile" in body
+        assert body["profile"] is not None
+
+    async def test_sync_response_contains_all_required_fields(self, app_client: AsyncClient):
+        """The profile dict in the API response must contain all 16 required fields."""
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"])).json()["profile"]
+        missing = REQUIRED_PROFILE_FIELDS - set(profile.keys())
+        assert not missing, f"Profile response missing fields: {missing}"
+
+    async def test_mongo_document_contains_all_required_fields(self, app_client: AsyncClient):
+        """The raw MongoDB document must also contain all 16 required fields."""
+        reg = await _register(app_client)
+        await _sync_profile(app_client, reg["session_token"])
+
+        col = _mock_client["entropy_prime"]["biometric_profiles"]
+        doc = col.find_one({"user_id": reg["user_id"]})
+        assert doc is not None, "No biometric_profiles document found in MongoDB"
+
+        missing = REQUIRED_PROFILE_FIELDS - set(doc.keys())
+        assert not missing, f"MongoDB document missing fields: {missing}"
+
+    async def test_sync_avg_theta_in_range(self, app_client: AsyncClient):
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"], theta=0.80)).json()["profile"]
+        assert 0.0 <= profile["avg_theta"] <= 1.0
+
+    async def test_sync_avg_channels_are_numeric(self, app_client: AsyncClient):
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"])).json()["profile"]
+        for field in ("avg_theta", "avg_h_exp", "avg_dwell", "avg_flight",
+                      "avg_speed", "avg_jitter", "avg_accel", "avg_rhythm"):
+            assert isinstance(profile[field], (int, float)), f"{field} is not numeric"
+
+    async def test_sync_samples_list_present(self, app_client: AsyncClient):
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"])).json()["profile"]
+        assert isinstance(profile["samples"], list)
+
+    async def test_sync_samples_accumulate(self, app_client: AsyncClient):
+        """Three consecutive syncs should produce three entries in the ring-buffer."""
+        reg   = await _register(app_client)
+        token = reg["session_token"]
+        for _ in range(3):
+            await _sync_profile(app_client, token)
+
+        col = _mock_client["entropy_prime"]["biometric_profiles"]
+        doc = col.find_one({"user_id": reg["user_id"]})
+        assert doc is not None
+        assert len(doc.get("samples", [])) == 3
+
+    async def test_sync_ema_converges_toward_input(self, app_client: AsyncClient):
+        """
+        After 20 syncs with the same theta, avg_theta should move noticeably
+        toward that value from the initial 0.5 default.
+        """
+        reg   = await _register(app_client)
+        token = reg["session_token"]
+        target_theta = 0.9
+        for _ in range(20):
+            await _sync_profile(app_client, token, theta=target_theta)
+
+        col     = _mock_client["entropy_prime"]["biometric_profiles"]
+        doc     = col.find_one({"user_id": reg["user_id"]})
+        avg_theta = doc.get("avg_theta", 0.5)
+        # Should be clearly above the 0.5 starting point
+        assert avg_theta > 0.6, f"EMA did not converge: avg_theta={avg_theta}"
+
+    async def test_sync_timestamps_present(self, app_client: AsyncClient):
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"])).json()["profile"]
+        assert profile.get("created_at") is not None
+        assert profile.get("updated_at") is not None
+
+    async def test_sync_selected_features_stored(self, app_client: AsyncClient):
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"])).json()["profile"]
+        assert isinstance(profile["selected_features"], list)
+        assert "dwell_norm" in profile["selected_features"]
+
+    async def test_sync_feature_means_stored(self, app_client: AsyncClient):
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"])).json()["profile"]
+        assert isinstance(profile["feature_means"], list)
+        assert len(profile["feature_means"]) == 8
+
+    async def test_sync_adaptive_threshold_stored(self, app_client: AsyncClient):
+        reg     = await _register(app_client)
+        profile = (await _sync_profile(app_client, reg["session_token"])).json()["profile"]
+        assert isinstance(profile["adaptive_threshold"], (int, float))
+
+    async def test_get_profile_after_sync_returns_full_doc(self, app_client: AsyncClient):
+        """GET /biometric/profile/{id} should also return all required fields."""
+        reg   = await _register(app_client)
+        token = reg["session_token"]
+        uid   = reg["user_id"]
+
+        await _sync_profile(app_client, token)
+
+        r = await app_client.get(f"/biometric/profile/{uid}",
+                                  headers={"X-Session-Token": token})
+        assert r.status_code == 200
+        profile = r.json()["profile"]
+        missing = REQUIRED_PROFILE_FIELDS - set(profile.keys())
+        assert not missing, f"GET profile missing fields: {missing}"
+
+    async def test_sync_user_id_from_session_not_body(self, app_client: AsyncClient):
+        """
+        Even if a different user_id were somehow injected into the request,
+        the route must use the session's user_id.  We verify by checking
+        the stored document's user_id matches the registered user, not any
+        client-supplied value.
+        """
+        reg     = await _register(app_client)
+        token   = reg["session_token"]
+        # Attempt to submit with an extra user_id field (ignored by Pydantic model)
+        payload = {
+            "theta":  0.75,
+            "h_exp":  0.6,
+            "keyboard_stats": {"avgDwell": 80.0, "avgFlight": 120.0,
+                               "rhythm": 0.85, "avgPause": 200.0},
+            "pointer_stats":  {"avgSpeed": 350.0, "avgJitter": 12.0, "avgAccel": 5.0},
+            "profile_stats":  {"sampleCount": 5, "featureMeans": [0.5] * 8,
+                               "selectedFeatures": []},
+            "user_id":        "000000000000000000000000",  # should be ignored
+        }
+        r    = await app_client.post("/biometric/profile", json=payload,
+                                      headers={"X-Session-Token": token})
+        body = r.json()
+        assert body["user_id"] == reg["user_id"]
+
+        col = _mock_client["entropy_prime"]["biometric_profiles"]
+        doc = col.find_one({"user_id": reg["user_id"]})
+        assert doc is not None, "Document stored under injected user_id instead of session user_id"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Password Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestPasswordUtils:
@@ -613,7 +883,7 @@ class TestPasswordUtils:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Pipeline Debug & Admin
+# 9. Pipeline Debug & Admin
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAdminPipelineDebug:
@@ -622,10 +892,8 @@ class TestAdminPipelineDebug:
         assert r.status_code == 200
         body = r.json()
         assert "stages" in body
-        assert "biometric" in body["stages"]
-        assert "honeypot"  in body["stages"]
-        assert "governor"  in body["stages"]
-        assert "watchdog"  in body["stages"]
+        for stage in ("biometric", "honeypot", "governor", "watchdog"):
+            assert stage in body["stages"]
 
     async def test_debug_bot_theta(self, app_client: AsyncClient):
         r = await app_client.get("/admin/pipeline-debug?theta=0.02&h_exp=0.9&server_load=0.2")
@@ -642,16 +910,11 @@ class TestAdminPipelineDebug:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. Fallback / Degraded Mode Resilience
+# 10. Fallback / Degraded Mode Resilience
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestDegradedModeFallback:
     async def test_score_still_returns_200_when_stage1_raises(self, app_client: AsyncClient):
-        """
-        If Stage 1 (biometric interpreter) crashes, the orchestrator must
-        catch the exception and return a degraded=True response with HTTP 200.
-        Bots should never receive an error page — that breaks the deception.
-        """
         import main as app_module
         import models.stage1_biometric as s1_mod
 
@@ -667,7 +930,6 @@ class TestDegradedModeFallback:
             s1_mod.run = original_run
 
     async def test_score_degraded_when_governor_raises(self, app_client: AsyncClient):
-        """Stage 3 (governor/DQN) failure → degraded=True, STANDARD preset fallback."""
         import models.stage3_governor as s3_mod
 
         original_run = s3_mod.run
@@ -681,7 +943,6 @@ class TestDegradedModeFallback:
             s3_mod.run = original_run
 
     async def test_score_degraded_when_honeypot_raises(self, app_client: AsyncClient):
-        """Stage 2 (honeypot/MAB) failure → degraded result but no crash."""
         import models.stage2_honeypot as s2_mod
 
         original_run = s2_mod.run
@@ -699,11 +960,6 @@ class TestDegradedModeFallback:
         assert body["degraded"] is False
 
     async def test_watchdog_none_agent_falls_back_to_rule_based(self, app_client: AsyncClient):
-        """
-        Even with a broken PPO agent, the stage-4 rule-based fallback must
-        still return a valid WatchdogResult.  We validate this through /score
-        with a latent vector so the watchdog runs.
-        """
         import main as app_module
         original_ppo = app_module.orchestrator.ppo
         app_module.orchestrator.ppo = None
@@ -718,7 +974,7 @@ class TestDegradedModeFallback:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. Session Guard (require_active_session dependency)
+# 11. Session Guard
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestSessionGuard:
@@ -728,7 +984,6 @@ class TestSessionGuard:
         assert "X-Session-Token" in r.json().get("detail", "")
 
     async def test_guard_rejects_expired_session(self, app_client: AsyncClient):
-        """Manually insert an expired session and verify the guard rejects it."""
         col = _mock_client["entropy_prime"]["sessions"]
         col.insert_one({
             "user_id":       "expired_user",
@@ -736,13 +991,12 @@ class TestSessionGuard:
             "is_active":     True,
             "trust_score":   1.0,
             "created_at":    time.time() - 7200,
-            "expires_at":    time.time() - 3600,  # expired 1 hour ago
+            "expires_at":    time.time() - 3600,
         })
         r = await app_client.get("/me", headers={"X-Session-Token": "expired_tok_999"})
         assert r.status_code == 401
 
     async def test_guard_rejects_inactive_session(self, app_client: AsyncClient):
-        """Manually insert an is_active=False session."""
         col = _mock_client["entropy_prime"]["sessions"]
         col.insert_one({
             "user_id":       "ghost_user",
@@ -762,7 +1016,7 @@ class TestSessionGuard:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11. Edge-cases & Boundary values
+# 12. Edge-cases & Boundary values
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestEdgeCases:
@@ -779,7 +1033,6 @@ class TestEdgeCases:
     async def test_score_server_overload_caps_preset(self, app_client: AsyncClient):
         payload = {**HUMAN_SCORE_PAYLOAD, "server_load": 0.92}
         body    = (await app_client.post("/score", json=payload)).json()
-        # With server overload the governor caps to STANDARD or ECONOMY
         assert body["action_label"] in ("economy", "standard")
 
     async def test_multiple_bot_requests_accumulate_honeypot(self, app_client: AsyncClient):
@@ -789,26 +1042,20 @@ class TestEdgeCases:
         assert r.json()["count"] == 5
 
     async def test_register_creates_session_immediately(self, app_client: AsyncClient):
-        """Fresh registration must return a usable session token (no separate login)."""
         reg = await _register(app_client)
         r   = await app_client.get("/me", headers={"X-Session-Token": reg["session_token"]})
         assert r.status_code == 200
 
     async def test_trust_score_not_accepted_from_client(self, app_client: AsyncClient):
-        """
-        /session/verify intentionally does NOT accept trust_score from the
-        client body.  Verify the endpoint ignores extra fields gracefully.
-        """
         await _register(app_client)
-        login = await _login(app_client)
+        login   = await _login(app_client)
         payload = {
             "session_token": login["session_token"],
             "user_id":       login["user_id"],
             "latent_vector": [0.5] * 32,
             "e_rec":         0.05,
-            "trust_score":   999.0,  # should be silently ignored
+            "trust_score":   999.0,
         }
         r = await app_client.post("/session/verify", json=payload)
-        # Should still succeed; the injected trust_score is ignored
         assert r.status_code == 200
-        assert r.json()["trust_score"] < 2.0  # DB value was used, not 999.0
+        assert r.json()["trust_score"] < 2.0

@@ -1,49 +1,48 @@
 """
 backend/database.py  —  Unified Data-Access Layer (MongoDB / Motor)
 
-v4.0.0 — full merge of threat intelligence into the existing Motor stack.
+v5.0.0 — Multi-tenant profile-build onboarding state machine.
 
-Changes from v3.1.0
+Changes from v4.0.0
 ───────────────────
-• Added ThreatRecord dataclass and all threat-intelligence operations
-  (upsert_threat, get_active_threats, get_active_threats_by_ip,
-   expire_threats_before, broadcast_global_threat) — all backed by the
-  existing MongoDB connection rather than a separate SQL engine.
-• Added a `threat_broadcasts` collection for at-least-once delivery logging.
-• _create_indexes now covers both new collections.
-• No existing behaviour changed; all v3.1.0 public functions are intact
-  and signature-compatible.
+• BiometricProfile now carries an `onboarding_state` field
+  (collecting | syncing | stable | drifted) so every consumer can
+  query it without re-deriving it from raw sample counts.
+• upsert_biometric_profile accepts `onboarding_state` and writes it
+  atomically alongside the other summary stats.
+• New helper: get_onboarding_state(db, user_id) — lightweight single-
+  field read used by the heartbeat and trust-gate paths.
+• New helper: set_onboarding_state(db, user_id, state) — used by the
+  drift-detection path to transition stable→drifted without rewriting
+  the whole profile document.
+• profile_build_summary aggregate query groups per-tenant stats so the
+  admin dashboard can see how many users are in each onboarding stage.
+• All pre-existing behaviour is preserved; every public function is
+  signature-compatible with v4.0.0.
+• The `threat_intelligence` / `threat_broadcasts` collections from
+  v4.0.0 are unchanged.
 
-MongoDB collections introduced
-───────────────────────────────
-  threat_intelligence  — one document per (fingerprint_hash, tenant_id, action)
-                         triple; weight is accumulated via $inc on upsert.
+Onboarding state machine
+────────────────────────
+  collecting  — fewer than STABLE_SAMPLE_THRESHOLD samples recorded;
+                drift detection is suppressed to avoid false positives
+                on a cold profile.
+  syncing     — sample count crossed the threshold during the current
+                sync cycle; the aggregated EMA has not yet been persisted
+                back.  The backend sets this transiently; the client
+                transitions it to `stable` on the next successful sync.
+  stable      — profile has enough samples and EMA variance is low enough
+                for drift detection to be meaningful.
+  drifted     — the watchdog detected a significant behavioural departure
+                from the EMA baseline while the profile was `stable`.
+                Re-authentication or explicit reset moves it back to
+                `collecting`.
 
-    {
-      fingerprint_hash : str,          # SHA-256 hex of raw fingerprint
-      ip_address       : str | None,
-      tenant_id        : str,
-      action           : str,          # WatchdogAction.value
-      weight           : float,        # accumulated via $inc
-      e_rec            : float,
-      trust_score      : float,
-      reason           : str | None,
-      ts               : float,        # Unix epoch of most-recent observation
-      expired_at       : float | None  # None = active; set by TTL sweep
-    }
-
-  threat_broadcasts  — append-only delivery log for global notifications.
-
-    {
-      fingerprint_hash : str,
-      ip_address       : str | None,
-      cumulative_score : float,
-      tenant_count     : int,
-      action           : str,
-      payload          : dict,         # full broadcast payload
-      sent_at          : float,
-      delivered        : bool
-    }
+MongoDB collections modified
+────────────────────────────
+  biometric_profiles  — `onboarding_state` (str) field added.
+                        `tenant_id` and `site_id` are now indexed for
+                        per-tenant admin queries.
 """
 from __future__ import annotations
 
@@ -61,6 +60,17 @@ from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 logger = logging.getLogger("entropy_prime.database")
+
+# ── Onboarding-state constants ─────────────────────────────────────────────────
+ONBOARDING_COLLECTING = "collecting"
+ONBOARDING_SYNCING    = "syncing"
+ONBOARDING_STABLE     = "stable"
+ONBOARDING_DRIFTED    = "drifted"
+
+# Minimum aggregated samples before drift detection is armed.
+# Kept here (not in the model layer) so every consumer uses one source
+# of truth; callers that need it can import it directly.
+STABLE_SAMPLE_THRESHOLD = 50
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,7 +119,7 @@ class Database:
 
     All threat-intelligence operations are instance methods on this class.
     All pre-existing operations remain free functions that accept an
-    AsyncIOMotorDatabase handle (unchanged from v3.1.0).
+    AsyncIOMotorDatabase handle (unchanged from v4.0.0).
     """
 
     def __init__(self) -> None:
@@ -182,12 +192,17 @@ class Database:
             await self.db.users.create_index("tenant_id")
             await self.db.sessions.create_index("tenant_id")
             await self.db.sessions.create_index("site_id")
+
+            # ── biometric_profiles ────────────────────────────────────────────
             await self.db.biometric_profiles.create_index("tenant_id")
             await self.db.biometric_profiles.create_index("site_id")
+            # Fast per-tenant state-machine queries
+            await self.db.biometric_profiles.create_index(
+                [("tenant_id", ASCENDING), ("onboarding_state", ASCENDING)],
+                name="idx_bp_tenant_state",
+            )
 
             # ── threat_intelligence ───────────────────────────────────────────
-            # Compound unique key: one document per (fp, tenant, action) triple.
-            # This makes $inc weight accumulation safe under concurrent upserts.
             await self.db.threat_intelligence.create_index(
                 [
                     ("fingerprint_hash", ASCENDING),
@@ -197,17 +212,14 @@ class Database:
                 unique=True,
                 name="idx_ti_fp_tenant_action",
             )
-            # Fast read path for is_globally_flagged() lookups
             await self.db.threat_intelligence.create_index(
                 [("fingerprint_hash", ASCENDING), ("expired_at", ASCENDING)],
                 name="idx_ti_fp_hash",
             )
-            # Fast read path for IP-level lookups
             await self.db.threat_intelligence.create_index(
                 [("ip_address", ASCENDING), ("expired_at", ASCENDING)],
                 name="idx_ti_ip",
             )
-            # TTL sweep efficiency
             await self.db.threat_intelligence.create_index(
                 [("ts", ASCENDING)],
                 name="idx_ti_ts",
@@ -218,7 +230,6 @@ class Database:
                 [("fingerprint_hash", ASCENDING)],
                 name="idx_tb_fp",
             )
-            # Retry sweeper queries {delivered: false} ordered by sent_at
             await self.db.threat_broadcasts.create_index(
                 [("delivered", ASCENDING), ("sent_at", ASCENDING)],
                 name="idx_tb_delivered",
@@ -233,20 +244,8 @@ class Database:
 
     async def upsert_threat(self, record: ThreatRecord) -> None:
         """
-        Insert a new threat observation or *accumulate* weight if a document
+        Insert a new threat observation or accumulate weight if a document
         already exists for the same (fingerprint_hash, tenant_id, action) triple.
-
-        Using $inc for weight means concurrent upserts from multiple app
-        instances are safe with no application-level locking.
-
-        `expired_at` is explicitly reset to None so a previously TTL-expired
-        record becomes active again on a fresh observation — identical
-        semantics to the SQL `ON CONFLICT ... expired_at = NULL` behaviour.
-
-        IP address follows a "first wins, update on new value" strategy:
-        $setOnInsert keeps the original IP; the conditional $set in the
-        update path replaces it only when a non-None IP is provided, mirroring
-        SQL's COALESCE(EXCLUDED.ip_address, existing.ip_address).
         """
         filter_doc = {
             "fingerprint_hash": record.fingerprint_hash,
@@ -261,14 +260,12 @@ class Database:
             "expired_at":  None,
         }
         if record.ip_address:
-            # Overwrite IP only when a fresh value is supplied
             set_fields["ip_address"] = record.ip_address
 
         update_doc = {
             "$inc": {"weight": record.weight},
             "$set": set_fields,
             "$setOnInsert": {
-                # Written exactly once, on document creation
                 "fingerprint_hash": record.fingerprint_hash,
                 "tenant_id":        record.tenant_id,
                 "action":           record.action,
@@ -290,10 +287,6 @@ class Database:
     async def get_active_threats(
         self, fingerprint_hash: str, since: float
     ) -> list[ThreatRecord]:
-        """
-        Return all non-expired threat documents for a fingerprint hash whose
-        most-recent observation timestamp is >= `since` (Unix epoch float).
-        """
         cursor = self.db.threat_intelligence.find(
             {
                 "fingerprint_hash": fingerprint_hash,
@@ -306,10 +299,6 @@ class Database:
     async def get_active_threats_by_ip(
         self, ip_address: str, since: float
     ) -> list[ThreatRecord]:
-        """
-        Return all non-expired threat documents associated with an IP address
-        whose most-recent observation timestamp is >= `since`.
-        """
         cursor = self.db.threat_intelligence.find(
             {
                 "ip_address": ip_address,
@@ -322,15 +311,6 @@ class Database:
     # ── Threat intelligence — TTL sweep ───────────────────────────────────────
 
     async def expire_threats_before(self, cutoff: float) -> int:
-        """
-        Soft-delete all active threat documents older than `cutoff` epoch by
-        setting `expired_at` to the current Unix timestamp.  Documents are
-        retained for forensic audit; they are simply excluded from scoring
-        queries.
-
-        Returns the number of documents updated.  Call from a periodic
-        background task (e.g. APScheduler, Celery beat).
-        """
         result = await self.db.threat_intelligence.update_many(
             {
                 "ts":         {"$lt": cutoff},
@@ -347,14 +327,6 @@ class Database:
     # ── Threat intelligence — broadcast ───────────────────────────────────────
 
     async def broadcast_global_threat(self, payload) -> None:
-        """
-        Persist a broadcast record for at-least-once delivery, then call
-        `_deliver_broadcast` to fan-out to the configured notification channel.
-
-        Persistence happens BEFORE the network call so a crashed delivery can
-        be retried by a background sweeper that queries `{delivered: false}`.
-        The `delivered` flag is set to True only after a successful delivery.
-        """
         payload_dict = {
             "fingerprint_hash": payload.fingerprint_hash,
             "ip_address":       payload.ip_address,
@@ -376,7 +348,6 @@ class Database:
         result = await self.db.threat_broadcasts.insert_one(broadcast_doc)
         inserted_id = result.inserted_id
 
-        # Best-effort delivery; never propagates exception to caller
         try:
             await self._deliver_broadcast(payload_dict)
             await self.db.threat_broadcasts.update_one(
@@ -389,13 +360,6 @@ class Database:
             )
 
     async def _deliver_broadcast(self, payload: dict) -> None:
-        """
-        Override this method to fan-out to webhooks, SNS, Redis pub/sub,
-        WebSocket hub, etc.
-
-        The default implementation logs at WARNING level — sufficient for
-        local dev and unit tests with no external dependencies.
-        """
         logger.warning(
             "[DB.TI] GLOBAL THREAT BROADCAST (no delivery backend configured): %s",
             json.dumps(payload, default=str),
@@ -403,11 +367,10 @@ class Database:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Private helper
+# Private helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _doc_to_threat(doc: dict) -> ThreatRecord:
-    """Convert a raw MongoDB document to a ThreatRecord dataclass."""
     return ThreatRecord(
         fingerprint_hash = doc["fingerprint_hash"],
         tenant_id        = doc["tenant_id"],
@@ -422,8 +385,42 @@ def _doc_to_threat(doc: dict) -> ThreatRecord:
     )
 
 
+def _derive_onboarding_state(
+    sample_count: int,
+    current_state: str,
+    last_drift: float = 0.0,
+    adaptive_threshold: float = 1.8,
+) -> str:
+    """
+    Pure function: derive the correct onboarding state from profile facts.
+
+    Rules (ordered by priority):
+      1. If the stored state is already `drifted`, keep it — only an explicit
+         reset or a re-auth clears it.
+      2. If sample_count < STABLE_SAMPLE_THRESHOLD → `collecting`.
+      3. If sample_count >= threshold and drift is already above the adaptive
+         threshold (and we were previously stable) → `drifted`.
+      4. Otherwise → `stable`.
+
+    The `syncing` state is a transient backend flag set during an in-progress
+    upsert; callers set it directly via set_onboarding_state() and it is
+    immediately overwritten by the next completed sync.
+    """
+    if current_state == ONBOARDING_DRIFTED:
+        return ONBOARDING_DRIFTED
+    if sample_count < STABLE_SAMPLE_THRESHOLD:
+        return ONBOARDING_COLLECTING
+    if (
+        current_state == ONBOARDING_STABLE
+        and adaptive_threshold > 0
+        and last_drift > adaptive_threshold
+    ):
+        return ONBOARDING_DRIFTED
+    return ONBOARDING_STABLE
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Tenant & Site Operations  (unchanged from v3.1.0)
+# Tenant & Site Operations  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def create_tenant(
@@ -481,7 +478,7 @@ async def get_site_by_api_key(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# User Operations  (unchanged from v3.1.0)
+# User Operations  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def user_exists(
@@ -562,7 +559,7 @@ async def update_user_security_level(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Session Operations  (unchanged from v3.1.0)
+# Session Operations  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def create_session(
@@ -618,25 +615,12 @@ async def update_session_trust_score(
     session_token: str,
     trust_score: float,
 ) -> bool:
-    """
-    Persist the watchdog's post-decay trust score for a session.
-
-    Called with the *updated* trust_score from WatchdogResult — i.e. after
-    the watchdog has already applied its decay/recovery delta.  We never
-    write a client-supplied value here.
-
-    `last_verified` is stamped to the current UTC time so the admin dashboard
-    can show how stale the heartbeat is.
-
-    Returns True on a successful update, False when no matching active session
-    was found (e.g. already invalidated by a concurrent FORCE_LOGOUT).
-    """
-    trust_score = max(0.0, min(1.0, trust_score))  # clamp: DB must never store out-of-range
+    trust_score = max(0.0, min(1.0, trust_score))
 
     result = await db.sessions.update_one(
         {
             "session_token": session_token,
-            "is_active":     True,   # don't silently re-open an invalidated session
+            "is_active":     True,
         },
         {
             "$set": {
@@ -658,12 +642,6 @@ async def get_active_session_for_user(
     db: AsyncIOMotorDatabase,
     user_id: str,
 ) -> Optional[dict]:
-    """
-    Return the most-recently-created *active* session for a user.
-
-    Intended for tests and admin tooling.  The /session/verify flow uses
-    get_session (token-keyed) instead because it always has the token.
-    """
     session = await db.sessions.find_one(
         {
             "user_id":    user_id,
@@ -679,7 +657,7 @@ async def get_active_session_for_user(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-User Biometric Profile Operations  (unchanged from v3.1.0)
+# Per-User Biometric Profile Operations
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def upsert_biometric_profile(
@@ -690,13 +668,41 @@ async def upsert_biometric_profile(
     adaptive_threshold: float,
     feature_means: List[float],
     selected_features: List[str],
-    tenant_id:    Optional[str]        = None,
-    site_id:      Optional[str]        = None,
-    ema_profile:  Optional[List[float]] = None,
-    ema_variance: Optional[List[float]] = None,
+    tenant_id:         Optional[str]        = None,
+    site_id:           Optional[str]        = None,
+    ema_profile:       Optional[List[float]] = None,
+    ema_variance:      Optional[List[float]] = None,
+    onboarding_state:  Optional[str]        = None,
 ) -> str:
-    now        = datetime.utcnow()
-    set_fields = {
+    """
+    Upsert the aggregated biometric profile for a user.
+
+    `onboarding_state` is derived automatically if not provided by the caller,
+    using the current document's stored state so that the `drifted` sticky
+    rule is respected.  Callers that want to force a transition (e.g.
+    reset after re-auth) should pass the desired state explicitly.
+
+    Only aggregated statistics are stored — raw keystroke / mouse traces
+    are never persisted to MongoDB.
+    """
+    now = datetime.utcnow()
+
+    # Fetch the current state before overwriting so _derive_onboarding_state
+    # can apply the sticky-drifted rule.
+    existing = await db.biometric_profiles.find_one(
+        {"user_id": user_id}, {"onboarding_state": 1}
+    )
+    current_state = (existing or {}).get("onboarding_state", ONBOARDING_COLLECTING)
+
+    if onboarding_state is None:
+        onboarding_state = _derive_onboarding_state(
+            sample_count        = sample_count,
+            current_state       = current_state,
+            last_drift          = last_drift,
+            adaptive_threshold  = adaptive_threshold,
+        )
+
+    set_fields: dict = {
         "user_id":            user_id,
         "tenant_id":          tenant_id,
         "site_id":            site_id,
@@ -705,6 +711,7 @@ async def upsert_biometric_profile(
         "adaptive_threshold": adaptive_threshold,
         "feature_means":      feature_means,
         "selected_features":  selected_features,
+        "onboarding_state":   onboarding_state,
         "updated_at":         now,
     }
     if ema_profile  is not None:
@@ -716,6 +723,11 @@ async def upsert_biometric_profile(
         {"user_id": user_id},
         {"$set": set_fields, "$setOnInsert": {"created_at": now}},
         upsert=True,
+    )
+
+    logger.debug(
+        "[DB.BP] upsert user=%s samples=%d state=%s drift=%.3f",
+        user_id, sample_count, onboarding_state, last_drift,
     )
     return str(result.upserted_id) if result.upserted_id else user_id
 
@@ -737,12 +749,113 @@ async def get_biometric_profile_summary(
         {
             "user_id": 1, "sample_count": 1, "last_drift": 1,
             "adaptive_threshold": 1, "selected_features": 1,
-            "updated_at": 1,
+            "onboarding_state": 1, "updated_at": 1,
         },
     )
     if profile:
         profile["_id"] = str(profile["_id"])
     return profile
+
+
+async def get_onboarding_state(
+    db: AsyncIOMotorDatabase, user_id: str
+) -> str:
+    """
+    Lightweight single-field read.  Returns `collecting` for unknown users
+    so callers treat them as pre-onboarding (drift detection suppressed).
+    """
+    doc = await db.biometric_profiles.find_one(
+        {"user_id": user_id}, {"onboarding_state": 1}
+    )
+    if not doc:
+        return ONBOARDING_COLLECTING
+    return doc.get("onboarding_state", ONBOARDING_COLLECTING)
+
+
+async def set_onboarding_state(
+    db: AsyncIOMotorDatabase,
+    user_id: str,
+    state: str,
+) -> bool:
+    """
+    Atomically overwrite the onboarding state without touching other fields.
+    Used by the drift-detection path (stable → drifted) and the reset path
+    (drifted → collecting) without triggering a full profile re-computation.
+
+    Returns True when a document was matched.
+    """
+    if state not in (
+        ONBOARDING_COLLECTING,
+        ONBOARDING_SYNCING,
+        ONBOARDING_STABLE,
+        ONBOARDING_DRIFTED,
+    ):
+        raise ValueError(f"Unknown onboarding state: {state!r}")
+
+    result = await db.biometric_profiles.update_one(
+        {"user_id": user_id},
+        {"$set": {"onboarding_state": state, "updated_at": datetime.utcnow()}},
+    )
+    matched = result.matched_count > 0
+    if matched:
+        logger.info("[DB.BP] onboarding_state → %s for user=%s", state, user_id)
+    return matched
+
+
+async def reset_biometric_profile(
+    db: AsyncIOMotorDatabase,
+    user_id: str,
+    tenant_id: Optional[str] = None,
+    site_id:   Optional[str] = None,
+) -> None:
+    """
+    Reset a profile back to the `collecting` state after re-authentication.
+    Wipes sample_count, EMA vectors, and drift history so the new session
+    builds a clean baseline rather than inheriting stale variance.
+
+    The document is preserved (not deleted) for audit purposes; the old
+    EMA data is overwritten in-place.
+    """
+    now = datetime.utcnow()
+    await db.biometric_profiles.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "sample_count":       0,
+                "last_drift":         0.0,
+                "adaptive_threshold": 1.8,
+                "feature_means":      [0.5] * 8,
+                "selected_features":  [],
+                "ema_profile":        None,
+                "ema_variance":       None,
+                "onboarding_state":   ONBOARDING_COLLECTING,
+                "reset_at":           now,
+                "updated_at":         now,
+            }
+        },
+        upsert=True,
+    )
+    logger.info("[DB.BP] Profile reset → collecting for user=%s", user_id)
+
+
+async def profile_build_summary(
+    db: AsyncIOMotorDatabase,
+    tenant_id: str,
+) -> dict:
+    """
+    Per-tenant admin aggregate: how many users are in each onboarding state.
+    Safe to call on large collections — uses the idx_bp_tenant_state index.
+    """
+    pipeline = [
+        {"$match": {"tenant_id": tenant_id}},
+        {"$group": {
+            "_id":   "$onboarding_state",
+            "count": {"$sum": 1},
+            "avg_samples": {"$avg": "$sample_count"},
+        }},
+    ]
+    rows = await db.biometric_profiles.aggregate(pipeline).to_list(20)
+    return {row["_id"]: {"count": row["count"], "avg_samples": row["avg_samples"]} for row in rows}
 
 
 async def store_biometric_sample(
@@ -760,21 +873,13 @@ async def store_biometric_sample(
     bigram:    float,
     device_ip: str,
 ):
-    sample = {
-        "timestamp": datetime.utcnow(),
-        "theta":     theta,
-        "h_exp":     h_exp,
-        "dwell":     dwell,
-        "flight":    flight,
-        "speed":     speed,
-        "jitter":    jitter,
-        "accel":     accel,
-        "rhythm":    rhythm,
-        "pause":     pause,
-        "bigram":    bigram,
-        "device_ip": device_ip,
-    }
+    """
+    Maintain a rolling EMA of the 8 biometric channels.
 
+    Raw values are NOT stored in MongoDB; only the rolling EMA is updated.
+    The client-side ring buffer retains up to 500 samples for local
+    drift computation; none of that data is transmitted to the server.
+    """
     ALPHA = 0.05
 
     async def _ema(field: str, new_val: float) -> float:
@@ -797,7 +902,6 @@ async def store_biometric_sample(
     return await db.biometric_profiles.update_one(
         {"user_id": user_id},
         {
-            "$push": {"samples": {"$each": [sample], "$slice": -500}},
             "$set": {
                 "avg_theta":  avg_theta,
                 "avg_h_exp":  avg_h_exp,
@@ -810,8 +914,9 @@ async def store_biometric_sample(
                 "updated_at": datetime.utcnow(),
             },
             "$setOnInsert": {
-                "user_id":    user_id,
-                "created_at": datetime.utcnow(),
+                "user_id":          user_id,
+                "onboarding_state": ONBOARDING_COLLECTING,
+                "created_at":       datetime.utcnow(),
             },
         },
         upsert=True,
@@ -819,7 +924,7 @@ async def store_biometric_sample(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Drift Event Log  (unchanged from v3.1.0)
+# Drift Event Log  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def log_drift_event(
@@ -884,7 +989,7 @@ async def get_drift_summary(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature Selection History  (unchanged from v3.1.0)
+# Feature Selection History  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def record_feature_selection(
@@ -921,7 +1026,7 @@ async def get_feature_selection_history(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Honeypot Operations  (unchanged from v3.1.0)
+# Honeypot Operations  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def store_honeypot_entry(
@@ -962,7 +1067,7 @@ async def get_honeypot_count(db: AsyncIOMotorDatabase) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cleanup  (unchanged from v3.1.0)
+# Cleanup  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def cleanup_expired_sessions(db: AsyncIOMotorDatabase) -> int:

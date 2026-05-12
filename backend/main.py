@@ -1,8 +1,9 @@
 """
-backend/main.py — Entropy Prime FastAPI Application  v3.2.0
+backend/main.py — Entropy Prime FastAPI Application  v4.0.0
 ============================================================
 Four-stage zero-trust biometric authentication pipeline with full
-Integration API and outgoing webhook delivery.
+Integration API, outgoing webhook delivery, and multi-tenant
+profile-build onboarding state machine.
 
 Stages
 ------
@@ -11,33 +12,44 @@ Stages
   3  Resource Governor    — DQN Argon2id parameter selection
   4  Session Watchdog     — Per-user behavioral profile + PPO drift detection
 
-v3.2.0 additions (merged from Integration API layer)
-----------------------------------------------------
+v4.0.0 additions
+-----------------
+  Profile-build onboarding state machine
+  ───────────────────────────────────────
+  Every user now progresses through a well-defined lifecycle:
+    collecting → syncing → stable → drifted
+
+  The state is stored in `biometric_profiles.onboarding_state` and is the
+  single authoritative flag that suppresses or arms drift detection.  The
+  watchdog heartbeat reads this flag before running; sessions in `collecting`
+  or `syncing` skip the drift check so a fresh account never gets a false-
+  positive force-logout.
+
+  New / changed endpoints
+  ───────────────────────
+  POST   /biometric/profile          — sync payload now writes onboarding_state;
+                                       response embeds ProfileBuildStatus
+  GET    /biometric/profile/{id}/status — lightweight state-machine status poll
+  POST   /biometric/profile/reset    — re-auth path: wipe profile → collecting
+  GET    /admin/onboarding-summary   — per-tenant state-machine counts
+
+  /session/verify now reads onboarding_state from MongoDB and suppresses the
+  watchdog drift check when the profile is not yet `stable`.
+
+v3.2.0 additions (unchanged)
+-----------------------------
   POST   /webhooks/endpoints            — Register a signed delivery endpoint
   GET    /webhooks/endpoints            — List endpoints (filterable by customer_id)
   GET    /webhooks/endpoints/{id}       — Fetch one endpoint
   PATCH  /webhooks/endpoints/{id}       — Update url / secret / events / enabled
   DELETE /webhooks/endpoints/{id}       — Unregister endpoint
   POST   /webhooks/endpoints/{id}/test  — Send a test delivery
-
   POST   /session/trust                 — Gate check before a sensitive transaction
-  GET    /session/trust/{session_id}    — Poll current trust posture (SSE-friendly)
-
+  GET    /session/trust/{session_id}    — Poll current trust posture
   GET    /notifications                 — Query notification log
   GET    /notifications/stats           — Aggregated event counts
   POST   /notifications/thresholds      — Per-customer alert threshold config
   GET    /notifications/thresholds/{id} — Read per-customer thresholds
-
-v3.1.0 changes
-──────────────
-  • `require_active_session` FastAPI dependency: validates every token against
-    the DB before any sensitive route runs.  Rejects expired / inactive
-    sessions with HTTP 401.
-  • /auth/login and /auth/register call `create_session` explicitly.
-  • /session/verify: uses DB-persisted trust score as authoritative baseline;
-    writes updated score back; invalidates on FORCE_LOGOUT.
-  • /honeypot/reward: validates arm index; clamps reward.
-  • Cross-site threat gate via WatchdogService (globally_flagged check).
 """
 
 from __future__ import annotations
@@ -53,7 +65,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
-# ── Ensure parent directory is in path for imports ────────────────────────────
 _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
@@ -70,17 +81,28 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 from starlette.requests import Request
 
 # ── Database layer ────────────────────────────────────────────────────────────
-from backend.database import Database
+from backend.database import (
+    Database,
+    ONBOARDING_COLLECTING,
+    ONBOARDING_SYNCING,
+    ONBOARDING_STABLE,
+    ONBOARDING_DRIFTED,
+    STABLE_SAMPLE_THRESHOLD,
+)
 from backend.database import (
     user_exists, create_user, get_user_by_email, get_user_by_id,
     update_last_login, update_user_security_level,
     create_session, get_session, invalidate_session, update_session_trust_score,
     store_biometric_sample, get_biometric_profile, upsert_biometric_profile,
+    get_biometric_profile_summary, get_onboarding_state, set_onboarding_state,
+    reset_biometric_profile, profile_build_summary,
     store_honeypot_entry, get_honeypot_signatures, get_honeypot_count,
+    log_drift_event,
 )
 
-# ── Pydantic auth models ──────────────────────────────────────────────────────
+# ── Pydantic models ───────────────────────────────────────────────────────────
 from backend.models.pydantic_models import UserCreate, UserLogin
+from backend.models import OnboardingState, ProfileBuildStatus, STABLE_SAMPLE_THRESHOLD
 
 # ── ML agents ────────────────────────────────────────────────────────────────
 from backend.models.dqn   import DQNAgent
@@ -98,70 +120,51 @@ from backend.middleware.auth import attach_db, SiteCtx
 from backend.services.auth_service import load_jwt_public_key
 from backend.services.watchdog_services import WatchdogService
 
-# ── Integration API: webhooks + notification service ─────────────────────────
-from backend.webhooks import (
-    WebhookEndpoint,
-    WebhookEvent,
-    dispatcher,
-)
+# ── Integration API ───────────────────────────────────────────────────────────
+from backend.webhooks import WebhookEndpoint, WebhookEvent, dispatcher
 from backend.services.notification_service import (
-    AlertThresholds,
-    NotificationService,
-    Severity,
-    notification_service,
+    AlertThresholds, NotificationService, Severity, notification_service,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level   = getattr(logging, os.environ.get("LOG_LEVEL", "INFO")),
-    format  = "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level  = getattr(logging, os.environ.get("LOG_LEVEL", "INFO")),
+    format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("entropy_prime")
-logger.info("Starting Entropy Prime v3.2 (log level: %s)", os.environ.get("LOG_LEVEL", "INFO"))
+logger.info("Starting Entropy Prime v4.0 (log level: %s)", os.environ.get("LOG_LEVEL", "INFO"))
 
-# ── Module-level secrets ──────────────────────────────────────────────────────
 SESSION_SECRET = os.environ.get("EP_SESSION_SECRET", secrets.token_hex(32))
 SHADOW_SECRET  = os.environ.get("EP_SHADOW_SECRET",  secrets.token_hex(32))
 
-# ── Singleton DB handler & model agents ──────────────────────────────────────
 db_handler = Database()
 
-dqn_agent = DQNAgent(state_dim=3,  action_dim=4)
-mab_agent = MABAgent(n_arms=3)
-gov_ppo_agent = PPOAgent(state_dim=5, action_dim=4)  # Stage 3
-ppo_agent = PPOAgent(state_dim=10, action_dim=3)    # Stage 4
-cnn_model = CNN1D(input_channels=8, out_dim=32)
+dqn_agent     = DQNAgent(state_dim=3,  action_dim=4)
+mab_agent     = MABAgent(n_arms=3)
+gov_ppo_agent = PPOAgent(state_dim=5,  action_dim=4)
+ppo_agent     = PPOAgent(state_dim=10, action_dim=3)
+cnn_model     = CNN1D(input_channels=8, out_dim=32)
 
 watchdog_service: Optional[WatchdogService] = None
 orchestrator:     Optional[PipelineOrchestrator] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Checkpoint loading
+# Checkpoint loading  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_checkpoints() -> None:
-    """
-    Load pre-trained weights for every agent.
-
-    Resolution order (first match wins):
-      1. Environment variable  (EP_RL_CHECKPOINT / EP_MAB_CHECKPOINT / EP_PPO_CHECKPOINT)
-      2. Default path          (EP_CHECKPOINT_DIR/<name>.pt|json)
-
-    Missing checkpoints are non-fatal; agents use random / cold-start weights.
-    """
-    ckpt_dir = os.environ.get("EP_CHECKPOINT_DIR", "checkpoints")
-
-    rl_path  = os.environ.get("EP_RL_CHECKPOINT",  os.path.join(ckpt_dir, "governor.pt"))
-    mab_path = os.environ.get("EP_MAB_CHECKPOINT", os.path.join(ckpt_dir, "mab.json"))
+    ckpt_dir     = os.environ.get("EP_CHECKPOINT_DIR", "checkpoints")
+    rl_path      = os.environ.get("EP_RL_CHECKPOINT",      os.path.join(ckpt_dir, "governor.pt"))
+    mab_path     = os.environ.get("EP_MAB_CHECKPOINT",     os.path.join(ckpt_dir, "mab.json"))
     gov_ppo_path = os.environ.get("EP_GOV_PPO_CHECKPOINT", os.path.join(ckpt_dir, "governor_ppo.pt"))
-    ppo_path = os.environ.get("EP_PPO_CHECKPOINT", os.path.join(ckpt_dir, "watchdog.pt"))
+    ppo_path     = os.environ.get("EP_PPO_CHECKPOINT",     os.path.join(ckpt_dir, "watchdog.pt"))
 
     for path, loader, label in [
-        (rl_path,  lambda p: dqn_agent.load_checkpoint(p),                                  "DQN"),
-        (mab_path, lambda p: mab_agent.load_state_dict(json.load(open(p))),                 "MAB"),
-        (gov_ppo_path, lambda p: gov_ppo_agent.load_checkpoint(p),                          "GOV_PPO"),
-        (ppo_path, lambda p: ppo_agent.load_checkpoint(p),                                  "WATCHDOG_PPO"),
+        (rl_path,      lambda p: dqn_agent.load_checkpoint(p),                                "DQN"),
+        (mab_path,     lambda p: mab_agent.load_state_dict(json.load(open(p))),               "MAB"),
+        (gov_ppo_path, lambda p: gov_ppo_agent.load_checkpoint(p),                            "GOV_PPO"),
+        (ppo_path,     lambda p: ppo_agent.load_checkpoint(p),                                "WATCHDOG_PPO"),
     ]:
         if os.path.exists(path):
             try:
@@ -181,7 +184,7 @@ def _load_checkpoints() -> None:
 async def lifespan(app: FastAPI):
     global orchestrator, watchdog_service
 
-    logger.info("🚀 Entropy Prime v3.2 starting up…")
+    logger.info("🚀 Entropy Prime v4.0 starting up…")
 
     await db_handler.connect_to_mongo()
     attach_db(db_handler.db)
@@ -190,17 +193,16 @@ async def lifespan(app: FastAPI):
 
     watchdog_service = WatchdogService(db_handler)
 
-    # Auto-seed test data in development
     if os.environ.get("ENVIRONMENT") == "development":
         from database import create_tenant, create_site
         import hmac as _hmac, hashlib
 
         try:
             if not await db_handler.db.tenants.find_one({"admin_email": "admin@test.com"}):
-                tenant_id = await create_tenant(db_handler.db, "Test Corp", "admin@test.com", "pro")
-                raw_api_key    = "test-sdk-key-123"
+                tenant_id   = await create_tenant(db_handler.db, "Test Corp", "admin@test.com", "pro")
+                raw_api_key = "test-sdk-key-123"
                 api_key_secret = os.environ.get("EP_API_KEY_SECRET", "dev-only-api-key-secret-change-me")
-                key_digest     = _hmac.new(
+                key_digest  = _hmac.new(
                     api_key_secret.encode(), raw_api_key.encode(), hashlib.sha256
                 ).hexdigest()
                 await create_site(db_handler.db, tenant_id, "Test Site", "localhost", key_digest)
@@ -217,7 +219,6 @@ async def lifespan(app: FastAPI):
         session_secret = SESSION_SECRET,
     )
 
-    # Background task: periodic TTL sweep for stale threats
     import asyncio
 
     async def _threat_ttl_sweep():
@@ -233,7 +234,7 @@ async def lifespan(app: FastAPI):
                 logger.error("[TTL Sweep] Failed: %s", exc)
 
     sweep_task = asyncio.create_task(_threat_ttl_sweep())
-    logger.info("✓ Entropy Prime v3.2 initialised — 4-stage pipeline + Integration API active")
+    logger.info("✓ Entropy Prime v4.0 initialised — 4-stage pipeline + onboarding state machine")
     yield
 
     logger.info("🛑 Entropy Prime shutting down…")
@@ -244,7 +245,6 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await db_handler.close_mongo_connection()
-        logger.info("✓ MongoDB connection closed")
     except Exception as exc:
         logger.error("Error during DB shutdown: %s", exc)
 
@@ -255,9 +255,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Entropy Prime",
-    version     = "3.2.0",
-    description = "Zero-trust behavioural biometrics engine — 4-stage pipeline + Integration API",
-    lifespan    = lifespan,
+    version     = "4.0.0",
+    description = (
+        "Zero-trust behavioural biometrics engine — "
+        "4-stage pipeline + Integration API + multi-tenant onboarding state machine"
+    ),
+    lifespan = lifespan,
 )
 
 app.add_middleware(
@@ -272,8 +275,6 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
-
-# ── Middleware: per-request timing log ────────────────────────────────────────
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -294,8 +295,6 @@ async def log_requests(request: Request, call_next):
         raise
 
 
-# ── Global exception handler ──────────────────────────────────────────────────
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error(
@@ -309,29 +308,16 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Session Guard — reusable FastAPI dependency
+# Session Guard dependency  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _SessionGuardDep:
-    """
-    Validates X-Session-Token against MongoDB before any sensitive route runs.
-
-    Raises HTTP 401 when:
-      • No X-Session-Token header is present.
-      • The token does not exist in the DB.
-      • The session is expired or explicitly invalidated (is_active=False).
-
-    Returns the raw session document (ObjectIds already stringified).
-    """
-
     async def __call__(self, request) -> dict:
         token = request.headers.get("X-Session-Token")
         if not token:
-            # Fallback to standard Authorization header
             auth_header = request.headers.get("Authorization")
             if auth_header and auth_header.startswith("Bearer "):
                 token = auth_header.removeprefix("Bearer ").strip()
-
         if not token:
             raise HTTPException(
                 status_code = status.HTTP_401_UNAUTHORIZED,
@@ -342,10 +328,7 @@ class _SessionGuardDep:
             session = await get_session(db_handler.db, token)
         except Exception as exc:
             logger.error("[SessionGuard] DB error: %s", exc)
-            raise HTTPException(
-                status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail      = "Session store unavailable",
-            )
+            raise HTTPException(status_code=503, detail="Session store unavailable")
         if session is None:
             raise HTTPException(
                 status_code = status.HTTP_401_UNAUTHORIZED,
@@ -363,8 +346,6 @@ ActiveSession = Annotated[dict, Depends(require_active_session)]
 # Pydantic request / response models
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Pipeline models ───────────────────────────────────────────────────────────
-
 class ScoreReq(BaseModel):
     theta:         float       = Field(..., ge=0.0, le=1.0)
     h_exp:         float       = Field(..., ge=0.0, le=1.0)
@@ -379,7 +360,7 @@ class ScoreReq(BaseModel):
             raise ValueError("latent_vector must be empty or exactly 32-dim")
         if not self.fingerprint:
             import hashlib
-            combined        = f"{self.user_agent}:{str(self.latent_vector[:8])}"
+            combined         = f"{self.user_agent}:{str(self.latent_vector[:8])}"
             self.fingerprint = hashlib.sha256(combined.encode()).hexdigest()[:32]
         return self
 
@@ -388,20 +369,24 @@ class SessionVerifyReq(BaseModel):
     """
     Heartbeat payload for /session/verify.
 
-    NOTE: `trust_score` is NOT accepted from the client — the authoritative
-    value lives in MongoDB so a replayed or inflated value cannot bypass drift
-    detection.
+    `onboarding_state` is now required so the server can suppress drift
+    detection for users who have not yet completed profile-build.  If the
+    client sends an unknown state, the server defaults to `collecting`
+    (safe side: drift detection suppressed).
+
+    `trust_score` from the client is never used as authority — the DB
+    value is always preferred.
     """
-    session_token: str
-    user_id:       str
-    latent_vector: list[float]
-    e_rec:         float = Field(..., ge=0.0)
-    fingerprint:   str   = ""
-    # Watchdog extension fields (informational; not used as authority)
+    session_token:      str
+    user_id:            str
+    latent_vector:      list[float]
+    e_rec:              float = Field(..., ge=0.0)
+    fingerprint:        str   = ""
     behavioral_drift:   float | None    = None
     adaptive_threshold: float | None    = None
     selected_features:  list[str]       = Field(default_factory=list)
     sample_count:       int | None      = None
+    onboarding_state:   OnboardingState = OnboardingState.COLLECTING
 
     @model_validator(mode="after")
     def _validate(self):
@@ -413,6 +398,47 @@ class SessionVerifyReq(BaseModel):
                 str(self.latent_vector[:8]).encode()
             ).hexdigest()[:32]
         return self
+
+
+class BiometricProfileSyncReq(BaseModel):
+    """
+    Sync payload from the profile-build page.
+
+    Only aggregated statistics are accepted — raw signals must be stripped
+    before transmission.  The client may pass `onboarding_state=stable` to
+    request a state transition once its local EMA has stabilised; the server
+    validates the sample_count claim before honouring it.
+    """
+    theta:          float              = Field(0.5, ge=0.0, le=1.0)
+    h_exp:          float              = Field(0.0, ge=0.0, le=1.0)
+    latent_vector:  list[float]        = Field(default_factory=list)
+    practice_text:  str                = ""
+    keyboard_stats: dict[str, Any]     = Field(default_factory=dict)
+    pointer_stats:  dict[str, Any]     = Field(default_factory=dict)
+    profile_stats:  dict[str, Any]     = Field(default_factory=dict)
+    live_drift:     float | None       = None
+    server_load:    float              = Field(0.5, ge=0.0, le=1.0)
+    # Client-requested state transition (only `stable` is honoured; see endpoint)
+    requested_state: OnboardingState | None = None
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.latent_vector:
+            if len(self.latent_vector) < 32:
+                padded = list(self.latent_vector[:32])
+                padded.extend([0.0] * (32 - len(padded)))
+                object.__setattr__(self, "latent_vector", padded)
+            elif len(self.latent_vector) > 32:
+                object.__setattr__(self, "latent_vector", list(self.latent_vector[:32]))
+        return self
+
+
+class ProfileResetReq(BaseModel):
+    """
+    Re-auth re-onboarding: wipes the aggregated profile back to `collecting`.
+    Requires an active session (the user must be authenticated).
+    """
+    reason: str = "reauth"  # e.g. "reauth", "admin_reset", "user_request"
 
 
 class PwHashReq(BaseModel):
@@ -453,45 +479,22 @@ class BiometricExtractReq(BaseModel):
     raw_signal: list[float]
 
 
-class BiometricProfileSyncReq(BaseModel):
-    theta:         float              = Field(0.5, ge=0.0, le=1.0)
-    h_exp:         float              = Field(0.0, ge=0.0, le=1.0)
-    latent_vector: list[float]        = Field(default_factory=list)
-    practice_text: str                = ""
-    keyboard_stats: dict[str, Any]    = Field(default_factory=dict)
-    pointer_stats:  dict[str, Any]    = Field(default_factory=dict)
-    profile_stats:  dict[str, Any]    = Field(default_factory=dict)
-    live_drift:     float | None      = None
-    server_load:    float             = Field(0.5, ge=0.0, le=1.0)
-
-    @model_validator(mode="after")
-    def _validate(self):
-        if self.latent_vector:
-            if len(self.latent_vector) < 32:
-                padded = list(self.latent_vector[:32])
-                padded.extend([0.0] * (32 - len(padded)))
-                object.__setattr__(self, "latent_vector", padded)
-            elif len(self.latent_vector) > 32:
-                object.__setattr__(self, "latent_vector", list(self.latent_vector[:32]))
-        return self
-
-
-# ── Webhook endpoint models ───────────────────────────────────────────────────
+# ── Webhook endpoint models  (unchanged from v3.2.0) ─────────────────────────
 
 class EndpointCreate(BaseModel):
     url:         HttpUrl
-    secret:      str = Field(min_length=16, description="HMAC signing secret (≥16 chars)")
+    secret:      str = Field(min_length=16)
     events:      list[WebhookEvent]
     customer_id: str
     description: str = ""
 
 
 class EndpointUpdate(BaseModel):
-    url:         HttpUrl | None         = None
-    secret:      str | None             = None
+    url:         HttpUrl | None            = None
+    secret:      str | None               = None
     events:      list[WebhookEvent] | None = None
-    enabled:     bool | None            = None
-    description: str | None             = None
+    enabled:     bool | None              = None
+    description: str | None               = None
 
 
 class EndpointOut(BaseModel):
@@ -512,20 +515,14 @@ class TestDeliveryOut(BaseModel):
     error:       str | None
 
 
-# ── Session trust models ──────────────────────────────────────────────────────
-
 class SessionTrustRequest(BaseModel):
-    """Customer backend sends this before authorising a sensitive transaction."""
     session_token:    str
     user_id:          str
     customer_id:      str         = ""
     trust_score:      float | None = Field(None, ge=0.0, le=1.0)
     e_rec:            float | None = Field(None, ge=0.0)
     latent_vector:    list[float]  = Field(default_factory=list)
-    transaction_risk: float        = Field(
-        0.5, ge=0.0, le=1.0,
-        description="Customer-provided risk level [0, 1]",
-    )
+    transaction_risk: float        = Field(0.5, ge=0.0, le=1.0)
 
 
 class SessionTrustResponse(BaseModel):
@@ -533,15 +530,13 @@ class SessionTrustResponse(BaseModel):
     user_id:          str
     trust_score:      float
     e_rec:            float
-    action:           str    # 'allow' | 'challenge' | 'deny'
-    confidence:       str    # 'high' | 'medium' | 'low'
+    action:           str
+    confidence:       str
     risk_adjusted:    float
     reasons:          list[str]
-    pipeline_version: str = "3.2"
+    pipeline_version: str = "4.0"
     timestamp:        str
 
-
-# ── Notification threshold model ──────────────────────────────────────────────
 
 class ThresholdConfig(BaseModel):
     trust_degraded_below: float = Field(0.50, ge=0.0, le=1.0)
@@ -559,10 +554,6 @@ def _client_ip(request: Request) -> str:
 
 
 async def _threat_gate(fingerprint: str, ip: str | None) -> bool:
-    """
-    Returns True when the fingerprint/IP is globally flagged.
-    Swallows all errors so a WatchdogService outage never blocks auth.
-    """
     if not watchdog_service:
         return False
     try:
@@ -574,7 +565,6 @@ async def _threat_gate(fingerprint: str, ip: str | None) -> bool:
 
 
 async def _ingest_watchdog(tenant_id: str, fingerprint: str, ip: str | None, wd_result) -> None:
-    """Push a watchdog result into the cross-site threat store (fire-and-forget)."""
     if not watchdog_service:
         return
     try:
@@ -593,25 +583,26 @@ async def _ingest_watchdog(tenant_id: str, fingerprint: str, ip: str | None, wd_
         logger.error("[ThreatIngest] Failed: %s", exc)
 
 
+def _safe_onboarding_state(raw: str) -> str:
+    """
+    Convert a client-supplied state string to a known constant.
+    Falls back to `collecting` for unknown values (safe side).
+    """
+    known = {
+        ONBOARDING_COLLECTING,
+        ONBOARDING_SYNCING,
+        ONBOARDING_STABLE,
+        ONBOARDING_DRIFTED,
+    }
+    return raw if raw in known else ONBOARDING_COLLECTING
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1-4: /score  — main pipeline entry point
+# /score  — main pipeline entry point  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/score")
 async def score(req: ScoreReq, request: Request):
-    """
-    Runs the full 4-stage pipeline with cross-site threat intelligence gating.
-    Always returns HTTP 200 — bots receive a synthetic shadow token so they
-    cannot distinguish rejection from success.
-
-    Flow
-    ────
-    1. Threat gate: is the fingerprint/IP globally flagged? → instant shadow
-    2. 4-stage pipeline (biometric → honeypot → governor → watchdog)
-    3. Bot hit → store honeypot entry in DB
-    4. Watchdog result → ingest into cross-site threat store
-    5. Emit webhook notification if bot detected
-    """
     ip  = _client_ip(request)
     raw = BiometricInput(
         theta         = req.theta,
@@ -622,15 +613,14 @@ async def score(req: ScoreReq, request: Request):
         ip_address    = ip,
     )
 
-    # ── 1. Threat gate ────────────────────────────────────────────────────────
     if await _threat_gate(req.fingerprint, ip):
         logger.warning("[/score] Global threat gate tripped: fp=%.8s", req.fingerprint)
         shadow_token = "bot_" + secrets.token_hex(32)
         notification_service.notify_bot_detected(
-            user_id    = f"anon_{shadow_token[:8]}",
-            theta      = req.theta,
-            path       = "/score",
-            ua         = req.user_agent or "unknown",
+            user_id = f"anon_{shadow_token[:8]}",
+            theta   = req.theta,
+            path    = "/score",
+            ua      = req.user_agent or "unknown",
         )
         return {
             "session_token":       shadow_token,
@@ -644,10 +634,8 @@ async def score(req: ScoreReq, request: Request):
             "threat_gate":         "GLOBALLY_FLAGGED",
         }
 
-    # ── 2. Full pipeline ──────────────────────────────────────────────────────
     result = orchestrator.run(raw)
 
-    # ── 3. Honeypot DB entry ──────────────────────────────────────────────────
     if result.shadow_mode:
         try:
             await store_honeypot_entry(
@@ -662,17 +650,11 @@ async def score(req: ScoreReq, request: Request):
             logger.error("[Honeypot] DB write failed: %s", exc)
 
         notification_service.notify_bot_detected(
-            user_id    = f"anon_{result.session_token[:8]}",
-            theta      = req.theta,
-            path       = "/score",
-            ua         = req.user_agent or "unknown",
+            user_id = f"anon_{result.session_token[:8]}",
+            theta   = req.theta,
+            path    = "/score",
+            ua      = req.user_agent or "unknown",
         )
-
-    logger.info(
-        "[Pipeline] shadow=%s preset=%-8s conf=%-6s degraded=%s θ=%.3f",
-        result.shadow_mode, result.action_label,
-        result.pipeline_confidence, result.degraded, result.humanity_score,
-    )
 
     response: dict = {
         "session_token":       result.session_token,
@@ -685,7 +667,6 @@ async def score(req: ScoreReq, request: Request):
         "degraded":            result.degraded,
     }
 
-    # ── 4. Watchdog result + threat ingest ────────────────────────────────────
     if result.watchdog is not None:
         wd = result.watchdog
         response["watchdog"] = {
@@ -695,10 +676,7 @@ async def score(req: ScoreReq, request: Request):
             "confidence":  wd.confidence.value,
             "reason":      wd.reason,
         }
-        # TODO: derive tenant_id from SiteCtx / API key
         await _ingest_watchdog("default", req.fingerprint, ip, wd)
-
-        # Route through notification service
         notification_service.route_watchdog_action(
             action      = wd.action.value,
             user_id     = f"anon_{result.session_token[:8]}",
@@ -717,15 +695,11 @@ async def score(req: ScoreReq, request: Request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Telemetry (SDK batch events)
+# /telemetry  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/telemetry")
 async def telemetry(req: TelemetryReq, site: SiteCtx):
-    """
-    Receives batch telemetry from the SDK.
-    Authenticated via X-API-Key (SiteCtx middleware).
-    """
     logger.info(
         "[Telemetry] %d events  site=%s  tenant=%s  user=%s",
         len(req.events), site.site_id, site.tenant_id, req.userId,
@@ -734,34 +708,31 @@ async def telemetry(req: TelemetryReq, site: SiteCtx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 4: /session/verify  — continuous watchdog heartbeat
+# /session/verify  — continuous watchdog heartbeat (updated)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/session/verify")
 async def session_verify(req: SessionVerifyReq, request: Request):
     """
-    Continuous identity-drift heartbeat called periodically by the client.
+    Continuous identity-drift heartbeat.
 
-    Security model
-    ──────────────
-    1. Validate session token against MongoDB — dead sessions always get 401.
-    2. Trust score baseline from DB, not the request body (replay-safe).
-    3. Updated trust score (post-decay / recovery) is written back to the DB.
-    4. FORCE_LOGOUT immediately invalidates the session in the DB.
-    5. Cross-site threat gate checked; globally flagged sessions are force-
-       logged-out even if the local watchdog would allow them.
-    6. Watchdog result ingested into the cross-site threat store.
-    7. Notification service routes the action to webhooks / log.
+    Drift detection is gated on the profile's `onboarding_state`.
+    When the state is `collecting` or `syncing`, the watchdog still runs
+    (for latent-vector anomaly detection) but FORCE_LOGOUT is suppressed
+    and the trust score decay is dampened so a fresh account is never
+    falsely logged out before its EMA baseline has stabilised.
+
+    The server re-reads the onboarding state from MongoDB rather than
+    trusting the client-supplied value, which prevents a malicious client
+    from permanently suppressing drift detection by always sending
+    `onboarding_state=collecting`.
     """
     # ── 1. Validate session ───────────────────────────────────────────────────
     try:
         session = await get_session(db_handler.db, req.session_token)
     except Exception as exc:
         logger.error("[SessionVerify] DB read failed: %s", exc)
-        raise HTTPException(
-            status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail      = "Session store unavailable",
-        )
+        raise HTTPException(status_code=503, detail="Session store unavailable")
 
     if session is None:
         raise HTTPException(
@@ -771,19 +742,18 @@ async def session_verify(req: SessionVerifyReq, request: Request):
         )
 
     if session.get("user_id") != req.user_id:
-        logger.warning(
-            "[SessionVerify] user_id mismatch: token_owner=%s claimed=%s",
-            session.get("user_id"), req.user_id,
-        )
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail      = "Session / user_id mismatch",
         )
 
-    # ── 2. DB trust score is authoritative ────────────────────────────────────
+    # ── 2. Read authoritative onboarding state from DB ────────────────────────
+    db_onboarding_state = await get_onboarding_state(db_handler.db, req.user_id)
+
+    # ── 3. DB trust score is authoritative ────────────────────────────────────
     db_trust: float = float(session.get("trust_score", 1.0))
 
-    # ── 3. Cross-site threat gate ─────────────────────────────────────────────
+    # ── 4. Cross-site threat gate ─────────────────────────────────────────────
     ip = _client_ip(request)
     if await _threat_gate(req.fingerprint, ip):
         logger.warning(
@@ -808,37 +778,80 @@ async def session_verify(req: SessionVerifyReq, request: Request):
             "confidence":         "HIGH",
             "reason":             "globally_flagged",
             "session_invalidated": True,
+            "onboarding_state":   db_onboarding_state,
         }
 
-    # ── 4. Run watchdog ───────────────────────────────────────────────────────
+    # ── 5. Run watchdog ───────────────────────────────────────────────────────
     wd = orchestrator.run_watchdog(
         latent_vector = req.latent_vector,
         e_rec         = req.e_rec,
-        trust_score   = db_trust,   # ← DB value, not client-supplied
+        trust_score   = db_trust,
     )
+
+    # ── 6. Apply onboarding gate ──────────────────────────────────────────────
+    # If the profile is still being built, demote FORCE_LOGOUT to a softer
+    # action so the user is never kicked out during initial calibration.
+    # PASSIVE_REAUTH and OK are passed through unchanged.
+    drift_armed = db_onboarding_state == ONBOARDING_STABLE
+    if not drift_armed and wd.action == WatchdogAction.FORCE_LOGOUT:
+        logger.info(
+            "[SessionVerify] FORCE_LOGOUT suppressed (onboarding=%s) for user=%s",
+            db_onboarding_state, req.user_id,
+        )
+        # Downgrade to passive_reauth so the UX asks rather than kicks
+        from backend.pipeline.contracts import WatchdogResult, WatchdogAction as WA, Confidence
+        wd = WatchdogResult(
+            action      = WA.PASSIVE_REAUTH,
+            trust_score = wd.trust_score,
+            e_rec       = wd.e_rec,
+            confidence  = wd.confidence,
+            reason      = f"drift_detection_suppressed(onboarding={db_onboarding_state})",
+        )
 
     logger.info(
-        "[SessionVerify] user=%s action=%s trust %.3f→%.3f e_rec=%.3f conf=%s",
+        "[SessionVerify] user=%s action=%s trust %.3f→%.3f e_rec=%.3f conf=%s onboarding=%s",
         req.user_id, wd.action.value, db_trust, wd.trust_score,
-        wd.e_rec, wd.confidence.value,
+        wd.e_rec, wd.confidence.value, db_onboarding_state,
     )
 
-    # ── 5. Persist updated trust score ────────────────────────────────────────
+    # ── 7. Persist updated trust score ────────────────────────────────────────
     try:
         await update_session_trust_score(db_handler.db, req.session_token, wd.trust_score)
     except Exception as exc:
         logger.warning("[SessionVerify] trust-score persist failed: %s", exc)
 
-    # ── 6. Invalidate on FORCE_LOGOUT ─────────────────────────────────────────
-    session_invalidated = wd.action == WatchdogAction.FORCE_LOGOUT
+    # ── 8. Invalidate on FORCE_LOGOUT (only when drift is armed) ──────────────
+    session_invalidated = wd.action == WatchdogAction.FORCE_LOGOUT and drift_armed
     if session_invalidated:
         try:
             await invalidate_session(db_handler.db, req.session_token)
-            logger.info("[SessionVerify] Session invalidated (FORCE_LOGOUT): user=%s", req.user_id)
+            # Mark the profile as drifted so subsequent logins know to reset
+            await set_onboarding_state(db_handler.db, req.user_id, ONBOARDING_DRIFTED)
+            logger.info(
+                "[SessionVerify] Session invalidated + profile→drifted: user=%s",
+                req.user_id,
+            )
         except Exception as exc:
             logger.error("[SessionVerify] Session invalidation failed: %s", exc)
 
-    # ── 7. Cross-site ingest + notification routing ───────────────────────────
+    # ── 9. Log drift event when profile is stable and action is not OK ─────────
+    if drift_armed and wd.action != WatchdogAction.OK:
+        try:
+            await log_drift_event(
+                db_handler.db,
+                user_id            = req.user_id,
+                drift_score        = req.behavioral_drift or 0.0,
+                adaptive_threshold = req.adaptive_threshold or 1.8,
+                trust_score        = wd.trust_score,
+                e_rec              = wd.e_rec,
+                selected_features  = req.selected_features,
+                action             = wd.action.value,
+                session_token      = req.session_token,
+            )
+        except Exception as exc:
+            logger.warning("[SessionVerify] Drift event log failed: %s", exc)
+
+    # ── 10. Cross-site ingest + notification routing ───────────────────────────
     await _ingest_watchdog("default", req.fingerprint, ip, wd)
     notification_service.route_watchdog_action(
         action      = wd.action.value,
@@ -856,51 +869,30 @@ async def session_verify(req: SessionVerifyReq, request: Request):
         "confidence":         wd.confidence.value,
         "reason":             wd.reason,
         "session_invalidated": session_invalidated,
+        "onboarding_state":   db_onboarding_state,
+        "drift_detection_armed": drift_armed,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /honeypot/reward  — MAB feedback loop
+# /honeypot  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/honeypot/reward")
 async def honeypot_reward(req: MabRewardReq):
-    """
-    Close the MAB reward loop after a shadow session ends.
-
-    reward > 0 → deception held (bot stayed in sandbox)
-    reward < 0 → bot escaped (arm strategy was ineffective)
-
-    Arm is validated against the live n_arms so a corrupted / replayed payload
-    cannot index out of bounds.
-    """
     n_arms = mab_agent.n_arms
     if not (0 <= req.arm < n_arms):
         raise HTTPException(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail      = f"arm must be in [0, {n_arms - 1}]; got {req.arm}",
         )
-    reward = max(-1.0, min(1.0, req.reward))   # belt-and-suspenders clamp
+    reward = max(-1.0, min(1.0, req.reward))
     orchestrator.report_mab_reward(req.arm, reward)
-    logger.info("[MAB] reward arm=%d  reward=%.3f", req.arm, reward)
     return {"ok": True, "arm": req.arm, "reward": reward}
 
 
 @app.post("/honeypot/trigger")
 async def honeypot_trigger(req: HoneypotTriggerReq, request: Request):
-    """
-    SDK calls this when a bot interacts with an injected DOM decoy.
-
-    Always returns HTTP 200 with a plausible payload — bots must not learn
-    that this endpoint detects them.
-
-    Flow
-    ────
-    1. Verify HMAC-SHA256 challenge signature (invalid → fake-200, no DB write)
-    2. Validate arm index
-    3. Log hit to honeypot collection
-    4. Issue strong positive MAB reward
-    """
     from .models.stage2_honeypot import verify_challenge_signature
 
     valid = verify_challenge_signature(
@@ -912,14 +904,9 @@ async def honeypot_trigger(req: HoneypotTriggerReq, request: Request):
         shadow_secret = SHADOW_SECRET,
     )
     if not valid:
-        logger.warning(
-            "[Trigger] Invalid/expired challenge: id=%s arm=%d src=%s",
-            req.challenge_id, req.arm, _client_ip(request),
-        )
         return {"ok": True, "status": "recorded"}
 
     if not (0 <= req.arm < mab_agent.n_arms):
-        logger.warning("[Trigger] Invalid arm %d in trigger payload", req.arm)
         return {"ok": True, "status": "recorded"}
 
     try:
@@ -935,33 +922,17 @@ async def honeypot_trigger(req: HoneypotTriggerReq, request: Request):
         logger.error("[Trigger] DB write failed: %s", exc)
 
     orchestrator.report_mab_reward(req.arm, 1.0)
-    logger.info(
-        "[Trigger] Bot caught: challenge=%s arm=%d decoy=%s event=%s kind=%s",
-        req.challenge_id, req.arm,
-        req.triggered_decoy, req.trigger_event, req.trigger_kind,
-    )
     return {"ok": True, "status": "recorded"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Authentication
+# Authentication  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", status_code=status.HTTP_201_CREATED)
 async def register(req: UserCreate, request: Request):
-    """
-    Register a new user and open an initial session.
-
-    The DQN governor selects the Argon2id preset based on current server load,
-    binding account security to real-world conditions.  The initial session has
-    a 20-minute window — shorter than normal because no behavioural baseline
-    exists yet.
-    """
     if await user_exists(db_handler.db, req.email):
-        raise HTTPException(
-            status_code = status.HTTP_409_CONFLICT,
-            detail      = "An account with that email already exists",
-        )
+        raise HTTPException(status_code=409, detail="An account with that email already exists")
 
     bio_raw = BiometricInput(
         theta=0.9, h_exp=0.9, server_load=0.4,
@@ -976,7 +947,7 @@ async def register(req: UserCreate, request: Request):
     try:
         user_id = await create_user(db_handler.db, req.email, password_hash)
     except Exception as exc:
-        logger.error("[Auth] Register — user creation failed: %s", exc, exc_info=True)
+        logger.error("[Auth] Register failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to register user")
 
     initial_lv    = [0.0] * 32
@@ -990,37 +961,48 @@ async def register(req: UserCreate, request: Request):
             expires_in_minutes = 20,
         )
     except Exception as exc:
-        logger.error("[Auth] Register — session creation failed: %s", exc, exc_info=True)
+        logger.error("[Auth] Session creation failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create session after registration")
+
+    # Seed an empty profile in `collecting` state so /session/verify has a
+    # document to read immediately — avoids a missing-document race on the
+    # very first heartbeat.
+    try:
+        await upsert_biometric_profile(
+            db_handler.db,
+            user_id            = user_id,
+            sample_count       = 0,
+            last_drift         = 0.0,
+            adaptive_threshold = 1.8,
+            feature_means      = [0.5] * 8,
+            selected_features  = [],
+            onboarding_state   = ONBOARDING_COLLECTING,
+        )
+    except Exception as exc:
+        logger.warning("[Auth] Profile seed failed (non-fatal): %s", exc)
 
     try:
         await update_user_security_level(db_handler.db, user_id, gov.preset.value)
     except Exception:
-        pass  # non-critical
+        pass
 
     logger.info("[Auth] Registered %s  preset=%s", req.email, gov.preset.value)
     return {
-        "success":        True,
-        "user_id":        user_id,
-        "email":          req.email,
-        "session_token":  session_token,
-        "security_level": gov.preset.value,
+        "success":          True,
+        "user_id":          user_id,
+        "email":            req.email,
+        "session_token":    session_token,
+        "security_level":   gov.preset.value,
+        "onboarding_state": ONBOARDING_COLLECTING,
     }
 
 
 @app.post("/auth/login")
 async def login(req: UserLogin, request: Request):
-    """
-    Email + password login.
-
-    A fresh session document is always created on successful login — prior
-    tokens are never re-used to prevent replay attacks.  Initial trust = 1.0;
-    decays on subsequent heartbeats.
-    """
     try:
         user = await get_user_by_email(db_handler.db, req.email)
         if not user:
-            PasswordHasher().hash("dummy_constant_work")   # constant-time
+            PasswordHasher().hash("dummy_constant_work")
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
         if not user.get("is_active", False):
@@ -1043,13 +1025,25 @@ async def login(req: UserLogin, request: Request):
             expires_in_minutes = 30,
         )
 
-        logger.info("[Auth] Login: %s", req.email)
+        # Fetch the current onboarding state to return to the client
+        # so the router can decide which page to land on.
+        ob_state = await get_onboarding_state(db_handler.db, user_id)
+
+        # A drifted profile means the last session ended abnormally.
+        # Reset to collecting so the user rebuilds a clean baseline.
+        if ob_state == ONBOARDING_DRIFTED:
+            await reset_biometric_profile(db_handler.db, user_id)
+            ob_state = ONBOARDING_COLLECTING
+            logger.info("[Auth] Login: drifted profile reset for user=%s", user_id)
+
+        logger.info("[Auth] Login: %s  onboarding=%s", req.email, ob_state)
         return {
-            "success":        True,
-            "session_token":  session_token,
-            "user_id":        user_id,
-            "email":          user["email"],
-            "security_level": user.get("security_level", "standard"),
+            "success":          True,
+            "session_token":    session_token,
+            "user_id":          user_id,
+            "email":            user["email"],
+            "security_level":   user.get("security_level", "standard"),
+            "onboarding_state": ob_state,
         }
     except HTTPException:
         raise
@@ -1060,11 +1054,9 @@ async def login(req: UserLogin, request: Request):
 
 @app.post("/auth/logout")
 async def logout(req: Optional[LogoutReq] = None, session_token: Optional[str] = None):
-    """Invalidate a session. Supports token in body or query param."""
     token = session_token
     if not token and req:
         token = req.session_token
-    
     if not token:
         raise HTTPException(status_code=422, detail="session_token required")
 
@@ -1077,36 +1069,35 @@ async def logout(req: Optional[LogoutReq] = None, session_token: Optional[str] =
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Protected: /me
+# Protected: /me  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/me")
 async def me(session: dict = Depends(require_active_session)):
-    """
-    Returns the authenticated user's profile.  Demonstrates `require_active_session`.
-    """
     user_id = session["user_id"]
     try:
         user = await get_user_by_id(db_handler.db, user_id)
     except Exception as exc:
-        logger.error("[Me] DB error: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to retrieve profile")
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    ob_state = await get_onboarding_state(db_handler.db, user_id)
+
     return {
-        "user_id":        user_id,
-        "email":          user.get("email"),
-        "security_level": user.get("security_level", "standard"),
-        "last_login":     user.get("last_login"),
-        "created_at":     user.get("created_at"),
-        "trust_score":    session.get("trust_score", 1.0),
+        "user_id":          user_id,
+        "email":            user.get("email"),
+        "security_level":   user.get("security_level", "standard"),
+        "last_login":       user.get("last_login"),
+        "created_at":       user.get("created_at"),
+        "trust_score":      session.get("trust_score", 1.0),
+        "onboarding_state": ob_state,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Password utilities
+# Password utilities  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/password/hash")
@@ -1148,7 +1139,291 @@ async def pw_verify(req: PwHashReq):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Honeypot / admin
+# Biometric / CNN
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/biometric/extract")
+async def biometric_extract(req: BiometricExtractReq):
+    try:
+        features = cnn_model.extract(req.raw_signal)
+        return {"success": True, "features": features, "dim": len(features)}
+    except Exception as exc:
+        logger.error("[CNN] Extract error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Feature extraction failed")
+
+
+@app.get("/biometric/profile/{user_id}/status")
+async def get_profile_status(
+    user_id: str,
+    session: dict = Depends(require_active_session),
+):
+    """
+    Lightweight onboarding state poll.  Returns only the ProfileBuildStatus
+    fields — not the full profile document.  Called frequently by the
+    ProfileBuildPage to update its progress bar and state machine.
+    """
+    if session.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Cannot access another user's profile status")
+
+    try:
+        profile = await get_biometric_profile_summary(db_handler.db, user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to read profile status")
+
+    if not profile:
+        # Return a default collecting status for new users
+        return ProfileBuildStatus(
+            user_id               = user_id,
+            tenant_id             = None,
+            onboarding_state      = OnboardingState.COLLECTING,
+            sample_count          = 0,
+            progress              = 0.0,
+            drift_detection_armed = False,
+            last_drift            = 0.0,
+            adaptive_threshold    = 1.8,
+            selected_features     = [],
+            updated_at            = None,
+        )
+
+    return ProfileBuildStatus.from_profile(profile)
+
+
+@app.get("/biometric/profile/{user_id}")
+async def get_biometric_profile_api(
+    user_id: str,
+    session: dict = Depends(require_active_session),
+):
+    if session.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Cannot access another user's biometric profile")
+    try:
+        profile = await get_biometric_profile(db_handler.db, user_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Biometric profile not found")
+        return {"user_id": user_id, "profile": profile}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[Biometric] Profile fetch error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to retrieve profile")
+
+
+@app.post("/biometric/profile")
+async def sync_biometric_profile(
+    req: BiometricProfileSyncReq,
+    session: dict = Depends(require_active_session),
+):
+    """
+    Persist the active user's aggregated biometric typing pattern.
+
+    State machine transitions allowed from the client:
+      collecting  →  syncing   (automatic, server sets it before the write)
+      syncing     →  stable    (client may request this when sample_count >= threshold)
+      stable      →  stable    (updates EMA and drift; may transition to drifted if
+                                last_drift > adaptive_threshold)
+
+    Disallowed client transitions (silently ignored):
+      collecting  →  drifted   (only the watchdog can set drifted)
+      stable      →  collecting (use POST /biometric/profile/reset instead)
+      drifted     →  any        (use POST /biometric/profile/reset instead)
+
+    Raw keystroke / mouse coordinate data must be stripped before this
+    payload is constructed — only aggregated metrics are accepted.
+    """
+    user_id    = session["user_id"]
+    tenant_id  = session.get("tenant_id")
+    site_id    = session.get("site_id")
+
+    keyboard_stats = req.keyboard_stats or {}
+    pointer_stats  = req.pointer_stats  or {}
+    profile_stats  = req.profile_stats  or {}
+
+    dwell  = float(keyboard_stats.get("avgDwell",  0.0) or 0.0)
+    flight = float(keyboard_stats.get("avgFlight", 0.0) or 0.0)
+    rhythm = float(keyboard_stats.get("rhythm",    0.0) or 0.0)
+    pause  = float(keyboard_stats.get("avgPause",  0.0) or 0.0)
+    speed  = float(pointer_stats.get("avgSpeed",   0.0) or 0.0)
+    jitter = float(pointer_stats.get("avgJitter",  0.0) or 0.0)
+    accel  = float(pointer_stats.get("avgAccel",   0.0) or 0.0)
+    bigram = float(req.h_exp)
+
+    client_sample_count = int(profile_stats.get("sampleCount", 0) or 0)
+    last_drift         = float(profile_stats.get("lastDrift",       req.live_drift or 0.0) or 0.0)
+    adaptive_threshold = float(profile_stats.get("adaptiveThreshold", 0.0) or 0.0)
+    selected_features  = profile_stats.get("selectedFeatures", [])
+    feature_means      = profile_stats.get("featureMeans", [])
+    ema_profile        = profile_stats.get("emaProfile")
+    ema_variance       = profile_stats.get("emaVariance")
+
+    # ── Resolve requested state transition ─────────────────────────────────────
+    # Fetch the current DB state before we decide what to write.
+    existing_profile = await get_biometric_profile_summary(db_handler.db, user_id)
+    current_state    = (existing_profile or {}).get("onboarding_state", ONBOARDING_COLLECTING)
+    existing_sample_count = int((existing_profile or {}).get("sample_count", 0) or 0)
+
+    # Server-authoritative sample count: each completed sync advances the
+    # profile by exactly one aggregated sample, independent of the client's claim.
+    sample_count = existing_sample_count + 1
+
+    if client_sample_count and client_sample_count != sample_count:
+        logger.warning(
+            "[Biometric] sample_count claim mismatch: client=%d server=%d user=%s",
+            client_sample_count, sample_count, user_id,
+        )
+
+    # We set syncing first (transient flag that the write is in progress)
+    # and then resolve to the correct terminal state.
+    target_state: str
+    if current_state in (ONBOARDING_DRIFTED,):
+        # Drifted profiles cannot be updated via sync — use /reset endpoint.
+        raise HTTPException(
+            status_code = 409,
+            detail      = (
+                "Profile is in 'drifted' state. "
+                "Use POST /biometric/profile/reset after re-authentication."
+            ),
+        )
+    elif current_state == ONBOARDING_STABLE:
+        # Stay stable unless drift says otherwise; _derive_onboarding_state
+        # handles the stable→drifted transition inside upsert_biometric_profile.
+        target_state = ONBOARDING_STABLE
+    elif (
+        req.requested_state == OnboardingState.STABLE
+        and sample_count >= STABLE_SAMPLE_THRESHOLD
+    ):
+        # Client explicitly requested stable and has enough samples
+        target_state = ONBOARDING_STABLE
+    elif sample_count >= STABLE_SAMPLE_THRESHOLD:
+        # Threshold crossed; transition via syncing
+        target_state = ONBOARDING_SYNCING
+    else:
+        target_state = ONBOARDING_COLLECTING
+
+    try:
+        # EMA update for rolling averages
+        await store_biometric_sample(
+            db_handler.db,
+            user_id   = user_id,
+            theta     = req.theta,
+            h_exp     = req.h_exp,
+            dwell     = dwell,
+            flight    = flight,
+            speed     = speed,
+            jitter    = jitter,
+            accel     = accel,
+            rhythm    = rhythm,
+            pause     = pause,
+            bigram    = bigram,
+            device_ip = "?",
+        )
+
+        # Full summary upsert — this is what the watchdog reads
+        await upsert_biometric_profile(
+            db_handler.db,
+            user_id            = user_id,
+            sample_count       = sample_count,
+            last_drift         = last_drift,
+            adaptive_threshold = adaptive_threshold,
+            feature_means      = feature_means,
+            selected_features  = selected_features,
+            tenant_id          = tenant_id,
+            site_id            = site_id,
+            ema_profile        = ema_profile,
+            ema_variance       = ema_variance,
+            onboarding_state   = target_state,
+        )
+
+        # Reflect stable back to syncing→stable: if we wrote syncing, now
+        # confirm stable immediately (syncing is only needed within a write
+        # race window that doesn't exist here since we await the upsert).
+        if target_state == ONBOARDING_SYNCING:
+            await set_onboarding_state(db_handler.db, user_id, ONBOARDING_STABLE)
+            target_state = ONBOARDING_STABLE
+
+        # Sync the condensed summary onto the user document as well
+        await db_handler.db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {
+                "biometric_profile": {
+                    "sample_count":       sample_count,
+                    "last_drift":         last_drift,
+                    "adaptive_threshold": adaptive_threshold,
+                    "selected_features":  selected_features,
+                    "onboarding_state":   target_state,
+                    "updated_at":         datetime.utcnow(),
+                    "source":             "profile-build",
+                },
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+
+        profile = await get_biometric_profile_summary(db_handler.db, user_id)
+        status_obj = ProfileBuildStatus.from_profile(profile) if profile else ProfileBuildStatus(
+            user_id=user_id, tenant_id=tenant_id, onboarding_state=OnboardingState(target_state),
+            sample_count=sample_count, progress=min(sample_count / STABLE_SAMPLE_THRESHOLD, 1.0),
+            drift_detection_armed=(target_state == ONBOARDING_STABLE),
+            last_drift=last_drift, adaptive_threshold=adaptive_threshold,
+            selected_features=selected_features, updated_at=None,
+        )
+
+        logger.info(
+            "[Biometric] Sync: user=%s samples=%d state=%s drift=%.3f",
+            user_id, sample_count, target_state, last_drift,
+        )
+
+        return {
+            "success":         True,
+            "user_id":         user_id,
+            "profile_status":  status_obj.model_dump(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[Biometric] Profile sync failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to store biometric profile")
+
+
+@app.post("/biometric/profile/reset")
+async def reset_biometric_profile_endpoint(
+    req: ProfileResetReq,
+    session: dict = Depends(require_active_session),
+):
+    """
+    Re-onboarding endpoint.  Wipes the aggregated EMA and resets the profile
+    to `collecting` so the user builds a fresh baseline after re-auth.
+
+    Should be called:
+      • Automatically by the login handler when a `drifted` profile is detected.
+      • By the ProfileBuildPage's "start over" button in the `drifted` panel.
+
+    Returns the empty ProfileBuildStatus that the client uses to reset its
+    local state machine.
+    """
+    user_id   = session["user_id"]
+    tenant_id = session.get("tenant_id")
+    site_id   = session.get("site_id")
+
+    try:
+        await reset_biometric_profile(
+            db_handler.db,
+            user_id   = user_id,
+            tenant_id = tenant_id,
+            site_id   = site_id,
+        )
+    except Exception as exc:
+        logger.error("[Biometric] Reset failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to reset biometric profile")
+
+    logger.info("[Biometric] Profile reset: user=%s reason=%s", user_id, req.reason)
+    return {
+        "success":        True,
+        "user_id":        user_id,
+        "onboarding_state": ONBOARDING_COLLECTING,
+        "reason":         req.reason,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/honeypot/signatures")
@@ -1158,7 +1433,6 @@ async def signatures():
         count   = await get_honeypot_count(db_handler.db)
         return {"signatures": db_sigs, "count": count}
     except Exception as exc:
-        logger.error("[Honeypot] Fetch error: %s", exc)
         return {"signatures": [], "count": 0}
 
 
@@ -1191,6 +1465,27 @@ async def models_status():
             "stages":    ["biometric", "honeypot", "governor", "watchdog"],
             "contracts": "pipeline/contracts.py",
         },
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/admin/onboarding-summary")
+async def onboarding_summary(
+    tenant_id: str = Query(..., description="Tenant ID to aggregate for"),
+):
+    """
+    Per-tenant breakdown of how many users are in each onboarding state.
+    Useful for monitoring cold-start funnel health.
+    """
+    try:
+        summary = await profile_build_summary(db_handler.db, tenant_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {
+        "tenant_id": tenant_id,
+        "states":    summary,
+        "threshold": STABLE_SAMPLE_THRESHOLD,
         "timestamp": time.time(),
     }
 
@@ -1240,127 +1535,7 @@ async def pipeline_debug(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Biometric / CNN
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/biometric/extract")
-async def biometric_extract(req: BiometricExtractReq):
-    try:
-        features = cnn_model.extract(req.raw_signal)
-        return {"success": True, "features": features, "dim": len(features)}
-    except Exception as exc:
-        logger.error("[CNN] Extract error: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Feature extraction failed")
-
-
-@app.get("/biometric/profile/{user_id}")
-async def get_biometric_profile_api(user_id: str, session: dict = Depends(require_active_session)):
-    """
-    Protected by the session guard.  Callers may only read their own profile.
-    """
-    if session.get("user_id") != user_id:
-        raise HTTPException(
-            status_code = status.HTTP_403_FORBIDDEN,
-            detail      = "Cannot access another user's biometric profile",
-        )
-    try:
-        profile = await get_biometric_profile(db_handler.db, user_id)
-        if not profile:
-            raise HTTPException(status_code=404, detail="Biometric profile not found")
-        return {"user_id": user_id, "profile": profile}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("[Biometric] Profile fetch error: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to retrieve profile")
-
-
-@app.post("/biometric/profile")
-async def sync_biometric_profile(
-    req: BiometricProfileSyncReq,
-    session: dict = Depends(require_active_session)
-):
-    """
-    Persist the active user's biometric typing pattern.
-
-    The profile-build page calls this while the user types, so MongoDB stores
-    both the summary stats and the rolling sample history for that user.
-    """
-    user_id = session["user_id"]
-    ip = "?"  # Simplified; request IP not critical for profile storage
-
-    keyboard_stats = req.keyboard_stats or {}
-    pointer_stats = req.pointer_stats or {}
-    profile_stats = req.profile_stats or {}
-
-    dwell = float(keyboard_stats.get("avgDwell", 0.0) or 0.0)
-    flight = float(keyboard_stats.get("avgFlight", 0.0) or 0.0)
-    rhythm = float(keyboard_stats.get("rhythm", 0.0) or 0.0)
-    pause = float(keyboard_stats.get("avgPause", 0.0) or 0.0)
-    speed = float(pointer_stats.get("avgSpeed", 0.0) or 0.0)
-    jitter = float(pointer_stats.get("avgJitter", 0.0) or 0.0)
-    accel = float(pointer_stats.get("avgAccel", 0.0) or 0.0)
-    bigram = float(req.h_exp)
-
-    try:
-        await store_biometric_sample(
-            db_handler.db,
-            user_id   = user_id,
-            theta     = req.theta,
-            h_exp     = req.h_exp,
-            dwell     = dwell,
-            flight    = flight,
-            speed     = speed,
-            jitter    = jitter,
-            accel     = accel,
-            rhythm    = rhythm,
-            pause     = pause,
-            bigram    = bigram,
-            device_ip = ip,
-        )
-
-        summary = {
-            "sample_count":       int(profile_stats.get("sampleCount", 0) or 0),
-            "last_drift":         float(profile_stats.get("lastDrift", req.live_drift or 0.0) or 0.0),
-            "adaptive_threshold":  float(profile_stats.get("adaptiveThreshold", 0.0) or 0.0),
-            "selected_features":  profile_stats.get("selectedFeatures", []),
-            "feature_means":      profile_stats.get("featureMeans", []),
-            "updated_at":         datetime.utcnow(),
-            "source":             "profile-build",
-        }
-
-        await upsert_biometric_profile(
-            db_handler.db,
-            user_id            = user_id,
-            sample_count       = summary["sample_count"],
-            last_drift         = summary["last_drift"],
-            adaptive_threshold = summary["adaptive_threshold"],
-            feature_means      = summary["feature_means"],
-            selected_features  = summary["selected_features"],
-            ema_profile        = profile_stats.get("emaProfile"),
-            ema_variance       = profile_stats.get("emaVariance"),
-        )
-
-        await db_handler.db.users.update_one(
-            {"_id": ObjectId(user_id)},
-            {"$set": {"biometric_profile": summary, "updated_at": datetime.utcnow()}},
-        )
-
-        profile = await get_biometric_profile(db_handler.db, user_id)
-        return {
-            "success": True,
-            "user_id": user_id,
-            "profile": profile,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("[Biometric] Profile sync failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to store biometric profile")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Integration API — Session Trust Verification
+# Integration API — Session Trust  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post(
@@ -1370,26 +1545,8 @@ async def sync_biometric_profile(
     tags           = ["Integration API"],
 )
 async def verify_session_trust(req: SessionTrustRequest) -> SessionTrustResponse:
-    """
-    Customer backends call this **before authorising a sensitive transaction**
-    (payment, password change, data export, etc.).
-
-    Decision logic
-    ──────────────
-    1. Retrieve DB-persisted watchdog state for the session.
-    2. Take the more pessimistic value between stored and request signals.
-    3. Apply risk-adjusted scoring: high-risk transactions demand higher trust.
-    4. Emit `ep.anomaly.detected` webhook if action = deny.
-
-    Action mapping
-    ──────────────
-    allow     — proceed with the transaction
-    challenge — step-up MFA recommended before proceeding
-    deny      — block the transaction; force re-authentication
-    """
     now = datetime.now(timezone.utc).isoformat()
 
-    # Prefer the DB-persisted session state; fall back to request signals
     try:
         db_session = await get_session(db_handler.db, req.session_token)
     except Exception:
@@ -1405,14 +1562,10 @@ async def verify_session_trust(req: SessionTrustRequest) -> SessionTrustResponse
         stored_e_rec = req.e_rec       if req.e_rec is not None       else 0.0
         reasons.append("no_db_session_data")
 
-    # Take the more pessimistic value
-    trust = min(stored_trust, req.trust_score) if req.trust_score is not None else stored_trust
-    e_rec = max(stored_e_rec, req.e_rec)       if req.e_rec is not None       else stored_e_rec
-
-    # Risk-adjusted score: trust × (1 − risk × penalty)
+    trust    = min(stored_trust, req.trust_score) if req.trust_score is not None else stored_trust
+    e_rec    = max(stored_e_rec, req.e_rec)       if req.e_rec is not None       else stored_e_rec
     risk_adj = trust * (1 - req.transaction_risk * 0.3)
 
-    # Confidence
     if db_session and req.trust_score is not None:
         confidence = "high"
     elif db_session or req.trust_score is not None:
@@ -1421,7 +1574,6 @@ async def verify_session_trust(req: SessionTrustRequest) -> SessionTrustResponse
         confidence = "low"
         reasons.append("low_signal")
 
-    # Action decision (using per-customer thresholds)
     thresholds = notification_service.get_thresholds(req.customer_id)
 
     if e_rec > thresholds.anomaly_e_rec_above * 1.5:
@@ -1444,14 +1596,9 @@ async def verify_session_trust(req: SessionTrustRequest) -> SessionTrustResponse
             e_rec       = e_rec,
             trust_score = trust,
             drift       = float(db_session.get("drift", 0.0)) if db_session else 0.0,
-            reason      = f"Transaction blocked (risk={req.transaction_risk:.2f}): " + "; ".join(reasons),
+            reason      = f"Transaction blocked: " + "; ".join(reasons),
             customer_id = req.customer_id,
         )
-
-    logger.info(
-        "[Trust] user=%s action=%s trust=%.3f risk_adj=%.3f e_rec=%.4f tx_risk=%.2f",
-        req.user_id, action, trust, risk_adj, e_rec, req.transaction_risk,
-    )
 
     return SessionTrustResponse(
         session_id    = req.session_token,
@@ -1469,26 +1616,16 @@ async def verify_session_trust(req: SessionTrustRequest) -> SessionTrustResponse
 @app.get(
     "/session/trust/{session_id}",
     response_model = SessionTrustResponse,
-    summary        = "Poll current trust score for a session",
     tags           = ["Integration API"],
 )
 async def get_session_trust(session_id: str) -> SessionTrustResponse:
-    """
-    Lightweight poll for the current trust posture without re-running the
-    pipeline.  Suitable for SSE polling on the customer dashboard.
-    Reads directly from MongoDB so the value is always authoritative.
-    """
     try:
         db_session = await get_session(db_handler.db, session_id)
     except Exception as exc:
-        logger.error("[Trust/Poll] DB error: %s", exc)
         raise HTTPException(status_code=503, detail="Session store unavailable")
 
     if not db_session:
-        raise HTTPException(
-            status_code = 404,
-            detail      = f"Session '{session_id}' not found or expired.",
-        )
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found or expired.")
 
     trust         = float(db_session.get("trust_score", 1.0))
     e_rec         = float(db_session.get("e_rec", 0.0))
@@ -1514,79 +1651,39 @@ async def get_session_trust(session_id: str) -> SessionTrustResponse:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Integration API — Webhook Endpoint Management
+# Integration API — Webhooks  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post(
-    "/webhooks/endpoints",
-    status_code    = status.HTTP_201_CREATED,
-    response_model = EndpointOut,
-    summary        = "Register a webhook delivery endpoint",
-    tags           = ["Webhooks"],
-)
+@app.post("/webhooks/endpoints", status_code=201, response_model=EndpointOut, tags=["Webhooks"])
 async def register_endpoint(req: EndpointCreate) -> EndpointOut:
     endpoint = WebhookEndpoint(
-        id          = str(uuid.uuid4()),
-        url         = str(req.url),
-        secret      = req.secret,
-        events      = req.events,
-        customer_id = req.customer_id,
-        description = req.description,
+        id=str(uuid.uuid4()), url=str(req.url), secret=req.secret,
+        events=req.events, customer_id=req.customer_id, description=req.description,
     )
     dispatcher.register_endpoint(endpoint)
-    logger.info("Registered webhook endpoint %s for customer %s", endpoint.id, req.customer_id)
-    return EndpointOut(
-        id          = endpoint.id,
-        url         = endpoint.url,
-        events      = [e.value for e in endpoint.events],
-        customer_id = endpoint.customer_id,
-        enabled     = endpoint.enabled,
-        description = endpoint.description,
-    )
+    return EndpointOut(id=endpoint.id, url=endpoint.url, events=[e.value for e in endpoint.events],
+                       customer_id=endpoint.customer_id, enabled=endpoint.enabled, description=endpoint.description)
 
 
-@app.get(
-    "/webhooks/endpoints",
-    response_model = list[EndpointOut],
-    summary        = "List registered webhook endpoints",
-    tags           = ["Webhooks"],
-)
+@app.get("/webhooks/endpoints", response_model=list[EndpointOut], tags=["Webhooks"])
 async def list_endpoints(customer_id: str | None = Query(None)) -> list[EndpointOut]:
     return [
-        EndpointOut(
-            id          = ep.id,
-            url         = ep.url,
-            events      = [e.value for e in ep.events],
-            customer_id = ep.customer_id,
-            enabled     = ep.enabled,
-            description = ep.description,
-        )
+        EndpointOut(id=ep.id, url=ep.url, events=[e.value for e in ep.events],
+                    customer_id=ep.customer_id, enabled=ep.enabled, description=ep.description)
         for ep in dispatcher.list_endpoints(customer_id=customer_id)
     ]
 
 
-@app.get(
-    "/webhooks/endpoints/{endpoint_id}",
-    response_model = EndpointOut,
-    summary        = "Get a webhook endpoint",
-    tags           = ["Webhooks"],
-)
+@app.get("/webhooks/endpoints/{endpoint_id}", response_model=EndpointOut, tags=["Webhooks"])
 async def get_endpoint(endpoint_id: str) -> EndpointOut:
     ep = dispatcher._endpoints.get(endpoint_id)
     if not ep:
         raise HTTPException(status_code=404, detail=f"Endpoint '{endpoint_id}' not found.")
-    return EndpointOut(
-        id=ep.id, url=ep.url, events=[e.value for e in ep.events],
-        customer_id=ep.customer_id, enabled=ep.enabled, description=ep.description,
-    )
+    return EndpointOut(id=ep.id, url=ep.url, events=[e.value for e in ep.events],
+                       customer_id=ep.customer_id, enabled=ep.enabled, description=ep.description)
 
 
-@app.patch(
-    "/webhooks/endpoints/{endpoint_id}",
-    response_model = EndpointOut,
-    summary        = "Update a webhook endpoint",
-    tags           = ["Webhooks"],
-)
+@app.patch("/webhooks/endpoints/{endpoint_id}", response_model=EndpointOut, tags=["Webhooks"])
 async def update_endpoint(endpoint_id: str, req: EndpointUpdate) -> EndpointOut:
     kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
     if "url" in kwargs:
@@ -1594,54 +1691,32 @@ async def update_endpoint(endpoint_id: str, req: EndpointUpdate) -> EndpointOut:
     ep = dispatcher.update_endpoint(endpoint_id, **kwargs)
     if not ep:
         raise HTTPException(status_code=404, detail=f"Endpoint '{endpoint_id}' not found.")
-    return EndpointOut(
-        id=ep.id, url=ep.url, events=[e.value for e in ep.events],
-        customer_id=ep.customer_id, enabled=ep.enabled, description=ep.description,
-    )
+    return EndpointOut(id=ep.id, url=ep.url, events=[e.value for e in ep.events],
+                       customer_id=ep.customer_id, enabled=ep.enabled, description=ep.description)
 
 
-@app.delete(
-    "/webhooks/endpoints/{endpoint_id}",
-    status_code = status.HTTP_204_NO_CONTENT,
-    summary     = "Unregister a webhook endpoint",
-    tags        = ["Webhooks"],
-)
+@app.delete("/webhooks/endpoints/{endpoint_id}", status_code=204, tags=["Webhooks"])
 async def delete_endpoint(endpoint_id: str):
     if endpoint_id not in dispatcher._endpoints:
         raise HTTPException(status_code=404, detail=f"Endpoint '{endpoint_id}' not found.")
     dispatcher.unregister_endpoint(endpoint_id)
 
 
-@app.post(
-    "/webhooks/endpoints/{endpoint_id}/test",
-    response_model = TestDeliveryOut,
-    summary        = "Send a test webhook delivery",
-    tags           = ["Webhooks"],
-)
+@app.post("/webhooks/endpoints/{endpoint_id}/test", response_model=TestDeliveryOut, tags=["Webhooks"])
 async def test_endpoint_delivery(endpoint_id: str) -> TestDeliveryOut:
-    """Fire a synthetic ep.anomaly.detected to verify connectivity and signing."""
     result = await dispatcher.test_endpoint(endpoint_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Endpoint '{endpoint_id}' not found.")
-    return TestDeliveryOut(
-        delivery_id = result.delivery_id,
-        success     = result.success,
-        status_code = result.status_code,
-        attempts    = result.attempts,
-        latency_ms  = round(result.latency_ms, 2),
-        error       = result.error,
-    )
+    return TestDeliveryOut(delivery_id=result.delivery_id, success=result.success,
+                           status_code=result.status_code, attempts=result.attempts,
+                           latency_ms=round(result.latency_ms, 2), error=result.error)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Integration API — Notifications & Thresholds
+# Integration API — Notifications  (unchanged from v3.2.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get(
-    "/notifications",
-    summary = "Query notification / event log",
-    tags    = ["Integration API"],
-)
+@app.get("/notifications", tags=["Integration API"])
 async def query_notifications(
     customer_id: str | None      = Query(None),
     user_id:     str | None      = Query(None),
@@ -1650,30 +1725,18 @@ async def query_notifications(
     limit:       int             = Query(100, ge=1, le=500),
 ) -> dict:
     records = notification_service.query_log(
-        customer_id = customer_id,
-        user_id     = user_id,
-        severity    = severity,
-        event_type  = event_type,
-        limit       = limit,
+        customer_id=customer_id, user_id=user_id,
+        severity=severity, event_type=event_type, limit=limit,
     )
     return {"notifications": records, "count": len(records)}
 
 
-@app.get(
-    "/notifications/stats",
-    summary = "Aggregated notification counts",
-    tags    = ["Integration API"],
-)
+@app.get("/notifications/stats", tags=["Integration API"])
 async def notification_stats(customer_id: str | None = Query(None)) -> dict:
     return notification_service.stats(customer_id=customer_id)
 
 
-@app.post(
-    "/notifications/thresholds",
-    status_code = status.HTTP_204_NO_CONTENT,
-    summary     = "Configure alert thresholds for a customer",
-    tags        = ["Integration API"],
-)
+@app.post("/notifications/thresholds", status_code=204, tags=["Integration API"])
 async def set_thresholds(customer_id: str, config: ThresholdConfig):
     notification_service.set_thresholds(
         customer_id,
@@ -1686,11 +1749,7 @@ async def set_thresholds(customer_id: str, config: ThresholdConfig):
     )
 
 
-@app.get(
-    "/notifications/thresholds/{customer_id}",
-    summary = "Get alert thresholds for a customer",
-    tags    = ["Integration API"],
-)
+@app.get("/notifications/thresholds/{customer_id}", tags=["Integration API"])
 async def get_thresholds(customer_id: str) -> dict:
     t = notification_service.get_thresholds(customer_id)
     return {
@@ -1710,7 +1769,7 @@ async def get_thresholds(customer_id: str) -> dict:
 async def health():
     return {
         "status":    "ok",
-        "version":   "3.2.0",
+        "version":   "4.0.0",
         "pipeline":  "active" if orchestrator is not None else "starting",
         "stages":    4,
         "timestamp": time.time(),

@@ -9,16 +9,16 @@
  */
 import * as tf from '@tensorflow/tfjs'
 
-// ── Constants ──────────────────────────────────────────────────────────────
-const CNN_SEQ_LEN   = 50
-const CNN_FEATURES  = 8   // expanded: dwell, flight, speed, jitter, accel, rhythm, pressure_proxy, pause
-const LATENT_DIM    = 32
-const EREC_THRESH   = 0.18
-const PROFILE_WIN   = 200 // rolling window for per-user profile update
-const DRIFT_ALPHA   = 0.05 // EMA coefficient for profile smoothing
-const FEAT_K        = 6   // top-K features selected per user
+// ── Constants ─────────────────────────────────────────────────────────────────
+const CNN_SEQ_LEN  = 50
+const CNN_FEATURES = 8   // dwell, flight, speed, jitter, accel, rhythm, pressure_proxy, pause
+const LATENT_DIM   = 32
+const EREC_THRESH  = 0.18
+const PROFILE_WIN  = 200  // rolling window for per-user profile update
+const DRIFT_ALPHA  = 0.05 // EMA coefficient for profile smoothing
+const FEAT_K       = 6    // top-K features selected per user
 
-// ── Zipf Entropy ─────────────────────────────────────────────────────────────
+// ── Zipf Entropy ──────────────────────────────────────────────────────────────
 export function computeExpectationEntropy(password) {
   if (!password) return 0
   const freq = {}
@@ -36,34 +36,31 @@ export function computeExpectationEntropy(password) {
 
 // ── Feature Names (8 dimensions) ─────────────────────────────────────────────
 export const FEATURE_NAMES = [
-  'dwell_norm',      // key press duration
-  'flight_norm',     // inter-key gap
-  'speed_norm',      // pointer speed
-  'jitter_norm',     // pointer micro-tremor
-  'accel_norm',      // pointer acceleration magnitude
-  'rhythm_norm',     // keystroke rhythm consistency (CV of dwell)
-  'pause_norm',      // long pauses between bursts
-  'bigram_norm',     // common bigram dwell ratio
+  'dwell_norm',   // key press duration
+  'flight_norm',  // inter-key gap
+  'speed_norm',   // pointer speed
+  'jitter_norm',  // pointer micro-tremor
+  'accel_norm',   // pointer acceleration magnitude
+  'rhythm_norm',  // keystroke rhythm consistency (CV of dwell)
+  'pause_norm',   // long pauses between bursts
+  'bigram_norm',  // common bigram dwell ratio
 ]
 
 // ── Per-User Feature Selector ─────────────────────────────────────────────────
 /**
  * Tracks per-user feature variance and selects the K most discriminative
  * features based on coefficient of variation (high CV = high signal).
- * Updated online using an exponential moving average.
+ * Updated online using Welford's algorithm.
  */
 export class UserFeatureSelector {
   constructor(k = FEAT_K) {
-    this.k = k
-    this.means   = new Float32Array(CNN_FEATURES).fill(0.5)
-    this.m2s     = new Float32Array(CNN_FEATURES).fill(0.1)  // variance accumulator
-    this.n       = 0
-    this._selected = Array.from({ length: CNN_FEATURES }, (_, i) => i) // initial: all
+    this.k         = k
+    this.means     = new Float32Array(CNN_FEATURES).fill(0.5)
+    this.m2s       = new Float32Array(CNN_FEATURES).fill(0.1)
+    this.n         = 0
+    this._selected = Array.from({ length: CNN_FEATURES }, (_, i) => i)
   }
 
-  /**
-   * Welford online update of mean + variance per feature
-   */
   update(featureVec) {
     this.n++
     for (let i = 0; i < CNN_FEATURES; i++) {
@@ -72,7 +69,6 @@ export class UserFeatureSelector {
       const delta2 = featureVec[i] - this.means[i]
       this.m2s[i]  += delta * delta2
     }
-    // Recompute selected features every 20 observations
     if (this.n % 20 === 0) this._reselect()
   }
 
@@ -80,42 +76,38 @@ export class UserFeatureSelector {
     const cvs = Array.from({ length: CNN_FEATURES }, (_, i) => {
       const variance = this.n > 1 ? this.m2s[i] / (this.n - 1) : 0
       const std = Math.sqrt(variance)
-      return this.means[i] > 0 ? std / this.means[i] : 0 // CV
+      return this.means[i] > 0 ? std / this.means[i] : 0
     })
-    // Top-K by CV
     this._selected = cvs
       .map((cv, i) => ({ cv, i }))
       .sort((a, b) => b.cv - a.cv)
       .slice(0, this.k)
       .map(x => x.i)
-      .sort((a, b) => a - b) // keep original order
+      .sort((a, b) => a - b)
   }
 
   get selectedIndices() { return this._selected }
 
-  /**
-   * Return only the selected feature subset from a full vector
-   */
   project(featureVec) {
     return this._selected.map(i => featureVec[i])
   }
 
   toJSON() {
     return {
-      means: Array.from(this.means),
-      m2s:   Array.from(this.m2s),
-      n:     this.n,
+      means:    Array.from(this.means),
+      m2s:      Array.from(this.m2s),
+      n:        this.n,
       selected: this._selected,
     }
   }
 
   static fromJSON(obj) {
     if (!obj) return new UserFeatureSelector()
-    const sel = new UserFeatureSelector()
-    sel.means    = new Float32Array(obj.means)
-    sel.m2s      = new Float32Array(obj.m2s)
-    sel.n        = obj.n
-    sel._selected = obj.selected
+    const sel      = new UserFeatureSelector()
+    sel.means      = new Float32Array(obj.means)
+    sel.m2s        = new Float32Array(obj.m2s)
+    sel.n          = obj.n
+    sel._selected  = obj.selected
     return sel
   }
 }
@@ -127,17 +119,13 @@ export class UserFeatureSelector {
  */
 export class UserBehavioralProfile {
   constructor() {
-    this.emaProfile  = null           // Float32Array of CNN_FEATURES
-    this.emaVariance = null           // Float32Array — rolling variance
-    this.sampleCount = 0
-    this.driftHistory = []            // last 100 drift scores
+    this.emaProfile   = null
+    this.emaVariance  = null
+    this.sampleCount  = 0
+    this.driftHistory = []
     this.lastDrift    = 0
   }
 
-  /**
-   * Update EMA profile with new feature vector.
-   * Returns drift score relative to current profile.
-   */
   update(featureVec) {
     const vec = Float32Array.from(featureVec)
 
@@ -150,31 +138,25 @@ export class UserBehavioralProfile {
 
     this.sampleCount++
     const alpha = DRIFT_ALPHA
-
-    // Compute per-feature deviation before updating profile
     let drift = 0
+
     for (let i = 0; i < CNN_FEATURES; i++) {
       const diff = vec[i] - this.emaProfile[i]
       const std  = Math.sqrt(this.emaVariance[i]) + 1e-6
       drift += (diff / std) ** 2
-      // EMA update
       this.emaProfile[i]  = (1 - alpha) * this.emaProfile[i]  + alpha * vec[i]
       this.emaVariance[i] = (1 - alpha) * this.emaVariance[i] + alpha * diff * diff
     }
-    drift = Math.sqrt(drift / CNN_FEATURES) // normalized Mahalanobis-lite
+    drift = Math.sqrt(drift / CNN_FEATURES)
 
     this.lastDrift = drift
     this.driftHistory.push(drift)
     if (this.driftHistory.length > 100) this.driftHistory.shift()
 
-    console.log(`[BehavioralProfile] Updated drift: ${drift.toFixed(3)}, sampleCount: ${this.sampleCount}`)
+    console.log(`[BehavioralProfile] drift=${drift.toFixed(3)}, sampleCount=${this.sampleCount}`)
     return drift
   }
 
-  /**
-   * Baseline drift threshold: mean + 2σ of observed drift history.
-   * Adapts per-user over time.
-   */
   get adaptiveThreshold() {
     if (this.driftHistory.length < 10) return EREC_THRESH * 10
     const mean = this.driftHistory.reduce((s, v) => s + v, 0) / this.driftHistory.length
@@ -190,7 +172,7 @@ export class UserBehavioralProfile {
 
   toJSON() {
     return {
-      emaProfile:   this.emaProfile ? Array.from(this.emaProfile) : null,
+      emaProfile:   this.emaProfile  ? Array.from(this.emaProfile)  : null,
       emaVariance:  this.emaVariance ? Array.from(this.emaVariance) : null,
       sampleCount:  this.sampleCount,
       driftHistory: this.driftHistory,
@@ -210,15 +192,15 @@ export class UserBehavioralProfile {
   }
 }
 
-// ── Keyboard Collector (expanded) ─────────────────────────────────────────────
+// ── Keyboard Collector ────────────────────────────────────────────────────────
 export class KeyboardCollector {
   constructor() {
-    this._events    = []
-    this._keyDownTs = {}
-    this._lastKeyUp = null
-    this._bigramTs  = {}   // bigram dwell tracking
+    this._events     = []
+    this._keyDownTs  = {}
+    this._lastKeyUp  = null
+    this._bigramTs   = {}
     this._burstStart = null
-    this._pauses    = []
+    this._pauses     = []
   }
 
   start(target = document) {
@@ -235,18 +217,17 @@ export class KeyboardCollector {
       const now  = performance.now()
       const down = this._keyDownTs[e.code]
       if (down === undefined) return
-      const dwell  = now - down
-        const flight = this._lastKeyUp !== null ? Math.max(0, down - this._lastKeyUp) : 0
-      // Bigram: track pair with previous key
-      const prevCode = this._lastCode
-      this._lastCode = e.code
-      const bigramKey = prevCode ? `${prevCode}>${e.code}` : null
-      const avgBigram = this._getAvgBigram()
+      const dwell      = now - down
+      const flight     = this._lastKeyUp !== null ? Math.max(0, down - this._lastKeyUp) : 0
+      const prevCode   = this._lastCode
+      this._lastCode   = e.code
+      const bigramKey  = prevCode ? `${prevCode}>${e.code}` : null
       const bigramRatio = bigramKey && this._bigramTs[bigramKey]
         ? dwell / Math.max(this._bigramTs[bigramKey], 1)
         : 1.0
-      if (bigramKey) this._bigramTs[bigramKey] = dwell * 0.8 + (this._bigramTs[bigramKey] || dwell) * 0.2
-
+      if (bigramKey) {
+        this._bigramTs[bigramKey] = dwell * 0.8 + (this._bigramTs[bigramKey] || dwell) * 0.2
+      }
       this._events.push({ dwell, flight, ts: now, bigramRatio })
       if (this._events.length > 300) this._events.shift()
       this._lastKeyUp = now
@@ -265,13 +246,12 @@ export class KeyboardCollector {
     return vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : 100
   }
 
-  /** Coefficient of variation of dwell — rhythm consistency */
   getRhythm() {
     const dwells = this._events.slice(-20).map(e => e.dwell)
     if (dwells.length < 3) return 0
     const mean = dwells.reduce((s, v) => s + v, 0) / dwells.length
     const std  = Math.sqrt(dwells.reduce((s, v) => s + (v - mean) ** 2, 0) / dwells.length)
-    return mean > 0 ? Math.min(std / mean, 2) / 2 : 0 // CV normalized to [0,1]
+    return mean > 0 ? Math.min(std / mean, 2) / 2 : 0
   }
 
   getAvgPause() {
@@ -296,7 +276,7 @@ export class KeyboardCollector {
   clear() { this._events = []; this._pauses = [] }
 }
 
-// ── Pointer Collector (expanded) ──────────────────────────────────────────────
+// ── Pointer Collector ─────────────────────────────────────────────────────────
 export class PointerCollector {
   constructor() {
     this._samples = []
@@ -323,11 +303,18 @@ export class PointerCollector {
     const vx = (x - this._prev.x) / dt
     const vy = (y - this._prev.y) / dt
     let ax = 0, ay = 0
-    if (this._prevV) { ax = (vx - this._prevV.vx) / dt; ay = (vy - this._prevV.vy) / dt }
+    if (this._prevV) {
+      ax = (vx - this._prevV.vx) / dt
+      ay = (vy - this._prevV.vy) / dt
+    }
     const jitter = this._prevV
       ? Math.sqrt((vx - this._prevV.vx) ** 2 + (vy - this._prevV.vy) ** 2) : 0
     const accel = Math.sqrt(ax * ax + ay * ay)
-    this._samples.push({ vx, vy, ax, ay, jitter, accel, speed: Math.sqrt(vx*vx+vy*vy), ts: now })
+    this._samples.push({
+      vx, vy, ax, ay, jitter, accel,
+      speed: Math.sqrt(vx * vx + vy * vy),
+      ts: now,
+    })
     if (this._samples.length > 500) this._samples.shift()
     this._prevV = { vx, vy }
     this._prev  = { x, y, t: now }
@@ -347,13 +334,11 @@ export class PointerCollector {
   }
 }
 
-// ── Feature Vector Builder (8-dim) ───────────────────────────────────────────
+// ── Feature Vector Builder (8-dim) ────────────────────────────────────────────
 export function buildFeatureVector(keyEvents, pointerEvents, keyboard) {
   const kStats = keyboard.getStats()
-  const seq    = CNN_SEQ_LEN
   const feats  = new Float32Array(CNN_FEATURES)
 
-  // Aggregate from windows
   if (keyEvents.length) {
     const avgDwell  = keyEvents.reduce((s, e) => s + e.dwell,  0) / keyEvents.length
     const avgFlight = keyEvents.reduce((s, e) => s + e.flight, 0) / keyEvents.length
@@ -370,8 +355,9 @@ export function buildFeatureVector(keyEvents, pointerEvents, keyboard) {
   }
   feats[5] = kStats.rhythm || 0
   feats[6] = Math.min((kStats.avgPause || 0) / 3000, 1)
-  // Bigram ratio: average across recent events
-  const bigramRatios = keyEvents.filter(e => e.bigramRatio !== undefined).map(e => e.bigramRatio)
+  const bigramRatios = keyEvents
+    .filter(e => e.bigramRatio !== undefined)
+    .map(e => e.bigramRatio)
   feats[7] = bigramRatios.length
     ? Math.min(bigramRatios.reduce((s, v) => s + v, 0) / bigramRatios.length / 2, 1)
     : 0.5
@@ -386,8 +372,8 @@ export function buildCNNInput(keyEvents, pointerEvents, keyboard) {
   for (let i = 0; i < seq; i++) {
     const ke = keyEvents[i]     || { dwell: 0, flight: 0, bigramRatio: 0.5 }
     const pe = pointerEvents[i] || { speed: 0, jitter: 0, accel: 0 }
-    data[i * CNN_FEATURES + 0] = Math.min(ke.dwell  / 300, 1)
-    data[i * CNN_FEATURES + 1] = Math.min(ke.flight / 500, 1)
+    data[i * CNN_FEATURES + 0] = Math.min(ke.dwell  / 300,  1)
+    data[i * CNN_FEATURES + 1] = Math.min(ke.flight / 500,  1)
     data[i * CNN_FEATURES + 2] = Math.min(pe.speed  / 2000, 1)
     data[i * CNN_FEATURES + 3] = Math.min(pe.jitter / 100,  1)
     data[i * CNN_FEATURES + 4] = Math.min(pe.accel  / 5000, 1)
@@ -433,7 +419,7 @@ export function buildAutoencoder(inputDim = CNN_SEQ_LEN * CNN_FEATURES) {
   return { autoencoder, encoder }
 }
 
-// ── Session Watchdog (per-user profile aware) ─────────────────────────────────
+// ── Session Watchdog ──────────────────────────────────────────────────────────
 export class SessionWatchdog {
   constructor(autoencoder, encoder, onAnomaly) {
     this._ae        = autoencoder
@@ -446,10 +432,8 @@ export class SessionWatchdog {
   }
 
   async anchorIdentity(vectors) {
-    // Fit autoencoder baseline on anchor vectors (fine-tune a few steps)
     if (vectors.length < 3) return
-    const tensors = vectors.map(v => tf.tensor2d([v], [1, v.length]))
-    // Just record baseline reconstruction error
+    const tensors  = vectors.map(v => tf.tensor2d([v], [1, v.length]))
     const baseline = await Promise.all(
       tensors.map(async t => {
         const r = this._ae.predict(t)
@@ -459,25 +443,23 @@ export class SessionWatchdog {
       })
     )
     this._baselineERec = baseline.reduce((s, v) => s + v, 0) / baseline.length
-    this._timer = setInterval(() => {}, 30_000) // placeholder — fed externally
+    this._timer = setInterval(() => {}, 30_000)
   }
 
   stop() { if (this._timer) clearInterval(this._timer) }
 
   async check(vector, behavioralProfile) {
-    const t = tf.tensor2d([vector], [1, vector.length])
-    const r = this._ae.predict(t)
+    const t    = tf.tensor2d([vector], [1, vector.length])
+    const r    = this._ae.predict(t)
     const eRec = (await tf.losses.meanSquaredError(t.flatten(), r.flatten()).data())[0]
     t.dispose(); r.dispose()
     this.lastERec = eRec
 
-    // Per-user threshold from behavioral profile adaptive threshold
     const threshold = behavioralProfile
       ? Math.min(behavioralProfile.adaptiveThreshold * 0.05, EREC_THRESH * 1.5)
       : EREC_THRESH
 
-    this.lastDrift = behavioralProfile?.lastDrift ?? 0
-
+    this.lastDrift  = behavioralProfile?.lastDrift ?? 0
     const isAnomaly = eRec > threshold || (behavioralProfile?.isDrifting ?? false)
 
     if (isAnomaly) {
@@ -491,20 +473,20 @@ export class SessionWatchdog {
   }
 }
 
-// ── Per-User Profile Persistence (localStorage) ───────────────────────────────
-const PROFILE_PREFIX = 'ep_bioprofile_'
+// ── Per-User Profile Persistence ──────────────────────────────────────────────
+const PROFILE_PREFIX  = 'ep_bioprofile_'
 const SELECTOR_PREFIX = 'ep_featsel_'
 
 export function saveUserProfile(userId, profile, selector) {
   try {
-    localStorage.setItem(PROFILE_PREFIX + userId, JSON.stringify(profile.toJSON()))
+    localStorage.setItem(PROFILE_PREFIX  + userId, JSON.stringify(profile.toJSON()))
     localStorage.setItem(SELECTOR_PREFIX + userId, JSON.stringify(selector.toJSON()))
   } catch {}
 }
 
 export function loadUserProfile(userId) {
   try {
-    const profileData  = JSON.parse(localStorage.getItem(PROFILE_PREFIX + userId))
+    const profileData  = JSON.parse(localStorage.getItem(PROFILE_PREFIX  + userId))
     const selectorData = JSON.parse(localStorage.getItem(SELECTOR_PREFIX + userId))
     return {
       profile:  UserBehavioralProfile.fromJSON(profileData),
@@ -530,9 +512,9 @@ export class EntropyPrimeClient {
     this._ready    = false
     this._onUpdate = null
     // Per-user state
-    this._userId   = null
-    this.behavioralProfile  = new UserBehavioralProfile()
-    this.featureSelector    = new UserFeatureSelector()
+    this._userId             = null
+    this.behavioralProfile   = new UserBehavioralProfile()
+    this.featureSelector     = new UserFeatureSelector()
     this._featureSampleCount = 0
   }
 
@@ -571,7 +553,6 @@ export class EntropyPrimeClient {
       this.theta = (await s.data())[0]
       t.dispose(); s.dispose()
 
-      // Update per-user feature profile
       const featureVec = buildFeatureVector(
         this.keyboard.getWindow(), this.pointer.getWindow(), this.keyboard
       )
@@ -579,17 +560,20 @@ export class EntropyPrimeClient {
       const drift = this.behavioralProfile.update(Array.from(featureVec))
       this._featureSampleCount++
 
-      console.log(`[LiveEval] theta=${this.theta.toFixed(3)}, drift=${drift.toFixed(3)}, samples=${this._featureSampleCount}`)
+      console.log(
+        `[LiveEval] theta=${this.theta.toFixed(3)}, ` +
+        `drift=${drift.toFixed(3)}, samples=${this._featureSampleCount}`
+      )
 
       this._onUpdate?.({
-        type: 'score',
-        theta: this.theta,
+        type:             'score',
+        theta:            this.theta,
         drift,
         selectedFeatures: this.featureSelector.selectedIndices,
-        featureNames: this.featureSelector.selectedIndices.map(i => FEATURE_NAMES[i]),
+        featureNames:     this.featureSelector.selectedIndices.map(i => FEATURE_NAMES[i]),
       })
     } catch (e) {
-      console.error('Live eval error:', e)
+      console.error('[LiveEval] error:', e)
     }
   }
 
@@ -601,52 +585,34 @@ export class EntropyPrimeClient {
 
   async evaluate(password = '') {
     try {
-      const keyEvents = this.keyboard.getWindow(CNN_SEQ_LEN)
+      const keyEvents     = this.keyboard.getWindow(CNN_SEQ_LEN)
       const pointerEvents = this.pointer.getWindow(CNN_SEQ_LEN)
-      
-      // Need minimum events to produce valid tensor
+
       if (keyEvents.length < 5) {
         console.log('[evaluate] Not enough keyboard events:', keyEvents.length)
         return { theta: 0.5, hExp: 0.0 }
       }
-      
-      const t    = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
-      const s    = this.cnn.predict(t)
+
+      const t        = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
+      const s        = this.cnn.predict(t)
       const thetaRaw = (await s.data())[0]
       t.dispose(); s.dispose()
-      
-      // Validate theta is in valid range
+
       this.theta = isFinite(thetaRaw) ? Math.max(0, Math.min(1, thetaRaw)) : 0.5
       this.hExp  = computeExpectationEntropy(password)
-      
-      // Validate hExp
-      this.hExp = isFinite(this.hExp) ? Math.max(0, Math.min(1, this.hExp)) : 0.0
-      
+      this.hExp  = isFinite(this.hExp)  ? Math.max(0, Math.min(1, this.hExp))  : 0.0
+
       console.log(`[evaluate] theta=${this.theta.toFixed(3)}, hExp=${this.hExp.toFixed(3)}`)
       return { theta: this.theta, hExp: this.hExp }
     } catch (e) {
-      console.error('[evaluate] Error:', e)
+      console.error('[evaluate] error:', e)
       return { theta: 0.5, hExp: 0.0 }
     }
   }
 
-  async getLatentVector() {
-    const t    = buildCNNInput(
-      this.keyboard.getWindow(), this.pointer.getWindow(), this.keyboard
-    )
-    const flat = Array.from(t.dataSync())
-    t.dispose()
-    const enc  = this.watchdog?._enc
-    if (!enc) return Array(LATENT_DIM).fill(0)
-    const lt   = enc.predict(tf.tensor2d([flat], [1, flat.length]))
-    const vec  = Array.from(await lt.data())
-    lt.dispose()
-    return vec
-  }
-
   /**
    * Perform full biometric check with per-user profile drift detection.
-   * Used by watchdog heartbeat.
+   * Used by the watchdog heartbeat.
    */
   async checkIdentity() {
     const vec = await this.getLatentVector()
@@ -654,8 +620,9 @@ export class EntropyPrimeClient {
     return this.watchdog.check(vec, this.behavioralProfile)
   }
 
-  getKeyboardStats()     { return this.keyboard.getStats() }
-  getPointerStats()      { return this.pointer.getStats() }
+  getKeyboardStats() { return this.keyboard.getStats() }
+  getPointerStats()  { return this.pointer.getStats() }
+
   getProfileStats() {
     return {
       sampleCount:       this.behavioralProfile.sampleCount,
@@ -673,83 +640,75 @@ export class EntropyPrimeClient {
     this.pointer.stop()
     if (this._evalLoop) clearInterval(this._evalLoop)
     if (this._saveLoop) clearInterval(this._saveLoop)
-    if (this.watchdog) this.watchdog.stop()
+    if (this.watchdog)  this.watchdog.stop()
   }
 
   /**
    * Generates a 32-dim latent vector from current behavioral signals.
-   * Uses proper 8-channel CNN input with all biometric features.
+   * Uses the full 8-channel CNN input reshaped for the autoencoder encoder.
+   * Falls back to a small-noise random vector when there aren't enough events yet.
    */
   async getLatentVector() {
     try {
-      const keyEvents = this.keyboard.getWindow(CNN_SEQ_LEN)
+      const keyEvents     = this.keyboard.getWindow(CNN_SEQ_LEN)
       const pointerEvents = this.pointer.getWindow(CNN_SEQ_LEN)
-      
-      // Need minimum window to generate proper tensor
+
       if (keyEvents.length < 10) {
-        console.log('[getLatentVector] Not enough samples:', keyEvents.length, '- returning random vector')
-        const randomVec = new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
-        console.log('[getLatentVector] Random vector length:', randomVec.length)
-        return randomVec
+        console.log(
+          '[getLatentVector] Not enough samples:', keyEvents.length,
+          '— returning random vector'
+        )
+        return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
       }
-      
-      // Build CNN input tensor [1, 50, 8]
-      const tensor = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
-      
-      // Flatten to [1, 400] for autoencoder input
+
+      // Build [1, 50, 8] tensor then flatten to [1, 400] for the autoencoder
+      const tensor    = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
       const flattened = tensor.reshape([1, CNN_SEQ_LEN * CNN_FEATURES])
       tensor.dispose()
-      
-      // Use encoder to generate 32-dim latent vector
+
       const enc = this.watchdog?._enc
       if (!enc) {
         console.warn('[getLatentVector] Encoder not available')
         flattened.dispose()
         return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.1)
       }
-      
+
       const encoded = enc.predict(flattened)
-      const result = Array.from(await encoded.data())
-      
+      const result  = Array.from(await encoded.data())
       flattened.dispose()
       encoded.dispose()
-      
-      console.log('[getLatentVector] Generated vector length:', result.length, 'values:', result.slice(0, 5), '...')
-      
-      // Ensure exactly LATENT_DIM dimensions
+
+      console.log(
+        '[getLatentVector] vector length:', result.length,
+        'first 5:', result.slice(0, 5)
+      )
+
+      // Guard against unexpected encoder output length
       if (result.length !== LATENT_DIM) {
-        console.warn('[getLatentVector] Length mismatch! Expected', LATENT_DIM, 'got', result.length)
+        console.warn(
+          '[getLatentVector] length mismatch — expected', LATENT_DIM, 'got', result.length
+        )
         const padded = new Array(LATENT_DIM).fill(0)
         result.slice(0, LATENT_DIM).forEach((v, i) => { padded[i] = v })
         return padded
       }
-      
+
       return result
     } catch (e) {
-      console.error('[getLatentVector] Exception:', e)
-      const fallback = new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.05)
-      console.log('[getLatentVector] Returning fallback vector, length:', fallback.length)
-      return fallback
+      console.error('[getLatentVector] exception:', e)
+      return new Array(LATENT_DIM).fill(0).map(() => Math.random() * 0.05)
     }
   }
 
-  /**
-   * Get current biometric sample count for progress tracking
-   */
-  getSampleCount() {
-    return this._featureSampleCount
-  }
+  /** Total feature-profile ticks since the engine was started. */
+  getSampleCount() { return this._featureSampleCount }
 
-  /**
-   * Get keyboard event window size
-   */
-  getKeyboardEventCount() {
-    return this.keyboard._events.length
-  }
+  /** Raw keyboard event buffer size (useful for debugging minimum-event guards). */
+  getKeyboardEventCount() { return this.keyboard._events.length }
 }
 
+// ── Session Token Binder ──────────────────────────────────────────────────────
 /**
- * SessionTokenBinder
  * Cryptographically binds a backend session token to a biometric latent vector
  * to prevent token theft or replay across different biometric profiles.
  */
@@ -758,28 +717,19 @@ export class SessionTokenBinder {
     this.token = sessionToken
   }
 
-  /**
-   * Binds the token with the latent vector to create a composite verification key.
-   * Uses simple XOR-style binding for the frontend; backend performs HMAC validation.
-   */
   async bind(latentVector) {
     if (!latentVector || latentVector.length !== LATENT_DIM) {
       throw new Error('Invalid latent vector for binding')
     }
-    
-    // In prod, this would involve a subtle shifting of the token based on latent variance
-    // For now, we return the token with the latent vector attached for backend scoring
     return {
-      token: this.token,
-      binding: this._computeBinding(latentVector),
-      timestamp: Date.now()
+      token:     this.token,
+      binding:   this._computeBinding(latentVector),
+      timestamp: Date.now(),
     }
   }
 
   _computeBinding(latent) {
-    // Return a stable hash-like string from the high-variance latent features
     const sum = latent.reduce((a, b) => a + b, 0)
     return `lb_${sum.toFixed(4)}_${latent[0].toFixed(2)}`
   }
 }
-

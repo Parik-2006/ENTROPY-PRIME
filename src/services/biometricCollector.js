@@ -1,195 +1,224 @@
 /**
  * BiometricCollector Service
  * ===========================
- * Manages biometric sample collection, pattern aggregation, and persistence.
- * 
- * Architecture:
- *  - Collects individual keystroke/pointer samples in real-time
- *  - Aggregates samples into patterns (min 10-20 samples = 1 pattern)
- *  - Syncs patterns to backend for storage in MongoDB
- *  - Tracks sample count towards 50-sample stability target
- *  - Provides progress updates and drift monitoring
+ * Single source of truth for biometric sample collection progress.
+ *
+ * Design contract:
+ *  - addSample()          → accumulates raw keystroke metrics in-memory
+ *  - aggregatePattern()   → converts buffer → pattern (local only, not persisted)
+ *  - markPersisted(n)     → called by ProfileBuildPage ONLY after a successful
+ *                           backend syncBiometricProfile() response; increments
+ *                           persistedSamples so the UI can distinguish "collected"
+ *                           from "actually saved to backend"
+ *  - getState()           → { collectedSamples, persistedSamples, isStable, ... }
+ *
+ * The UI must never show a sample as "stable" until persistedSamples >= targetSamples.
  */
 
 export class BiometricCollector {
   constructor(options = {}) {
-    this.minSamplesPerPattern = options.minSamplesPerPattern || 15;
-    this.targetSamples = options.targetSamples || 50;
-    this.debounceMs = options.debounceMs || 1500;
+    this.minSamplesPerPattern = options.minSamplesPerPattern || 15
+    this.targetSamples        = options.targetSamples        || 50
+    this.debounceMs           = options.debounceMs           || 1500
 
-    this.samples = [];
-    this.patterns = [];
-    this.totalSamples = 0;
-    this.isStable = false;
-    this.lastSyncTime = null;
-    this.debounceTimer = null;
+    // In-memory buffer of raw samples not yet aggregated into a pattern
+    this._pendingSamples = []
+    // Aggregated patterns (local, may or may not be persisted yet)
+    this._patterns = []
+    // Total samples that have been aggregated into patterns (local)
+    this.collectedSamples = 0
+    // Samples confirmed written to the backend (set via markPersisted)
+    this.persistedSamples = 0
+
+    this.debounceTimer = null
   }
 
+  // ── Sample ingestion ─────────────────────────────────────────────────────
+
   /**
-   * Add a single biometric sample (keystroke or pointer event)
+   * Add a single biometric sample.
+   * Auto-aggregates into a pattern once minSamplesPerPattern is reached.
+   * Returns current state snapshot.
    */
   addSample(sample) {
-    if (!sample || typeof sample !== 'object') return;
+    if (!sample || typeof sample !== 'object') return this.getState()
 
-    const enrichedSample = {
-      timestamp: Date.now(),
-      ...sample,
-    };
+    this._pendingSamples.push({ timestamp: Date.now(), ...sample })
 
-    this.samples.push(enrichedSample);
-    
-    // Auto-aggregate when we hit min samples
-    if (this.samples.length >= this.minSamplesPerPattern) {
-      this.aggregatePattern();
+    if (this._pendingSamples.length >= this.minSamplesPerPattern) {
+      this.aggregatePattern()
     }
 
-    return {
-      sampleCount: this.totalSamples,
-      isStable: this.isStable,
-      progress: this.totalSamples / this.targetSamples,
-    };
+    return this.getState()
   }
 
   /**
-   * Aggregate current samples into a pattern and clear the sample buffer
+   * Flush pending samples into a pattern regardless of buffer size.
+   * Called before a sync to ensure nothing is left in the buffer.
+   */
+  flushPending() {
+    if (this._pendingSamples.length >= 3) {
+      this.aggregatePattern()
+    }
+  }
+
+  /**
+   * Aggregate current pending buffer into a stored pattern.
    */
   aggregatePattern() {
-    if (this.samples.length === 0) return null;
+    if (this._pendingSamples.length === 0) return null
 
     const pattern = {
-      patternId: `pattern_${Date.now()}`,
-      sampleCount: this.samples.length,
+      patternId:    `pattern_${Date.now()}_${this._patterns.length}`,
+      sampleCount:  this._pendingSamples.length,
       aggregatedAt: Date.now(),
-      stats: this.computeStatistics(),
-      samples: [...this.samples], // Keep last N for later analysis
-    };
-
-    this.patterns.push(pattern);
-    this.totalSamples += this.samples.length;
-    this.samples = []; // Clear buffer
-
-    // Check stability
-    this.isStable = this.totalSamples >= this.targetSamples;
-
-    console.log(
-      `[BiometricCollector] Pattern aggregated: ${pattern.sampleCount} samples, ` +
-      `Total: ${this.totalSamples}/${this.targetSamples}, Stable: ${this.isStable}`
-    );
-
-    return pattern;
-  }
-
-  /**
-   * Compute statistics from all collected patterns
-   */
-  computeStatistics() {
-    const allSamples = this.patterns.flatMap(p => p.samples || []).concat(this.samples);
-    
-    if (allSamples.length === 0) {
-      return {
-        avgDwell: 0,
-        avgFlight: 0,
-        avgSpeed: 0,
-        avgJitter: 0,
-        avgAccel: 0,
-        rhythm: 0,
-      };
+      stats:        this._computeStatsFromSamples(this._pendingSamples),
+      // Keep a shallow copy for later analysis; trim to avoid memory bloat
+      samples:      this._pendingSamples.slice(-20),
     }
 
-    const extract = (key) => allSamples.map(s => s[key] || 0).filter(v => v > 0);
+    this._patterns.push(pattern)
+    this.collectedSamples += this._pendingSamples.length
+    this._pendingSamples = []
 
-    const avg = (values) => values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+    console.log(
+      `[BiometricCollector] Pattern aggregated: ${pattern.sampleCount} samples | ` +
+      `collected=${this.collectedSamples} persisted=${this.persistedSamples}/${this.targetSamples}`
+    )
 
-    return {
-      avgDwell: avg(extract('dwell')),
-      avgFlight: avg(extract('flight')),
-      avgSpeed: avg(extract('speed')),
-      avgJitter: avg(extract('jitter')),
-      avgAccel: avg(extract('accel')),
-      rhythm: avg(extract('rhythm')),
-      pauseFreq: avg(extract('pause')),
-    };
+    return pattern
   }
 
+  // ── Persistence tracking ─────────────────────────────────────────────────
+
   /**
-   * Get current collection state for UI display
+   * Called by ProfileBuildPage AFTER a successful syncBiometricProfile() API call.
+   * n = number of new samples that were included in that sync payload.
+   */
+  markPersisted(n) {
+    if (typeof n !== 'number' || n <= 0) return
+    this.persistedSamples = Math.min(this.persistedSamples + n, this.collectedSamples)
+    console.log(
+      `[BiometricCollector] markPersisted(${n}) → persistedSamples=${this.persistedSamples}/${this.targetSamples}`
+    )
+  }
+
+  // ── State ────────────────────────────────────────────────────────────────
+
+  /**
+   * Returns a snapshot of collection state for the UI.
+   * isStable is ONLY true once persistedSamples >= targetSamples.
    */
   getState() {
+    const isStable = this.persistedSamples >= this.targetSamples
     return {
-      sampleCount: this.totalSamples,
-      patternCount: this.patterns.length,
-      isStable: this.isStable,
-      progress: this.totalSamples / this.targetSamples,
-      pendingSamples: this.samples.length,
-      lastPattern: this.patterns[this.patterns.length - 1] || null,
-      stats: this.computeStatistics(),
-    };
+      collectedSamples: this.collectedSamples,
+      persistedSamples: this.persistedSamples,
+      targetSamples:    this.targetSamples,
+      patternCount:     this._patterns.length,
+      pendingSamples:   this._pendingSamples.length,
+      isStable,
+      // Progress based on persisted (confirmed) samples only
+      progress:         Math.min(this.persistedSamples / this.targetSamples, 1),
+      lastPattern:      this._patterns[this._patterns.length - 1] || null,
+      stats:            this._computeAllStats(),
+    }
   }
 
-  /**
-   * Prepare payload for backend sync
-   */
-  getPersistencePayload(theta, hExp, latentVector, profileStats) {
-    return {
-      theta,
-      h_exp: hExp,
-      latent_vector: latentVector || [],
-      keyboard_stats: {
-        avgDwell: this.computeStatistics().avgDwell,
-        avgFlight: this.computeStatistics().avgFlight,
-        rhythm: this.computeStatistics().rhythm,
-        avgPause: this.computeStatistics().pauseFreq,
-      },
-      pointer_stats: {
-        avgSpeed: this.computeStatistics().avgSpeed,
-        avgJitter: this.computeStatistics().avgJitter,
-        avgAccel: this.computeStatistics().avgAccel,
-      },
-      profile_stats: {
-        sampleCount: this.totalSamples,
-        patternCount: this.patterns.length,
-        selectedFeatures: profileStats?.selectedFeatures || [],
-        featureMeans: profileStats?.featureMeans || [],
-        emaProfile: profileStats?.emaProfile,
-        emaVariance: profileStats?.emaVariance,
-      },
-    };
-  }
+  // ── Payload building ─────────────────────────────────────────────────────
 
   /**
-   * Reset collector (logout, new profile, etc.)
+   * Build the payload for syncBiometricProfile().
+   * Also returns samplesInPayload so the caller knows how many to markPersisted.
    */
+  buildSyncPayload(theta, hExp, latentVector, engineProfileStats) {
+    // Flush any pending samples into the last pattern first
+    this.flushPending()
+
+    const stats            = this._computeAllStats()
+    const samplesInPayload = this.collectedSamples - this.persistedSamples
+
+    return {
+      payload: {
+        theta,
+        h_exp:         hExp,
+        latent_vector: latentVector ?? [],
+        keyboard_stats: {
+          avgDwell:  stats.avgDwell,
+          avgFlight: stats.avgFlight,
+          rhythm:    stats.rhythm,
+          avgPause:  stats.pauseFreq,
+        },
+        pointer_stats: {
+          avgSpeed:  stats.avgSpeed,
+          avgJitter: stats.avgJitter,
+          avgAccel:  stats.avgAccel,
+        },
+        profile_stats: {
+          sampleCount:      this.collectedSamples,
+          persistedSamples: this.persistedSamples,
+          patternCount:     this._patterns.length,
+          selectedFeatures: engineProfileStats?.selectedFeatures || [],
+          featureMeans:     engineProfileStats?.featureMeans     || [],
+          emaProfile:       engineProfileStats?.emaProfile,
+          emaVariance:      engineProfileStats?.emaVariance,
+        },
+      },
+      samplesInPayload: Math.max(samplesInPayload, 0),
+    }
+  }
+
+  // ── Internals ────────────────────────────────────────────────────────────
+
+  _computeStatsFromSamples(samples) {
+    if (!samples.length) return this._zeroStats()
+    const extract = key => samples.map(s => s[key] || 0).filter(v => v > 0)
+    const avg     = vals => vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0
+    return {
+      avgDwell:  avg(extract('dwell')),
+      avgFlight: avg(extract('flight')),
+      avgSpeed:  avg(extract('speed')),
+      avgJitter: avg(extract('jitter')),
+      avgAccel:  avg(extract('accel')),
+      rhythm:    avg(extract('rhythm')),
+      pauseFreq: avg(extract('pause')),
+    }
+  }
+
+  _computeAllStats() {
+    const allSamples = [
+      ...this._patterns.flatMap(p => p.samples || []),
+      ...this._pendingSamples,
+    ]
+    return allSamples.length ? this._computeStatsFromSamples(allSamples) : this._zeroStats()
+  }
+
+  _zeroStats() {
+    return { avgDwell: 0, avgFlight: 0, avgSpeed: 0, avgJitter: 0, avgAccel: 0, rhythm: 0, pauseFreq: 0 }
+  }
+
+  // ── Lifecycle ────────────────────────────────────────────────────────────
+
   reset() {
-    this.samples = [];
-    this.patterns = [];
-    this.totalSamples = 0;
-    this.isStable = false;
-    if (this.debounceTimer) clearTimeout(this.debounceTimer);
-  }
-
-  /**
-   * Get pending samples before they're aggregated
-   */
-  getPendingSamples() {
-    return [...this.samples];
+    this._pendingSamples  = []
+    this._patterns        = []
+    this.collectedSamples = 0
+    this.persistedSamples = 0
+    if (this.debounceTimer) clearTimeout(this.debounceTimer)
+    this.debounceTimer = null
   }
 }
 
-/**
- * Create a singleton instance
- */
-let collectorInstance = null;
+// ── Singleton ────────────────────────────────────────────────────────────────
+
+let _instance = null
 
 export function getBiometricCollector(options) {
-  if (!collectorInstance) {
-    collectorInstance = new BiometricCollector(options);
-  }
-  return collectorInstance;
+  if (!_instance) _instance = new BiometricCollector(options)
+  return _instance
 }
 
 export function resetBiometricCollector() {
-  if (collectorInstance) {
-    collectorInstance.reset();
-  }
-  collectorInstance = null;
+  if (_instance) _instance.reset()
+  _instance = null
 }

@@ -23,23 +23,19 @@ async function req(path, method = 'GET', body = null) {
   const url = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) + path : BACKEND_URL + path
   const res  = await fetch(url, opts)
   const data = await res.json()
+
   if (!res.ok) {
-    // Format error message
     let errorMsg = data.detail || `API error ${res.status}`
-    
-    // If detail is an array of validation errors
     if (Array.isArray(data.detail)) {
-      errorMsg = data.detail.map(err => {
-        if (err.msg) return `${err.loc?.join('.')}: ${err.msg}`
-        return JSON.stringify(err)
-      }).join('; ')
+      errorMsg = data.detail.map(err =>
+        err.msg ? `${err.loc?.join('.')}: ${err.msg}` : JSON.stringify(err)
+      ).join('; ')
     }
-    
     console.error(`[API] ${res.status} ${path}:`, {
-      status: res.status,
-      detail: data.detail,
+      status:       res.status,
+      detail:       data.detail,
       errorMsg,
-      fullResponse: data
+      fullResponse: data,
     })
     throw new Error(errorMsg)
   }
@@ -74,11 +70,11 @@ export async function submitScore({ theta, hExp, latentVector, userAgent, server
     latent_vector: latentVector ?? [],
   }
   console.log('[submitScore] Payload:', {
-    theta: payload.theta,
-    h_exp: payload.h_exp,
-    latent_vector_len: payload.latent_vector.length,
-    latent_vector_valid: payload.latent_vector.length === 0 || payload.latent_vector.length === 32,
-    server_load: payload.server_load,
+    theta:                payload.theta,
+    h_exp:                payload.h_exp,
+    latent_vector_len:    payload.latent_vector.length,
+    latent_vector_valid:  payload.latent_vector.length === 0 || payload.latent_vector.length === 32,
+    server_load:          payload.server_load,
   })
   return req('/score', 'POST', payload)
 }
@@ -99,14 +95,14 @@ export async function syncBiometricProfile({
 } = {}) {
   return req('/biometric/profile', 'POST', {
     theta,
-    h_exp: hExp,
-    latent_vector: latentVector ?? [],
-    practice_text: practiceText ?? '',
+    h_exp:          hExp,
+    latent_vector:  latentVector  ?? [],
+    practice_text:  practiceText  ?? '',
     keyboard_stats: keyboardStats ?? {},
-    pointer_stats: pointerStats ?? {},
-    profile_stats: profileStats ?? {},
-    live_drift: liveDrift,
-    server_load: serverLoad ?? 0.5,
+    pointer_stats:  pointerStats  ?? {},
+    profile_stats:  profileStats  ?? {},
+    live_drift:     liveDrift,
+    server_load:    serverLoad    ?? 0.5,
   })
 }
 
@@ -130,7 +126,7 @@ export async function hashPassword({ plainPassword, theta, hExp }) {
     plain_password: plainPassword,
     stored_hash:    '',
     theta,
-    h_exp: hExp,
+    h_exp:          hExp,
   })
 }
 
@@ -138,8 +134,8 @@ export async function verifyPassword({ plainPassword, storedHash }) {
   return req('/password/verify', 'POST', {
     plain_password: plainPassword,
     stored_hash:    storedHash,
-    theta: 0.5,
-    h_exp: 0.5,
+    theta:          0.5,
+    h_exp:          0.5,
   })
 }
 
@@ -156,14 +152,37 @@ export async function verifyPassword({ plainPassword, storedHash }) {
  *   confidence:  'high'|'medium'|'low'
  *   reason:      string         // diagnostic string
  * }
+ *
+ * @param {object} params
+ * @param {string}   params.userId
+ * @param {number[]} params.latentVector
+ * @param {number}   params.eRec
+ * @param {number}   params.trustScore
+ * @param {number}   [params.behavioralDrift]     - live drift score from the biometric engine
+ * @param {number}   [params.adaptiveThreshold]   - current dynamic anomaly threshold
+ * @param {string[]} [params.selectedFeatures]    - feature names active in the current window
+ * @param {number}   [params.sampleCount]         - total persisted samples in the profile
  */
-export async function sendWatchdogHeartbeat({ userId, latentVector, eRec, trustScore }) {
+export async function sendWatchdogHeartbeat({
+  userId,
+  latentVector,
+  eRec,
+  trustScore,
+  behavioralDrift,
+  adaptiveThreshold,
+  selectedFeatures,
+  sampleCount,
+}) {
   return req('/session/verify', 'POST', {
-    session_token:  localStorage.getItem('ep_token') ?? '',
-    user_id:        userId,
-    latent_vector:  latentVector,
-    e_rec:          eRec,
-    trust_score:    trustScore,
+    session_token:      localStorage.getItem('ep_token') ?? '',
+    user_id:            userId,
+    latent_vector:      latentVector,
+    e_rec:              eRec,
+    trust_score:        trustScore,
+    behavioral_drift:   behavioralDrift,
+    adaptive_threshold: adaptiveThreshold,
+    selected_features:  selectedFeatures,
+    sample_count:       sampleCount,
   })
 }
 
@@ -200,6 +219,39 @@ export async function logoutUser(sessionToken) {
   return req(`/auth/logout?session_token=${encodeURIComponent(sessionToken)}`, 'POST')
 }
 
+export async function fetchMe(sessionToken = localStorage.getItem('ep_token')) {
+  const opts = {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  }
+  if (sessionToken) opts.headers['X-Session-Token'] = sessionToken
+  const url = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) + '/me' : BACKEND_URL + '/me'
+  const res = await fetch(url, opts)
+  const data = await res.json()
+  if (!res.ok) {
+    throw new Error(data.detail || `API error ${res.status}`)
+  }
+  return data
+}
+
+export async function resetBiometricProfile(sessionToken = localStorage.getItem('ep_token'), reason = 'user_request') {
+  const opts = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  }
+  if (sessionToken) opts.headers['X-Session-Token'] = sessionToken
+  const url = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) + '/biometric/profile/reset' : BACKEND_URL + '/biometric/profile/reset'
+  const res = await fetch(url, {
+    ...opts,
+    body: JSON.stringify({ reason }),
+  })
+  const data = await res.json()
+  if (!res.ok) {
+    throw new Error(data.detail || `API error ${res.status}`)
+  }
+  return data
+}
+
 // ── Debug / admin ─────────────────────────────────────────────────────────────
 
 /**
@@ -216,13 +268,13 @@ export async function getModelsStatus() {
   return req('/admin/models-status')
 }
 
-// ── Health ─────────────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
 
 export async function healthCheck() {
   return req('/health')
 }
 
-// ── Watchdog action helpers ────────────────────────────────────────────────────
+// ── Watchdog action helpers ───────────────────────────────────────────────────
 
 /**
  * Maps watchdog action strings to UI-level severity levels.
@@ -231,10 +283,10 @@ export async function healthCheck() {
  */
 export function watchdogSeverity(action) {
   return {
-    ok:                    'ok',
-    passive_reauth:        'warn',
-    disable_sensitive_apis:'danger',
-    force_logout:          'critical',
+    ok:                     'ok',
+    passive_reauth:         'warn',
+    disable_sensitive_apis: 'danger',
+    force_logout:           'critical',
   }[action] ?? 'ok'
 }
 
