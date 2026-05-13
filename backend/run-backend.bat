@@ -2,6 +2,11 @@
 title ENTROPY PRIME - Backend :8000
 cd /d "%~dp0"
 
+REM Optional local overrides. These files are ignored by git and can be
+REM created on a developer machine without affecting the repo.
+if exist "%~dp0.env.local" call :load_env "%~dp0.env.local"
+if exist "%~dp0..\.env.local" call :load_env "%~dp0..\.env.local"
+
 echo ================================================
 echo    BACKEND - FastAPI on http://localhost:8000
 echo    API Docs: http://localhost:8000/docs
@@ -40,3 +45,9 @@ echo.
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 pause
+
+:load_env
+for /f "usebackq tokens=1* delims== eol=#" %%A in ("%~1") do (
+    if not "%%A"=="" set "%%A=%%B"
+)
+goto :eof
