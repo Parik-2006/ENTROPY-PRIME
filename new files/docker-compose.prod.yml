@@ -1,0 +1,66 @@
+# ============================================================
+#  ENTROPY PRIME — Production overrides
+#  Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#  Requires a populated .env.prod (never committed to git).
+# ============================================================
+
+services:
+
+  mongodb:
+    # No exposed ports in production — only reachable on ep_internal
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  redis:
+    # No exposed ports in production
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: production
+    image: ep_backend_prod
+    command: >
+      python -m uvicorn backend.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers ${UVICORN_WORKERS:-4}
+      --loop uvloop
+      --http h11
+      --no-access-log
+    environment:
+      ENVIRONMENT: production
+      LOG_LEVEL: ${LOG_LEVEL:-WARNING}
+    # Production: enforce read-only root filesystem
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 512m
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+
+  nginx:
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    # TLS certificate volume — mount from host or cert-manager
+    # volumes:
+    #   - /etc/letsencrypt:/etc/letsencrypt:ro
+    deploy:
+      resources:
+        limits:
+          memory: 128m

@@ -1,20 +1,24 @@
 """
-models/stage3_governor.py  —  Stage 3: Resource Governor (DQN + PPO)
+stage3_governor.py — Stage 3: Resource Governor (DQN + PPO)
 
 Two complementary agents work in sequence:
 
   DQN  — selects the Argon2id *compute hardening* preset (ECONOMY → PUNISHER).
-          Inputs: (θ, server_load, is_suspect).  Same logic as before.
+          Inputs: (θ, server_load, is_suspect).
 
   PPO  — selects the *behavioral response* (ALLOW / LOG / CHALLENGE / BLOCK).
-          Inputs: (θ, server_load, is_suspect, risk_tolerance, verdict_encoded).
+          Inputs: (θ, server_load, is_suspect, is_bot, risk_tolerance).
           Policy is shaped per-tenant via the TenantPolicy risk_tolerance field.
 
 Both agents are overridable by hard rules that encode non-negotiable business
 logic (bots on overloaded servers → ECONOMY; tenant block_bots_hard → BLOCK).
 
-DQN action → Argon2id preset mapping (unchanged)
-─────────────────────────────────────────────────
+Function-based API — both call signatures work without errors:
+  run(bio, dqn_agent)                                   ← old test path
+  run(bio, dqn_agent, ppo_agent=None, policy=None)      ← new integration shape
+
+DQN action → Argon2id preset mapping
+─────────────────────────────────────
   0  ECONOMY   64 MB / t=2 / p=4    — bots, high-load fallback
   1  STANDARD 128 MB / t=3 / p=4    — default for legitimate users
   2  HARD     256 MB / t=4 / p=8    — elevated-risk sessions
@@ -48,23 +52,23 @@ from .contracts import (
     GovernorResult,
     HoneypotVerdict,
     SecurityPreset,
-    SERVER_LOAD_HIGH,
     TenantPolicy,
+    SERVER_LOAD_HIGH,
 )
 
 logger = logging.getLogger("entropy_prime.stage3")
 
-# ── Argon2id preset table (unchanged) ────────────────────────────────────────
+# ── Argon2id preset table ─────────────────────────────────────────────────────
 
 _PRESETS: dict[int, tuple[SecurityPreset, int, int, int]] = {
-    #           preset             memory_kb   time_cost  parallelism
-    0: (SecurityPreset.ECONOMY,    65_536,     2,         4),
-    1: (SecurityPreset.STANDARD,  131_072,     3,         4),
-    2: (SecurityPreset.HARD,      262_144,     4,         8),
-    3: (SecurityPreset.PUNISHER,  524_288,     5,         8),
+    #           preset              memory_kb   time_cost  parallelism
+    0: (SecurityPreset.ECONOMY,     65_536,     2,         4),
+    1: (SecurityPreset.STANDARD,   131_072,     3,         4),
+    2: (SecurityPreset.HARD,       262_144,     4,         8),
+    3: (SecurityPreset.PUNISHER,   524_288,     5,         8),
 }
 
-# Ordered list used for ceiling comparisons
+# Ordered lists for floor/ceiling comparisons
 _PRESET_ORDER = [
     SecurityPreset.ECONOMY,
     SecurityPreset.STANDARD,
@@ -72,7 +76,6 @@ _PRESET_ORDER = [
     SecurityPreset.PUNISHER,
 ]
 
-# Ordered list used for floor/ceiling comparisons on GovernorAction
 _ACTION_ORDER = [
     GovernorAction.ALLOW,
     GovernorAction.LOG,
@@ -80,31 +83,36 @@ _ACTION_ORDER = [
     GovernorAction.BLOCK,
 ]
 
-_DEFAULT_DQN_ACTION  = 1   # STANDARD
-_DEFAULT_PPO_ACTION  = GovernorAction.ALLOW
+_DEFAULT_DQN_ACTION = 1              # STANDARD
+_DEFAULT_PPO_ACTION = GovernorAction.ALLOW
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(
-    bio:     BiometricResult,
+    bio:       BiometricResult,
     dqn_agent,
-    ppo_agent,
-    policy:  Optional[TenantPolicy] = None,
+    ppo_agent=None,                  # Optional — old tests pass nothing here
+    policy:    Optional[TenantPolicy] = None,
 ) -> GovernorResult:
     """
     Determine both the Argon2id preset (DQN) and behavioral action (PPO) for
     this request, subject to the tenant's policy constraints.
 
+    Backward-compatible: calling ``run(bio, dqn_agent)`` works identically to
+    ``run(bio, dqn_agent, ppo_agent=None, policy=None)``.
+
     Parameters
     ──────────
-    bio        — Stage-1 output.
-    dqn_agent  — agent with .select_action(np.ndarray) → int.
-    ppo_agent  — PPOPolicyAgent instance (or any object with
-                 .select_action(np.ndarray) → int).
-    policy     — TenantPolicy for this site_id.  If None, the default policy
-                 (risk_tolerance=0.5, all defaults) is used so the function
-                 always behaves sensibly even without a stored policy.
+    bio        — BiometricResult from Stage 1.
+    dqn_agent  — Agent with .select_action(np.ndarray) → int; selects the
+                 Argon2id SecurityPreset.
+    ppo_agent  — Optional PPOPolicyAgent with .select_action(np.ndarray) → int;
+                 selects the GovernorAction overlay.  When None the governor
+                 defaults to ALLOW (no overlay).
+    policy     — Optional TenantPolicy for this site_id.  When None a default
+                 policy (risk_tolerance=0.5, all defaults) is used so the
+                 function always behaves sensibly.
 
     Returns
     ───────
@@ -172,14 +180,14 @@ def run(
     )
 
 
-# ── DQN sub-pipeline (unchanged logic, extracted for clarity) ─────────────────
+# ── DQN sub-pipeline ──────────────────────────────────────────────────────────
 
 def _run_dqn(
     bio:       BiometricResult,
     dqn_agent,
 ) -> tuple[int, Confidence, bool]:
     """Run the DQN and return (action, confidence, fallback_flag)."""
-    # Low-confidence classification → conservative STANDARD (hard override)
+    # Low-confidence classification → conservative STANDARD
     if bio.confidence == Confidence.LOW:
         return _DEFAULT_DQN_ACTION, Confidence.LOW, False
 
@@ -201,13 +209,18 @@ def _run_ppo(
     ppo_agent,
     policy: TenantPolicy,
 ) -> tuple[GovernorAction, bool]:
-    """Run the PPO and return (governor_action, fallback_flag)."""
+    """
+    Run the PPO and return (governor_action, fallback_flag).
+
+    When ppo_agent is None (old call path) the default ALLOW action is
+    returned with fallback=True so callers can detect the absence gracefully.
+    """
     if ppo_agent is None:
         return _DEFAULT_PPO_ACTION, True
     try:
-        state     = _build_ppo_state(bio, policy)
+        state      = _build_ppo_state(bio, policy)
         action_raw = ppo_agent.select_action(state)
-        if isinstance(action_raw, tuple):
+        if isinstance(action_raw, tuple):   # some PPO impls return (action, log_prob)
             action_raw = action_raw[0]
         action_idx = int(action_raw)
         action_idx = max(0, min(len(_ACTION_ORDER) - 1, action_idx))
@@ -228,15 +241,15 @@ def _hard_override(
 
     Rules applied in priority order:
     1. BOT + block_bots_hard          → ECONOMY + BLOCK
-    2. BOT + high server load         → ECONOMY + LOG (save resources, still log)
-    3. BOT + healthy server           → HARD    + LOG (punish scraping)
+    2. BOT + high server load         → ECONOMY + LOG  (save resources, still log)
+    3. BOT + healthy server           → HARD    + LOG  (punish scraping)
     """
     if bio.is_bot:
         if policy.block_bots_hard:
             return 0, GovernorAction.BLOCK
         if bio.server_load > SERVER_LOAD_HIGH:
-            return 0, GovernorAction.LOG    # minimal compute, still audit
-        return 2, GovernorAction.LOG        # HARD hashing + audit; no full block
+            return 0, GovernorAction.LOG
+        return 2, GovernorAction.LOG
 
     return None  # no override — let agents decide
 
@@ -276,7 +289,7 @@ def _apply_suspect_rule(
 
 def _build_dqn_state(bio: BiometricResult) -> np.ndarray:
     """
-    3-element state vector for the DQN (unchanged from original):
+    3-element state vector for the DQN:
       [theta, server_load, is_suspect_float]
     """
     return np.array(

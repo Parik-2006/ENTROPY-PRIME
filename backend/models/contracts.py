@@ -290,3 +290,6 @@ class PipelineOutput:
 
     # SaaS Stage 2 honeypot challenge (None unless in shadow mode)
     challenge: Optional["ChallengeConfig"] = None
+
+    # Selected MAB arm, duplicated for legacy dashboard/test consumers.
+    mab_arm: int = -1

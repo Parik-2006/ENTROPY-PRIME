@@ -1,9 +1,18 @@
-# Environment variables
+# Environment variables (never commit secrets)
 .env
 .env.local
+.env.local.template
 .env.*.local
 .env.production
 all.env
+
+# Certificates & keys (never commit)
+*.pem
+*.key
+*.crt
+jwt_private.pem
+jwt_public.pem
+certs/
 
 # Dependencies
 node_modules/

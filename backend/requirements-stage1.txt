@@ -1,0 +1,4 @@
+# Stage 1 biometric service dependencies.
+# Keep aligned with the backend runtime; this file exists for Dockerfile-stage1.
+-r requirements.txt
+

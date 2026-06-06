@@ -1,31 +1,49 @@
 """
-backend/services/watchdog_service.py  —  Global Threat Intelligence Service
+services/watchdog_services.py — Watchdog Service
 
-Cross-site threat propagation layer sitting above Stage 4's per-session
-watchdog.  Responsibilities:
+This service has two complementary responsibilities that work in sequence on
+every scored request:
 
-  1. Ingest WatchdogResults produced by stage4_watchdog.run() and decide
-     whether the triggering fingerprint or IP should be flagged *globally*.
-  2. Persist threat records to the shared `threat_intelligence` table (see
-     database.py for the schema).
-  3. Expose a fast lookup path (`is_globally_flagged`) that every /score and
-     /session/verify endpoint calls BEFORE running the per-session PPO, so
-     known-bad actors are blocked at the gate.
-  4. Provide a cross-site broadcast hook (`broadcast_threat`) that fan-outs
-     a newly confirmed threat to all active tenant notification channels.
+  Per-session (Stage 4)
+  ─────────────────────
+  Wraps stage4_watchdog.run() + the session PPOAgent.  Every /score and
+  /session/verify request calls verify_session() to evaluate session integrity
+  from the biometric latent vector, reconstruction error, and DB-sourced trust
+  score.  is_session_valid() is a convenience bool wrapper around that.
+
+  Cross-site threat intelligence
+  ──────────────────────────────
+  Ingests WatchdogResults produced by Stage 4 and decides whether the
+  triggering fingerprint or IP should be flagged *globally* across tenants.
+  Persists threat records to the shared `threat_intelligence` table.
+  Exposes is_globally_flagged() — called BEFORE the per-session PPO so
+  known-bad actors are blocked at the gate without spending compute on them.
+  Broadcasts newly confirmed global threats to all active tenant channels.
+
+Typical request flow::
+
+    svc = WatchdogService(db=db, ppo_agent=ppo)
+
+    # 1. Gate: block known-bad actors before any PPO work
+    gate = await svc.is_globally_flagged(req.fingerprint, req.ip)
+    if gate.globally_flagged:
+        raise HTTPException(403, detail=gate.reason)
+
+    # 2. Per-session evaluation
+    result = svc.verify_session(latent_vector, e_rec, trust_score)
+
+    # 3. Feed result back into the cross-site layer
+    await svc.ingest(tenant_id, req.fingerprint, req.ip, result)
 
 Design notes
 ────────────
-* The service is intentionally stateless at the class level.  All persistence
-  goes through the injected `db` handle so the caller controls the session
-  lifecycle (FastAPI dependency injection keeps this clean).
-* Threat scoring uses additive weights rather than a boolean: a fingerprint
-  that triggers PASSIVE_REAUTH twice across different tenants is less severe
-  than one that triggers FORCE_LOGOUT once, but both accumulate toward the
-  GLOBAL_FLAG_THRESHOLD.
-* TTL-based expiry: threats older than THREAT_TTL_SECONDS are ignored for
-  scoring but kept in the table for audit purposes (soft-delete via
-  `expired_at`).
+* The DB handle controls session lifecycle; inject via FastAPI Depends.
+* Threat scoring is additive, not boolean: multiple PASSIVE_REAUTH events
+  across tenants accumulate toward GLOBAL_FLAG_THRESHOLD.
+* TTL-based expiry: records older than THREAT_TTL_SECONDS are ignored for
+  scoring but retained for audit (soft-delete via `expired_at`).
+* PyTorch inference (no_grad) is thread-safe for CPU tensors.  For GPU
+  inference use one service instance per thread or add an explicit lock.
 """
 from __future__ import annotations
 
@@ -35,10 +53,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..models.contracts import WatchdogAction, WatchdogResult
+from ..models.ppo import PPOAgent
+from ..pipeline import stage4_watchdog as _s4
+from ..pipeline.contracts import WatchdogAction, WatchdogResult
 from ..database import Database, ThreatRecord
 
 logger = logging.getLogger("entropy_prime.watchdog_service")
+
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
@@ -57,8 +78,8 @@ GLOBAL_FLAG_THRESHOLD: float = 10.0
 THREAT_TTL_SECONDS: int = 60 * 60 * 24 * 7  # 7 days
 
 # Minimum number of distinct tenants that must have reported a fingerprint
-# before a global flag is issued (prevents a single rogue tenant from poisoning
-# the shared blocklist).
+# before a global flag is issued (prevents a single rogue tenant from
+# poisoning the shared blocklist).
 MIN_TENANT_CORROBORATION: int = 2
 
 
@@ -83,7 +104,7 @@ class BroadcastPayload:
     ip_address:       Optional[str]
     cumulative_score: float
     tenant_count:     int
-    action:           str          # human-readable worst action seen
+    action:           str           # human-readable worst action seen
     timestamp:        float = field(default_factory=time.time)
 
 
@@ -91,26 +112,73 @@ class BroadcastPayload:
 
 class WatchdogService:
     """
-    Stateless cross-site threat intelligence service.
+    Session integrity evaluator and cross-site threat intelligence service.
 
-    Typical FastAPI usage::
-
-        @app.post("/score")
-        async def score(req: ScoreRequest, db: Database = Depends(get_db)):
-            svc = WatchdogService(db)
-            # Fast gate: block known-bad before expensive PPO
-            gate = await svc.is_globally_flagged(req.fingerprint, req.ip)
-            if gate.globally_flagged:
-                raise HTTPException(403, detail=gate.reason)
-            # … run per-session PPO …
-            result = stage4_watchdog.run(latent_vector, e_rec, trust, agent)
-            await svc.ingest(tenant_id, req.fingerprint, req.ip, result)
+    Parameters
+    ──────────
+    db          — Database handle.  Controls session lifecycle; use FastAPI
+                  Depends() for clean injection.  Required for the threat
+                  intelligence methods (ingest / is_globally_flagged /
+                  expire_stale_threats / get_threat_summary).  May be None
+                  in unit tests that only exercise the session-evaluation path.
+    ppo_agent   — Stage 4 PPOAgent.  Defaults to a freshly initialised
+                  (untrained) agent when not provided.
+    state_dim   — PPO state dimension (must match checkpoint if loading one).
+    action_dim  — PPO action dimension (must match checkpoint if loading one).
     """
 
-    def __init__(self, db: Database) -> None:
-        self._db = db
+    def __init__(
+        self,
+        db:         Optional[Database]  = None,
+        ppo_agent:  Optional[PPOAgent]  = None,
+        state_dim:  int = 10,
+        action_dim: int = 3,
+    ) -> None:
+        self._db  = db
+        self._ppo = ppo_agent or PPOAgent(state_dim=state_dim, action_dim=action_dim)
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Per-session evaluation (Stage 4) ──────────────────────────────────────
+
+    def verify_session(
+        self,
+        latent_vector: list[float],
+        e_rec:         float,
+        trust_score:   float,
+    ) -> WatchdogResult:
+        """
+        Evaluate session integrity via Stage 4.
+
+        Parameters
+        ──────────
+        latent_vector : biometric embedding (first 8 dims used by Stage 4).
+        e_rec         : reconstruction error from the Stage 1 autoencoder.
+        trust_score   : DB-sourced trust score in [0, 1].
+                        NEVER accept this value from the client.
+
+        Returns
+        ───────
+        WatchdogResult with action (OK / PASSIVE_REAUTH /
+        DISABLE_SENSITIVE_API / FORCE_LOGOUT) and supporting fields.
+        Never raises.
+        """
+        return _s4.run(latent_vector, e_rec, trust_score, self._ppo)
+
+    def is_session_valid(
+        self,
+        latent_vector: list[float],
+        e_rec:         float,
+        trust_score:   float,
+    ) -> bool:
+        """
+        Convenience wrapper: returns False on FORCE_LOGOUT, True otherwise.
+
+        Use verify_session() when you need the full WatchdogResult for
+        downstream logging or ingest(); use this for a simple gate check.
+        """
+        result = self.verify_session(latent_vector, e_rec, trust_score)
+        return result.action != WatchdogAction.FORCE_LOGOUT
+
+    # ── Cross-site threat intelligence ────────────────────────────────────────
 
     async def ingest(
         self,
@@ -121,12 +189,18 @@ class WatchdogService:
     ) -> ThreatIntelResult:
         """
         Record a WatchdogResult and re-evaluate the global threat state for
-        this fingerprint.  If the cumulative score crosses GLOBAL_FLAG_THRESHOLD
-        and MIN_TENANT_CORROBORATION is satisfied, the fingerprint is promoted
-        to globally flagged and broadcast_threat() is called.
+        this fingerprint.
+
+        If the cumulative score crosses GLOBAL_FLAG_THRESHOLD and
+        MIN_TENANT_CORROBORATION distinct tenants have reported the same
+        fingerprint, the fingerprint is promoted to globally flagged and
+        _broadcast_threat() is called to fan-out to all tenant channels.
 
         Returns the current ThreatIntelResult for the fingerprint.
+
+        Raises RuntimeError if no Database was injected.
         """
+        self._require_db("ingest")
         fp_hash = _hash_fingerprint(fingerprint)
         weight  = _ACTION_WEIGHT.get(result.action, 0.0)
 
@@ -162,14 +236,17 @@ class WatchdogService:
         ip_address:  Optional[str] = None,
     ) -> ThreatIntelResult:
         """
-        Fast read path.  Returns a ThreatIntelResult whose `globally_flagged`
+        Fast read path: returns a ThreatIntelResult whose `globally_flagged`
         field indicates whether this identity should be blocked before any
         further pipeline stages run.
 
-        Also checks `ip_address` if provided: an IP that has been associated
-        with globally-flagged fingerprints in >= MIN_TENANT_CORROBORATION
+        Also checks `ip_address` if provided: an IP associated with
+        globally-flagged fingerprints across >= MIN_TENANT_CORROBORATION
         tenants is itself flagged.
+
+        Raises RuntimeError if no Database was injected.
         """
+        self._require_db("is_globally_flagged")
         fp_hash = _hash_fingerprint(fingerprint)
         intel   = await self._evaluate(fp_hash)
 
@@ -185,17 +262,50 @@ class WatchdogService:
         Soft-delete threat records older than THREAT_TTL_SECONDS.
         Intended to be called from a periodic background task.
         Returns the number of records expired.
+
+        Raises RuntimeError if no Database was injected.
         """
+        self._require_db("expire_stale_threats")
         cutoff = time.time() - THREAT_TTL_SECONDS
         count  = await self._db.expire_threats_before(cutoff)
         logger.info("[TI] Expired %d stale threat records (cutoff=%.0f)", count, cutoff)
         return count
 
     async def get_threat_summary(self, fingerprint: str) -> ThreatIntelResult:
-        """Convenience wrapper for admin/dashboard endpoints."""
+        """
+        Convenience wrapper for admin / dashboard endpoints.
+
+        Raises RuntimeError if no Database was injected.
+        """
+        self._require_db("get_threat_summary")
         return await self._evaluate(_hash_fingerprint(fingerprint))
 
+    # ── Agent lifecycle ───────────────────────────────────────────────────────
+
+    @property
+    def ppo_agent(self) -> PPOAgent:
+        """Direct access to the managed PPO agent (read-only intent)."""
+        return self._ppo
+
+    def load_checkpoint(self, path: str) -> None:
+        """Hot-swap the PPO agent from a checkpoint file."""
+        self._ppo.load_checkpoint(path)
+        logger.info("[WatchdogService] PPO checkpoint loaded from %s", path)
+
+    def save_checkpoint(self, path: str) -> None:
+        """Persist the current PPO agent weights."""
+        self._ppo.save_checkpoint(path)
+        logger.info("[WatchdogService] PPO checkpoint saved to %s", path)
+
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _require_db(self, method: str) -> None:
+        """Raise a clear error rather than an AttributeError on None._db."""
+        if self._db is None:
+            raise RuntimeError(
+                f"WatchdogService.{method}() requires a Database instance. "
+                "Inject one via __init__(db=...)."
+            )
 
     async def _evaluate(self, fp_hash: str) -> ThreatIntelResult:
         """
@@ -230,7 +340,10 @@ class WatchdogService:
         reason = (
             f"cumulative_score={cumulative:.2f} tenants={tenant_count}"
             if flagged
-            else f"score={cumulative:.2f}/{GLOBAL_FLAG_THRESHOLD} tenants={tenant_count}/{MIN_TENANT_CORROBORATION}"
+            else (
+                f"score={cumulative:.2f}/{GLOBAL_FLAG_THRESHOLD} "
+                f"tenants={tenant_count}/{MIN_TENANT_CORROBORATION}"
+            )
         )
 
         return ThreatIntelResult(
@@ -245,8 +358,8 @@ class WatchdogService:
 
     async def _evaluate_ip(self, ip_address: str) -> ThreatIntelResult:
         """Check whether an IP is associated with globally-flagged fingerprints."""
-        cutoff   = time.time() - THREAT_TTL_SECONDS
-        records  = await self._db.get_active_threats_by_ip(ip_address, since=cutoff)
+        cutoff  = time.time() - THREAT_TTL_SECONDS
+        records = await self._db.get_active_threats_by_ip(ip_address, since=cutoff)
 
         if not records:
             return ThreatIntelResult(
@@ -273,7 +386,11 @@ class WatchdogService:
             tenant_count     = tenant_count,
             first_seen_ts    = min(r.ts for r in records),
             last_seen_ts     = max(r.ts for r in records),
-            reason           = f"ip_flagged score={cumulative:.2f} tenants={tenant_count}" if flagged else "ip_below_threshold",
+            reason           = (
+                f"ip_flagged score={cumulative:.2f} tenants={tenant_count}"
+                if flagged
+                else "ip_below_threshold"
+            ),
         )
 
     async def _broadcast_threat(
@@ -285,8 +402,9 @@ class WatchdogService:
         """
         Fan-out a globally confirmed threat to all tenant notification channels.
 
-        The Database layer owns the actual delivery mechanism (webhook queue,
-        pub/sub topic, etc.).  This method builds the payload and delegates.
+        The Database layer owns the delivery mechanism (webhook queue, pub/sub
+        topic, etc.).  This method builds the payload and delegates.  Broadcast
+        failures are logged but never propagate to the caller.
         """
         payload = BroadcastPayload(
             fingerprint_hash = intel.fingerprint_hash,
@@ -308,12 +426,12 @@ class WatchdogService:
             logger.error("[TI] Broadcast failed: %s", exc)
 
 
-# ── Module-level helpers ───────────────────────────────────────────────────────
+# ── Module-level helpers ──────────────────────────────────────────────────────
 
 def _hash_fingerprint(raw: str) -> str:
     """
     Deterministic, one-way fingerprint hash.
-    Using SHA-256 truncated to 64 hex chars keeps the DB column narrow while
-    remaining collision-resistant for realistic fleet sizes.
+    SHA-256 truncated to 64 hex chars: narrow DB column, collision-resistant
+    for realistic fleet sizes.
     """
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

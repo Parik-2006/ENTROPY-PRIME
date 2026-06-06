@@ -1,0 +1,56 @@
+# ── Secrets & environment files ────────────────────────────────────────────
+.env.local
+.env.prod
+.env.*.local
+*.secret
+secrets/
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache
+
+# ── Node / frontend ─────────────────────────────────────────────────────────
+node_modules/
+dist/
+.parcel-cache/
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+test_out*.txt
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/settings.json
+*.swp
+*.swo
+Thumbs.db
+
+# ── Docker volumes (local bind mounts) ──────────────────────────────────────
+mongo_data/
+redis_data/
+
+# ── ML model checkpoints (large binary files — store in DVC or GCS) ─────────
+checkpoints/*.pt
+checkpoints/*.bin
+# Keep the MAB JSON (small, version-controlled)
+!checkpoints/mab.json
+
+# ── Private keys ─────────────────────────────────────────────────────────────
+backend/certs/jwt_private.pem
+*.pem
+!backend/certs/jwt_public.pem

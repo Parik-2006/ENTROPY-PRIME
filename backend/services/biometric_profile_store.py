@@ -145,3 +145,29 @@ class RedisProfileStore(AbstractProfileStore):
 
     def delete(self, site_id: str, user_id: str) -> bool:
         return bool(self._r.delete(self._key(site_id, user_id)))
+
+
+# ── Factory (v4.0+) ──────────────────────────────────────────────────────────
+
+async def get_profile_store() -> AbstractProfileStore:
+    """
+    Factory: returns the appropriate profile store instance.
+    
+    Logic:
+    1. If EP_REDIS_URL is set and Redis is available → RedisProfileStore
+    2. Otherwise → InMemoryProfileStore (fallback)
+    
+    This allows the app to degrade gracefully if Redis is unavailable.
+    """
+    from backend.services.redis_client import get_redis
+    
+    try:
+        redis = await get_redis()
+        if redis:
+            logger.info("[ProfileStore] Using Redis backend")
+            return RedisProfileStore(redis)
+    except Exception as exc:
+        logger.warning("[ProfileStore] Redis fallback: %s", exc)
+    
+    logger.info("[ProfileStore] Using in-memory backend")
+    return InMemoryProfileStore()

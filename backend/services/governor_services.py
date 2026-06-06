@@ -331,3 +331,37 @@ class GovernorService:
         total_loss) for logging / early stopping.
         """
         return self._ppo.update(buffer, last_value=last_value)
+
+
+# ── Factory (v4.0+) ──────────────────────────────────────────────────────────
+
+async def get_governor_service(
+    dqn_agent: Optional[object] = None,
+    ppo_agent: Optional[PPOPolicyAgent] = None,
+) -> GovernorService:
+    """
+    Factory: creates a GovernorService with the appropriate policy store.
+    
+    Logic:
+    1. If EP_REDIS_URL is set and Redis is available → RedisPolicyStore
+    2. Otherwise → InMemoryPolicyStore (fallback)
+    
+    This allows the app to degrade gracefully if Redis is unavailable.
+    """
+    from backend.services.redis_client import get_redis
+    
+    policy_store: AbstractPolicyStore = InMemoryPolicyStore()
+    
+    try:
+        redis = await get_redis()
+        if redis:
+            logger.info("[GovernorService] Using Redis policy store")
+            policy_store = RedisPolicyStore(redis)
+    except Exception as exc:
+        logger.warning("[GovernorService] Redis fallback: %s", exc)
+    
+    return GovernorService(
+        dqn_agent=dqn_agent,
+        ppo_agent=ppo_agent,
+        policy_store=policy_store,
+    )

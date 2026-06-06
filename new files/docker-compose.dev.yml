@@ -1,0 +1,55 @@
+# ============================================================
+#  ENTROPY PRIME — Development overrides
+#  Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# ============================================================
+
+services:
+
+  mongodb:
+    ports:
+      - "27017:27017"   # expose for local Compass / mongosh access
+
+  redis:
+    ports:
+      - "6379:6379"     # expose for local redis-cli / debugging
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: backend-builder   # stop before production image
+    image: ep_backend_dev
+    # In dev, mount source live for hot-reload
+    volumes:
+      - ./backend:/app/backend:rw
+      - ./backend/certs:/app/certs:ro
+      - checkpoints:/app/checkpoints
+    command: >
+      python -m uvicorn backend.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --log-level debug
+    environment:
+      ENVIRONMENT: development
+      LOG_LEVEL: DEBUG
+      # Dev-only: relax CORS for Vite dev server
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173"
+      # Override MongoDB URL for dev: use root creds for convenience
+      MONGODB_URL: "mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD}@mongodb:27017/${MONGO_DB_NAME:-entropy_prime}?authSource=admin"
+    ports:
+      - "8000:8000"     # expose backend directly for curl / Swagger
+    # Dev does NOT need a healthcheck gate — start immediately
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  nginx:
+    # In dev nginx is optional; comment out if you run Vite separately
+    volumes:
+      - ./nginx/nginx.dev.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"

@@ -39,10 +39,6 @@ try:
     from .dqn import DQNAgent
     from .mab import MABAgent
     from .ppo import PPOAgent
-    from .stage1_biometric import Stage1BiometricInterpreter
-    from .stage2_honeypot import Stage2HoneypotClassifier
-    from .stage3_governor import Stage3ResourceGovernor
-    from .stage4_watchdog import Stage4SessionWatchdog
     _TORCH_AVAILABLE = True
 except ImportError as e:
     # PyTorch or related dependency not available; stages will be imported later
@@ -140,11 +136,6 @@ __all__ = [
     "DQNAgent",
     "MABAgent",
     "PPOAgent",
-    # Stages (if available)
-    "Stage1BiometricInterpreter",
-    "Stage2HoneypotClassifier",
-    "Stage3ResourceGovernor",
-    "Stage4SessionWatchdog",
     # Pydantic Models
     "UserCreate",
     "UserLogin",
