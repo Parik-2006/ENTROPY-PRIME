@@ -53,6 +53,23 @@ def _make_session_token(user_id: str, latent_vector: list, secret: str) -> str:
     return f"ep_{sig}_{secrets.token_hex(8)}"
 
 
+def _economy_governor():
+    """Cheapest preset for confirmed bots — no point profiling shadow traffic."""
+    try:
+        from ..pipeline.contracts import GovernorResult
+    except ImportError:
+        from pipeline.contracts import GovernorResult  # type: ignore
+    return GovernorResult(
+        action      = 0,
+        preset      = SecurityPreset.ECONOMY,
+        memory_kb   = 65_536,
+        time_cost   = 2,
+        parallelism = 4,
+        confidence  = Confidence.HIGH,
+        fallback    = True,
+    )
+
+
 class PipelineOrchestrator:
     """
     Four-stage zero-trust pipeline orchestrator.
@@ -133,6 +150,12 @@ class PipelineOrchestrator:
             honeypot = HoneypotResult(should_shadow=False, mab_arm_selected=-1,
                                       mab_confidence=Confidence.LOW, challenge=None)
             degraded = True
+
+        # Bot short-circuit — shadow-routed bots skip Stages 3/4 and use ECONOMY.
+        if honeypot.should_shadow:
+            return self._assemble(
+                raw, bio, honeypot, _economy_governor(), None, degraded,
+            )
 
         # Stage 3 — resource governor
         try:

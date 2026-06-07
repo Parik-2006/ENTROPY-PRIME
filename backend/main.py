@@ -53,8 +53,6 @@ Compatibility fixes applied (v3.2 pass — all still present)
   FIX-6  No invalid stage class names imported from backend
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import logging

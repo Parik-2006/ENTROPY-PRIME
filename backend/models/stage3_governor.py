@@ -87,6 +87,18 @@ _DEFAULT_DQN_ACTION = 1              # STANDARD
 _DEFAULT_PPO_ACTION = GovernorAction.ALLOW
 
 
+def _default_policy() -> TenantPolicy:
+    """
+    Policy used when callers omit an explicit tenant policy.
+
+    Legacy pipeline tests and ``run(bio, dqn_agent)`` expect the original
+    bot rules (overloaded → ECONOMY, healthy → HARD).  SaaS tenants that
+    want unconditional bot blocking must pass an explicit TenantPolicy with
+    block_bots_hard=True.
+    """
+    return TenantPolicy(site_id="__default__", block_bots_hard=False)
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(
@@ -119,7 +131,7 @@ def run(
     GovernorResult with both preset and governor_action populated.
     Never raises.
     """
-    effective_policy = policy or TenantPolicy(site_id="__default__")
+    effective_policy = policy or _default_policy()
 
     # ── Hard overrides (bypass both agents) ──────────────────────────────────
     hard = _hard_override(bio, effective_policy)
