@@ -1,0 +1,46 @@
+.grid { display: grid; gap: var(--space-5); }
+.phaseRow { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-4); }
+.statRow { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-4); }
+.chartRow { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-5); }
+.twoCol { display: grid; grid-template-columns: 1.4fr 1fr; gap: var(--space-5); }
+
+@media (max-width: 1080px) {
+  .phaseRow, .statRow { grid-template-columns: repeat(2, 1fr); }
+  .chartRow, .twoCol { grid-template-columns: 1fr; }
+}
+
+.chartTitle { font-size: 11px; color: var(--text-2); letter-spacing: .05em; text-transform: uppercase; margin-bottom: 14px; }
+
+.kv { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.kv:last-child { border-bottom: none; }
+.kvKey { color: var(--text-2); }
+.kvVal { font-family: var(--mono); color: var(--text); }
+
+/* threat intel */
+.summaryRow { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-4); }
+.timeline { position: relative; padding-left: 26px; }
+.timeline::before { content: ''; position: absolute; left: 7px; top: 4px; bottom: 4px; width: 2px; background: var(--border); }
+.tlItem { position: relative; padding: 0 0 20px; }
+.tlItem:last-child { padding-bottom: 0; }
+.tlDot { position: absolute; left: -23px; top: 3px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--bg); }
+.tlTime { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+.tlTitle { font-size: 13px; font-weight: 600; color: var(--text); margin: 2px 0; }
+.tlDesc { font-size: 12px; color: var(--text-2); }
+.tlChain { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10px; color: var(--accent); margin-top: 5px; }
+
+.feedRow {
+  display: grid; grid-template-columns: 90px 1fr auto; gap: 12px; align-items: center;
+  padding: 11px 0; border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.feedRow:last-child { border-bottom: none; }
+.feedTime { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+.feedUa { font-family: var(--mono); font-size: 11px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty { text-align: center; color: var(--text-3); padding: 30px; font-size: 13px; }
+
+/* event list (shared by Security Center + Threat Intel) */
+.evtList { display: flex; flex-direction: column; }
+.evtRow { display: flex; align-items: flex-start; gap: 11px; padding: 11px 0; border-bottom: 1px solid var(--border); }
+.evtRow:last-child { border-bottom: none; }
+.evtTitle { font-size: 13px; font-weight: 600; color: var(--text); }
+.evtSub { font-size: 11.5px; color: var(--text-3); line-height: 1.45; }
+.evtTime { font-family: var(--mono); font-size: 10px; color: var(--text-3); white-space: nowrap; }

@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@tensorflow/tfjs": "^4.17.0",
+    "framer-motion": "^12.40.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
     "react-router-dom": "^6.24.0",

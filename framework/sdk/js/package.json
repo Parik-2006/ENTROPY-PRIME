@@ -1,0 +1,21 @@
+{
+  "name": "@entropy-prime/sdk",
+  "version": "0.1.0",
+  "description": "JavaScript SDK for the Entropy Prime behavioral security framework",
+  "type": "module",
+  "main": "entropy-prime.js",
+  "module": "entropy-prime.js",
+  "exports": {
+    ".": "./entropy-prime.js"
+  },
+  "files": ["entropy-prime.js", "README.md"],
+  "keywords": [
+    "security",
+    "behavioral-biometrics",
+    "bot-detection",
+    "continuous-authentication",
+    "captcha-alternative"
+  ],
+  "license": "MIT",
+  "sideEffects": false
+}

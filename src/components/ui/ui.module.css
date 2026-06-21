@@ -1,0 +1,167 @@
+/* ── Card ─────────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.cardPad { padding: var(--space-5); }
+.cardHead {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+.cardTitle {
+  font-family: var(--display);
+  font-size: 13px; font-weight: 700; letter-spacing: .02em;
+  color: var(--text);
+}
+.cardSub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.cardBody { padding: var(--space-5); }
+
+/* ── StatTile ─────────────────────────────────────────────────────────────── */
+.stat {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 6px;
+  transition: transform var(--t-fast), box-shadow var(--t-fast), border-color var(--t-fast);
+}
+.stat:hover { transform: translateY(-3px); box-shadow: var(--shadow-lg); border-color: var(--border-2); }
+.statTop { display: flex; align-items: center; justify-content: space-between; }
+.statIcon {
+  width: 34px; height: 34px; border-radius: 10px;
+  display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+  font-size: 15px;
+}
+.statLabel { font-size: 11px; color: var(--text-2); letter-spacing: .04em; text-transform: uppercase; }
+.statValue { font-family: var(--display); font-size: 26px; font-weight: 700; color: var(--text); line-height: 1.1; }
+.statSub { font-size: 11px; color: var(--text-3); }
+.trend { font-size: 11px; font-weight: 600; }
+.trendUp { color: var(--accent); }
+.trendDown { color: var(--danger); }
+
+/* ── Button ───────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  border: 1px solid transparent; border-radius: var(--radius);
+  font-family: var(--sans); font-weight: 600; font-size: 13px;
+  cursor: pointer; transition: all var(--t-fast); white-space: nowrap;
+}
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btnMd { padding: 10px 18px; }
+.btnSm { padding: 6px 12px; font-size: 12px; }
+.btnLg { padding: 13px 22px; font-size: 14px; }
+.btnFull { width: 100%; }
+.primary { background: var(--accent); color: var(--on-accent); }
+.primary:hover:not(:disabled) { background: var(--accent-deep); transform: translateY(-1px); }
+.ghost { background: transparent; color: var(--text); border-color: var(--border-2); }
+.ghost:hover:not(:disabled) { background: var(--surface-2); }
+.subtle { background: var(--surface-2); color: var(--text); }
+.subtle:hover:not(:disabled) { background: var(--surface-3); }
+.danger { background: var(--danger); color: #fff; }
+.danger:hover:not(:disabled) { filter: brightness(1.05); }
+
+/* ── Field / Input ────────────────────────────────────────────────────────── */
+.field { display: flex; flex-direction: column; gap: 6px; margin-bottom: var(--space-4); }
+.fieldLabel { font-size: 12px; color: var(--text-2); font-weight: 500; }
+.fieldHint { font-size: 11px; color: var(--text-3); }
+.input, .textarea {
+  width: 100%;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--sans); font-size: 14px;
+  padding: 11px 13px;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+.input::placeholder, .textarea::placeholder { color: var(--text-3); }
+.input:focus, .textarea:focus { border-color: var(--accent); box-shadow: var(--ring); outline: none; }
+.textarea { resize: vertical; min-height: 96px; line-height: 1.6; }
+
+/* ── Badge ────────────────────────────────────────────────────────────────── */
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  border: 1px solid transparent;
+}
+.badgeDot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.toneNeutral { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
+.toneOk { background: var(--accent-soft); color: var(--accent); }
+.toneWarn { background: var(--warn-soft); color: var(--warn); }
+.toneDanger { background: var(--danger-soft); color: var(--danger); }
+
+/* ── ProgressBar ──────────────────────────────────────────────────────────── */
+.barTrack { height: 8px; background: var(--surface-3); border-radius: 999px; overflow: hidden; }
+.barFill { height: 100%; border-radius: 999px; transition: width var(--t-slow); background: var(--accent); }
+
+/* ── MetricBar ────────────────────────────────────────────────────────────── */
+.metricRow { display: grid; grid-template-columns: 150px 1fr 88px; gap: 14px; align-items: center; padding: 9px 0; }
+.metricLabel { font-size: 11px; color: var(--text-2); text-transform: uppercase; letter-spacing: .04em; }
+.metricVal { font-family: var(--mono); font-size: 12px; color: var(--text); text-align: right; }
+.metricVal span { color: var(--text-3); font-size: 10px; }
+
+/* ── PhaseCard ────────────────────────────────────────────────────────────── */
+.phase {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: var(--space-4);
+  display: flex; flex-direction: column; gap: 8px; position: relative; overflow: hidden;
+  box-shadow: var(--shadow);
+}
+.phaseTopBar { position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--accent); opacity: .85; }
+.phaseHead { display: flex; align-items: center; gap: 10px; }
+.phaseNum { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--text-3); }
+.phaseDot { width: 8px; height: 8px; border-radius: 50%; margin-left: auto; }
+.phaseTitle { font-family: var(--display); font-size: 13px; font-weight: 700; color: var(--text); }
+.phaseDesc { font-size: 11px; color: var(--text-2); line-height: 1.5; }
+.phaseMetric { font-family: var(--mono); font-size: 12px; color: var(--text); margin-top: 4px; }
+.phaseStatus { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+
+/* ── ThemeToggle ──────────────────────────────────────────────────────────── */
+.themeToggle {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 999px; padding: 5px; cursor: pointer; transition: all var(--t-fast);
+}
+.themeToggle:hover { border-color: var(--border-2); }
+.themeOpt {
+  width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 13px; color: var(--text-3); transition: all var(--t-fast);
+}
+.themeOptActive { background: var(--accent); color: var(--on-accent); }
+
+/* ── Modal ────────────────────────────────────────────────────────────────── */
+.overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(4px);
+  display: grid; place-items: center; z-index: 1000; animation: fadeIn .2s var(--ease) both;
+  padding: var(--space-5);
+}
+.modal {
+  background: var(--glass-bg);
+  backdrop-filter: blur(26px); -webkit-backdrop-filter: blur(26px);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+  width: 100%; max-width: 460px; overflow: hidden;
+}
+.modalHead { padding: var(--space-5); border-bottom: 1px solid var(--border); }
+.modalTitle { font-family: var(--display); font-size: 16px; font-weight: 700; color: var(--text); }
+.modalBody { padding: var(--space-5); color: var(--text-2); font-size: 13px; line-height: 1.6; }
+.modalFoot { padding: var(--space-4) var(--space-5); border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ── Ring ─────────────────────────────────────────────────────────────────── */
+.ringWrap { position: relative; display: inline-grid; place-items: center; }
+.ringText { position: absolute; text-align: center; }
+.ringValue { font-family: var(--display); font-weight: 700; color: var(--text); }
+.ringLabel { font-size: 10px; color: var(--text-3); letter-spacing: .05em; text-transform: uppercase; }

@@ -1,0 +1,91 @@
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────────── */
+.sidebar {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  padding: var(--space-5) var(--space-4);
+  position: sticky; top: 0; height: 100vh;
+}
+.brand { display: flex; align-items: center; gap: 11px; padding: 0 6px var(--space-5); }
+.logoMark {
+  width: 38px; height: 38px; border-radius: 11px;
+  display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: var(--on-accent); font-family: var(--display); font-weight: 800; font-size: 16px;
+  box-shadow: var(--shadow-sm);
+}
+.brandName { font-family: var(--display); font-size: 15px; font-weight: 800; color: var(--text); letter-spacing: -.01em; }
+.brandSub { font-size: 9.5px; color: var(--accent); letter-spacing: .06em; text-transform: uppercase; font-weight: 600; }
+
+.trust {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px 13px; margin-bottom: var(--space-5);
+}
+.trustHead { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.trustLabel { font-size: 10px; color: var(--text-2); letter-spacing: .06em; text-transform: uppercase; }
+.trustVal { font-family: var(--mono); font-size: 13px; font-weight: 700; }
+
+.nav { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; flex: 1; margin: 0 -4px; padding: 0 4px; }
+.navSection { font-size: 9.5px; color: var(--text-3); letter-spacing: .1em; text-transform: uppercase; margin: var(--space-4) 8px 6px; }
+.navItem {
+  display: flex; align-items: center; gap: 11px;
+  padding: 9px 11px; border-radius: var(--radius-sm);
+  background: transparent; border: none; cursor: pointer;
+  color: var(--text-2); font-size: 13px; font-weight: 500; text-align: left; width: 100%;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.navItem:hover { background: var(--surface-2); color: var(--text); }
+.navActive { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.navIcon { width: 18px; text-align: center; font-size: 15px; }
+.navBadge { margin-left: auto; }
+
+.userChip {
+  display: flex; align-items: center; gap: 10px; padding: 10px 8px;
+  border-top: 1px solid var(--border); margin-top: var(--space-3);
+}
+.avatar {
+  width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+  display: grid; place-items: center; font-weight: 700; font-size: 14px;
+  background: var(--surface-2); color: var(--accent); border: 1px solid var(--border);
+}
+.userEmail { font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px; }
+.userId { font-size: 10px; color: var(--text-3); font-family: var(--mono); }
+.logoutBtn {
+  background: transparent; border: 1px solid var(--border); color: var(--text-2);
+  border-radius: var(--radius-sm); padding: 5px 9px; font-size: 11px; cursor: pointer; transition: all var(--t-fast);
+}
+.logoutBtn:hover { border-color: var(--danger); color: var(--danger); }
+
+/* ── Main ─────────────────────────────────────────────────────────────────── */
+.main { display: flex; flex-direction: column; min-width: 0; }
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--space-4) var(--space-6);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  position: sticky; top: 0; z-index: 50; backdrop-filter: blur(8px);
+}
+.pageTitle { font-family: var(--display); font-size: 19px; font-weight: 700; color: var(--text); }
+.pageSub { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+.topRight { display: flex; align-items: center; gap: 14px; }
+.sessionPill {
+  display: flex; align-items: center; gap: 7px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 999px; padding: 6px 12px; font-size: 11px; color: var(--text-2);
+}
+.sessionDot { width: 7px; height: 7px; border-radius: 50%; }
+
+.content { padding: var(--space-6); flex: 1; max-width: 1320px; width: 100%; margin: 0 auto; }
+.protectedFoot {
+  text-align: center; padding: var(--space-5); font-size: 11px; color: var(--text-3);
+  letter-spacing: .04em;
+}
+.protectedFoot b { color: var(--accent); font-weight: 600; }

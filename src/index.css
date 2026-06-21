@@ -1,44 +1,61 @@
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+@import './theme/tokens.css';
 
-:root {
-  --bg:        #080b0f;
-  --bg2:       #0d1117;
-  --bg3:       #111820;
-  --border:    #1e2d3d;
-  --border2:   #243344;
-  --accent:    #00e5ff;
-  --accent2:   #0097a7;
-  --accent3:   #00ffa3;
-  --danger:    #ff3b5c;
-  --warn:      #ffb800;
-  --text:      #c9d6e3;
-  --text2:     #6b8299;
-  --text3:     #3a5068;
-  --mono:      'Space Mono', monospace;
-  --sans:      'Syne', sans-serif;
-  --radius:    6px;
-  --radius2:   12px;
-}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body, #root {
   height: 100%;
-  background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
   font-size: 14px;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
+/* Premium gradient backdrop that the glass cards float over */
+body {
+  background:
+    radial-gradient(1100px 700px at 12% -8%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 60%),
+    radial-gradient(1000px 650px at 92% 8%, color-mix(in srgb, var(--gold) 9%, transparent), transparent 55%),
+    linear-gradient(160deg, var(--bg) 0%, var(--bg-2) 55%, var(--bg-3) 100%);
+  background-attachment: fixed;
+}
+
+/* Reusable glass surface */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+/* Smooth theme transition on the surfaces/text that change between palettes */
+body,
+[class*="card"], [class*="Card"],
+[class*="sidebar"], [class*="surface"] {
+  transition: background-color var(--t-base), color var(--t-base),
+              border-color var(--t-base);
+}
+
+a { color: inherit; text-decoration: none; }
+button { font-family: inherit; }
+
+h1, h2, h3, h4 { font-family: var(--display); font-weight: 700; letter-spacing: -0.01em; }
+
 /* Scrollbar */
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: var(--bg2); }
-::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
 
 /* Selection */
-::selection { background: var(--accent2); color: #fff; }
+::selection { background: var(--accent); color: var(--on-accent); }
 
-/* Animations */
+/* Focus visibility */
+:focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--radius-sm); }
+
+/* Animations (legacy + new) */
 @keyframes fadeIn   { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes pulse    { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
 @keyframes scanline { 0% { transform: translateY(-100%); } 100% { transform: translateY(100vh); } }
@@ -46,6 +63,11 @@ html, body, #root {
 @keyframes spin     { to { transform: rotate(360deg); } }
 @keyframes blink    { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
 @keyframes slide-in { from { transform: translateX(-12px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+@keyframes shimmer  { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
 
-.fade-in  { animation: fadeIn .4s ease both; }
-.slide-in { animation: slide-in .3s ease both; }
+.fade-in  { animation: fadeIn .4s var(--ease) both; }
+.slide-in { animation: slide-in .3s var(--ease) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}

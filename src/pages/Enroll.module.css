@@ -1,0 +1,101 @@
+.page {
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 80% -10%, var(--accent-soft), transparent 60%),
+    var(--bg);
+  display: grid; grid-template-columns: 1.05fr 1fr;
+}
+
+/* left: brand / why */
+.left {
+  padding: 56px 56px 40px;
+  display: flex; flex-direction: column; justify-content: space-between;
+  border-right: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 12px; }
+.logoMark {
+  width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: var(--on-accent); font-family: var(--display); font-weight: 800; font-size: 17px;
+}
+.brandName { font-family: var(--display); font-size: 17px; font-weight: 800; color: var(--text); }
+.brandSub { font-size: 10px; color: var(--accent); letter-spacing: .07em; text-transform: uppercase; font-weight: 600; }
+
+.headline { font-family: var(--display); font-size: 34px; font-weight: 800; color: var(--text); line-height: 1.15; margin: 40px 0 16px; letter-spacing: -.02em; }
+.lede { font-size: 15px; color: var(--text-2); line-height: 1.7; max-width: 460px; }
+
+.assured { display: flex; flex-direction: column; gap: 14px; margin-top: 36px; }
+.assureItem { display: flex; gap: 12px; align-items: flex-start; }
+.assureIcon {
+  width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent); font-size: 14px;
+}
+.assureTitle { font-size: 13px; font-weight: 600; color: var(--text); }
+.assureDesc { font-size: 12px; color: var(--text-3); }
+
+.footnote { font-size: 11px; color: var(--text-3); margin-top: 32px; }
+
+/* right: enrollment card */
+.right { padding: 48px; display: flex; align-items: center; }
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+  width: 100%; max-width: 520px; margin: 0 auto; padding: 32px;
+}
+
+.steps { display: flex; gap: 7px; margin-bottom: 22px; }
+.stepDot { flex: 1; height: 5px; border-radius: 999px; background: var(--surface-3); transition: background var(--t-base); }
+.stepActive { background: var(--accent); }
+.stepDone { background: var(--accent-2); }
+
+.qIndex { font-family: var(--mono); font-size: 12px; color: var(--accent); letter-spacing: .05em; }
+.question { font-family: var(--display); font-size: 22px; font-weight: 700; color: var(--text); margin: 6px 0 6px; }
+.qHint { font-size: 13px; color: var(--text-3); margin-bottom: 16px; }
+
+.learning {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text-2);
+}
+.learnPulse { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s infinite; }
+
+.wordRow {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 14px; flex-wrap: wrap;
+}
+.wordCount { font-size: 12px; color: var(--text-2); font-family: var(--mono); }
+.wordRemain { color: var(--text-3); }
+
+.meterRow { display: flex; justify-content: space-between; align-items: baseline; margin: 26px 0 8px; }
+.meterLabel { font-size: 12px; color: var(--text-2); }
+.meterVal { font-family: var(--mono); font-size: 13px; color: var(--text); font-weight: 700; }
+.metaRow { display: flex; justify-content: space-between; margin-top: 10px; font-size: 11px; color: var(--text-3); }
+
+.actions { display: flex; gap: 12px; margin-top: 26px; }
+
+/* success */
+.successWrap { text-align: center; padding: 18px 0; }
+.successMark {
+  width: 72px; height: 72px; border-radius: 50%; margin: 0 auto 18px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent); font-size: 34px;
+  box-shadow: 0 0 0 8px var(--accent-soft);
+}
+.successTitle { font-family: var(--display); font-size: 24px; font-weight: 800; color: var(--text); margin-bottom: 8px; }
+.successText { font-size: 14px; color: var(--text-2); line-height: 1.6; margin-bottom: 22px; }
+
+.summaryBox {
+  text-align: left; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 6px 14px; margin-bottom: 22px;
+}
+.summaryRow {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.summaryRow:last-child { border-bottom: none; }
+.summaryKey { font-size: 13px; color: var(--text-2); }
+
+.countdown { font-size: 12px; color: var(--text-3); margin-top: 14px; }
+
+@media (max-width: 920px) {
+  .page { grid-template-columns: 1fr; }
+  .left { display: none; }
+}

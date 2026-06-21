@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "entropy-prime-sdk"
+version = "0.1.0"
+description = "Python SDK for the Entropy Prime behavioral security framework"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Entropy Prime" }]
+keywords = ["security", "behavioral-biometrics", "bot-detection", "continuous-authentication"]
+# Intentionally zero runtime dependencies — stdlib only.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/your-org/entropy-prime"
+
+[tool.setuptools]
+packages = ["entropy_prime"]

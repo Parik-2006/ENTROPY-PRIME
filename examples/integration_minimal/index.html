@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!--
+  Minimal integration - browser side (JavaScript SDK)
+  ===================================================
+  Serve this file from any static server and point apiUrl at a running
+  Entropy Prime framework. The SDK captures behavior and scores the login.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Entropy Prime - Minimal Integration</title>
+  </head>
+  <body>
+    <h1>Sign in</h1>
+    <form id="login-form">
+      <input name="email" placeholder="email" />
+      <input name="password" type="password" placeholder="password" />
+      <input type="hidden" id="ep_token" name="ep_token" />
+      <button type="submit">Sign in</button>
+    </form>
+    <pre id="out"></pre>
+
+    <script type="module">
+      // In the repo, the SDK lives at ../../framework/sdk/js/entropy-prime.js
+      import { EntropyPrime } from "../../framework/sdk/js/entropy-prime.js";
+
+      const out = document.querySelector("#out");
+      const ep = new EntropyPrime({
+        apiUrl: "http://localhost:8000",
+        onScore: (s, label) => (out.textContent = `humanity ${s.toFixed(2)} -> ${label}`),
+        onSession: (t) => (document.querySelector("#ep_token").value = t),
+      });
+      ep.attach(document.querySelector("#login-form"));
+
+      document.querySelector("#login-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const result = await ep.flush(); // POST /v1/score
+        out.textContent += result.shadow_mode
+          ? "\nBot behavior detected - request shadow-routed."
+          : "\nVerified human - proceeding.";
+      });
+    </script>
+  </body>
+</html>

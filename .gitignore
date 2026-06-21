@@ -177,3 +177,20 @@ tmp/
 temp/
 *.temp
 
+# ── Deployment (Phase: production) — never commit secrets ─────────────────────
+node_modules
+dist
+build
+.venv
+venv
+__pycache__
+.pytest_cache
+.env
+.env.local
+.env.production
+.env.development
+backend/.env
+frontend/.env
+# Keep the documented template (NOT ignored):
+!.env.example
+

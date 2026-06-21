@@ -634,6 +634,24 @@ export class EntropyPrimeClient {
     }
   }
 
+  /**
+   * Phase D.1 (SHADOW): current normalized 8-dim behavioral window.
+   * Read-only — computed from the existing capture windows via buildFeatureVector.
+   * Does NOT mutate any profile/EMA state and does NOT affect drift, trust, or the
+   * confidence system. Returns null when there isn't enough recent input.
+   */
+  getFeatureVector() {
+    try {
+      const keyEvents     = this.keyboard.getWindow(CNN_SEQ_LEN)
+      const pointerEvents = this.pointer.getWindow(CNN_SEQ_LEN)
+      if (keyEvents.length < 5) return null
+      const fv = buildFeatureVector(keyEvents, pointerEvents, this.keyboard)
+      return Array.from(fv)
+    } catch {
+      return null
+    }
+  }
+
   destroy() {
     this._persistProfile()
     this.keyboard.stop()

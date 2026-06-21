@@ -1,0 +1,137 @@
+/* ============================================================================
+   Entropy Prime V2 — Design Tokens (Premium Glassmorphism)
+   ----------------------------------------------------------------------------
+   Single source of truth for color, glass, elevation, radius, and motion across
+   both themes. Owns the premium palette AND remaps the legacy variable names
+   (--bg2, --accent3, --text2, …) so existing/legacy pages keep working.
+
+   Theme is selected via  <html data-theme="dark|light">  (see ThemeContext).
+   `:root` defaults to DARK so first paint (before JS) is correct.
+   ========================================================================== */
+
+:root,
+:root[data-theme="dark"] {
+  /* ── Surfaces (deep navy gradient base) ───────────────────────────────── */
+  --bg:          #0B1020;
+  --bg-2:        #111827;
+  --bg-3:        #161D2F;
+
+  /* glass cards: translucent over the gradient bg */
+  --surface:     rgba(255, 255, 255, 0.06);
+  --surface-2:   rgba(255, 255, 255, 0.09);
+  --surface-3:   rgba(255, 255, 255, 0.05);
+  --glass-bg:    rgba(255, 255, 255, 0.06);
+  --glass-hi:    rgba(255, 255, 255, 0.14);   /* inner top highlight */
+  --border:      rgba(255, 255, 255, 0.08);
+  --border-2:    rgba(255, 255, 255, 0.16);
+
+  /* ── Accents & status ─────────────────────────────────────────────────── */
+  --accent:      #14F1D9;   /* primary  */
+  --accent-2:    #7AF8E3;   /* secondary */
+  --accent-deep: #0FBFAD;
+  --gold:        #FFD166;   /* accent   */
+  --warn:        #FFD166;
+  --danger:      #FF5D73;
+  --info:        #5AA9FF;
+
+  /* ── Text ─────────────────────────────────────────────────────────────── */
+  --text:        #F8F5F0;
+  --text-2:      #D8D2C8;
+  --text-3:      #AFA8A0;
+  --on-accent:   #062722;
+
+  /* ── Effects ──────────────────────────────────────────────────────────── */
+  --blur:        20px;
+  --shadow-sm:   0 1px 2px rgba(0,0,0,.35);
+  --shadow:      0 8px 28px rgba(2,6,18,.45), inset 0 1px 0 var(--glass-hi);
+  --shadow-lg:   0 30px 70px rgba(2,6,18,.60), inset 0 1px 0 var(--glass-hi);
+  --ring:        0 0 0 3px rgba(20,241,217,.30);
+  --glow:        0 0 28px rgba(20,241,217,.25);
+  --accent-soft: rgba(20,241,217,.14);
+  --gold-soft:   rgba(255,209,102,.16);
+  --warn-soft:   rgba(255,209,102,.16);
+  --danger-soft: rgba(255,93,115,.16);
+  --grid-line:   rgba(255,255,255,.05);
+
+  /* ── Legacy aliases (old pages reference these; kept solid) ───────────── */
+  --bg2:     #111827;
+  --bg3:     #161D2F;
+  --border2: var(--border-2);
+  --accent2: var(--accent-deep);
+  --accent3: var(--accent-2);
+  --text2:   var(--text-2);
+  --text3:   var(--text-3);
+}
+
+:root[data-theme="light"] {
+  /* ── Surfaces (warm cream) ────────────────────────────────────────────── */
+  --bg:          #F7F3EC;
+  --bg-2:        #EFE9DE;
+  --bg-3:        #E9E2D4;
+
+  --surface:     rgba(255, 255, 255, 0.65);
+  --surface-2:   rgba(255, 255, 255, 0.82);
+  --surface-3:   rgba(255, 255, 255, 0.55);
+  --glass-bg:    rgba(255, 255, 255, 0.65);
+  --glass-hi:    rgba(255, 255, 255, 0.85);
+  --border:      rgba(30, 36, 51, 0.10);
+  --border-2:    rgba(30, 36, 51, 0.18);
+
+  /* ── Accents & status ─────────────────────────────────────────────────── */
+  --accent:      #12BFA8;
+  --accent-2:    #5CDDC7;
+  --accent-deep: #0E9E8B;
+  --gold:        #C89B3C;
+  --warn:        #C89B3C;
+  --danger:      #E0566C;
+  --info:        #2E6FC7;
+
+  /* ── Text ─────────────────────────────────────────────────────────────── */
+  --text:        #1E2433;
+  --text-2:      #545B6B;
+  --text-3:      #8A8F9C;
+  --on-accent:   #FFFFFF;
+
+  /* ── Effects ──────────────────────────────────────────────────────────── */
+  --blur:        20px;
+  --shadow-sm:   0 1px 2px rgba(40,36,28,.08);
+  --shadow:      0 10px 30px rgba(60,52,36,.12), inset 0 1px 0 var(--glass-hi);
+  --shadow-lg:   0 30px 70px rgba(60,52,36,.20), inset 0 1px 0 var(--glass-hi);
+  --ring:        0 0 0 3px rgba(18,191,168,.24);
+  --glow:        0 0 28px rgba(18,191,168,.18);
+  --accent-soft: rgba(18,191,168,.12);
+  --gold-soft:   rgba(200,155,60,.16);
+  --warn-soft:   rgba(200,155,60,.16);
+  --danger-soft: rgba(224,86,108,.12);
+  --grid-line:   rgba(30,36,51,.06);
+
+  /* ── Legacy aliases ──────────────────────────────────────────────────── */
+  --bg2:     #EFE9DE;
+  --bg3:     #FFFFFF;
+  --border2: var(--border-2);
+  --accent2: var(--accent-deep);
+  --accent3: var(--accent-deep);
+  --text2:   var(--text-2);
+  --text3:   var(--text-3);
+}
+
+/* ── Shared (theme-independent) tokens ───────────────────────────────────── */
+:root {
+  --mono:    'Space Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans:    'Inter', 'Syne', system-ui, -apple-system, Segoe UI, sans-serif;
+  --display: 'Syne', 'Inter', system-ui, sans-serif;
+
+  --radius:    14px;
+  --radius-sm: 9px;
+  --radius-lg: 20px;
+  --radius2:   20px; /* legacy alias */
+
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-5: 24px; --space-6: 32px; --space-7: 48px;
+
+  --ease:        cubic-bezier(.4, 0, .2, 1);
+  --t-fast:      .15s var(--ease);
+  --t-base:      .25s var(--ease);
+  --t-slow:      .4s var(--ease);
+  --sidebar-w:   254px;
+}

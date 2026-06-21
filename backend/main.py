@@ -96,7 +96,11 @@ from backend.database import (
     reset_biometric_profile, profile_build_summary,
     store_honeypot_entry, get_honeypot_signatures, get_honeypot_count,
     log_drift_event,
+    # Phase D.1 (shadow mode — validation only)
+    freeze_enrollment_baseline, get_enrollment_baseline, log_biometric_comparison,
 )
+# Phase D.1 (shadow mode) — pure comparison, makes no decision
+from backend.services.biometric_compare import compare as _bio_compare
 
 # ── Pydantic models ────────────────────────────────────────────────────────
 from backend.models.pydantic_models import UserCreate, UserLogin
@@ -315,11 +319,18 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins = os.environ.get(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://localhost:3001,http://localhost:5173,"
-        "http://127.0.0.1:3000,http://127.0.0.1:3001",
-    ).split(","),
+    allow_origins = [
+        o.strip() for o in os.environ.get(
+            "CORS_ORIGINS",
+            "http://localhost:3000,http://localhost:3001,http://localhost:5173,"
+            "http://127.0.0.1:3000,http://127.0.0.1:3001",
+        ).split(",") if o.strip()
+    ],
+    # Allow Vercel production + preview deployments (https://<name>.vercel.app)
+    # without enumerating every preview URL. Override via CORS_ORIGIN_REGEX.
+    allow_origin_regex = os.environ.get(
+        "CORS_ORIGIN_REGEX", r"https://.*\.vercel\.app"
+    ),
     allow_credentials = True,
     allow_methods     = ["*"],
     allow_headers     = ["*"],
@@ -424,6 +435,9 @@ class SessionVerifyReq(BaseModel):
     selected_features:  list[str]       = Field(default_factory=list)
     sample_count:       int | None      = None
     onboarding_state:   OnboardingState = OnboardingState.COLLECTING
+    # Phase D.1 (shadow mode): optional normalized 8-dim behavioral window.
+    # Used ONLY for shadow comparison logging; ignored by all decision logic.
+    feature_window:     list[float] | None = None
 
     @model_validator(mode="after")
     def _validate(self):
@@ -876,6 +890,39 @@ async def session_verify(req: SessionVerifyReq, request: Request):
             )
         except Exception as exc:
             logger.warning("[SessionVerify] Drift event log failed: %s", exc)
+
+    # ── Phase D.1 (SHADOW MODE): compare the current behavioral window against
+    # the FROZEN enrollment baseline and record the result.  This block is
+    # purely observational — `wd`, the trust score, the action, and the response
+    # below are all UNCHANGED by it.  Fully guarded so it can never break the
+    # heartbeat. ────────────────────────────────────────────────────────────────
+    if req.feature_window and len(req.feature_window) >= 4:
+        try:
+            _baseline = await get_enrollment_baseline(db_handler.db, req.user_id)
+            if _baseline and _baseline.get("mean"):
+                _cmp = _bio_compare(req.feature_window, _baseline)
+                logger.info(
+                    "[ShadowBiometric] user=%s distance=%.3f similarity=%.3f "
+                    "confidence=%d tier=%s | server trust UNCHANGED=%.3f action=%s",
+                    req.user_id, _cmp["distance"], _cmp["similarity"],
+                    _cmp["confidence"], _cmp["tier"], wd.trust_score, wd.action.value,
+                )
+                await log_biometric_comparison(db_handler.db, {
+                    "user_id":          req.user_id,
+                    "session_token":    req.session_token,
+                    "distance":         _cmp["distance"],
+                    "similarity":       _cmp["similarity"],
+                    "confidence":       _cmp["confidence"],
+                    "tier":             _cmp["tier"],
+                    "baseline_version": _cmp["baseline_version"],
+                    "window":           [round(float(x), 4) for x in req.feature_window],
+                    "per_feature":      _cmp["per_feature"],
+                    "server_action":    wd.action.value,   # context only
+                    "server_trust":     wd.trust_score,    # context only
+                    "onboarding_state": db_onboarding_state,
+                })
+        except Exception as _exc:
+            logger.warning("[ShadowBiometric] comparison skipped: %s", _exc)
 
     # 10. Cross-site ingest + notification routing
     await _ingest_watchdog("default", req.fingerprint, ip, wd)
@@ -1436,6 +1483,33 @@ async def sync_biometric_profile(
             await set_onboarding_state(db_handler.db, user_id, ONBOARDING_STABLE)
             target_state = ONBOARDING_STABLE
 
+        # ── Phase D.1 (SHADOW): freeze a write-once enrollment baseline the first
+        # time the user reaches `stable`.  Best-effort, never overwrites an
+        # existing baseline, and never affects this endpoint's response. ────────
+        if target_state == ONBOARDING_STABLE:
+            try:
+                _order = ["dwell_norm", "flight_norm", "speed_norm", "jitter_norm",
+                          "accel_norm", "rhythm_norm", "pause_norm", "bigram_norm"]
+                _mean = list(ema_profile) if ema_profile else (list(feature_means) if feature_means else [])
+                if ema_variance:
+                    _std = [float(v) ** 0.5 if (v and v > 0) else 0.1 for v in ema_variance]
+                else:
+                    _std = [0.1] * len(_mean)
+                if _mean:
+                    await freeze_enrollment_baseline(
+                        db_handler.db,
+                        user_id           = user_id,
+                        mean              = _mean,
+                        std               = _std,
+                        feature_order     = _order[:len(_mean)],
+                        selected_features = selected_features,
+                        sample_count      = sample_count,
+                        tenant_id         = tenant_id,
+                        site_id           = site_id,
+                    )
+            except Exception as _exc:
+                logger.warning("[Biometric][D1] baseline freeze skipped: %s", _exc)
+
         await db_handler.db.users.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {
@@ -1921,3 +1995,23 @@ async def health():
         "stages":    4,
         "timestamp": time.time(),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Framework API gateway — /v1 aliases  (ADDITIVE, NON-BREAKING)
+# ──────────────────────────────────────────────────────────────────────────
+# Every original route above remains exactly as-is. The block below mounts a
+# versioned, resource-grouped mirror of those routes under /v1 (e.g. POST
+# /v1/score == POST /score) by reusing the *same* handler callables — no logic
+# is duplicated. It runs last, after all routes are registered, so the whole
+# surface is available to mirror. It is wrapped so that any failure to build
+# the alias layer is non-fatal: the application still starts with the complete
+# original (un-prefixed) route set.
+try:
+    from framework.api_gateway import build_v1_routers
+
+    for _v1_router in build_v1_routers(sys.modules[__name__]):
+        app.include_router(_v1_router)
+    logger.info("✓ Framework /v1 API aliases mounted (additive, non-breaking)")
+except Exception as _v1_exc:  # pragma: no cover - alias layer is best-effort
+    logger.warning("/v1 alias layer not mounted (non-fatal): %s", _v1_exc)

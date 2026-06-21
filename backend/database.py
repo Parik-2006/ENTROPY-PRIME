@@ -132,7 +132,12 @@ class Database:
 
     async def connect_to_mongo(self) -> None:
         """Connect to MongoDB with retry logic. Falls back to mongomock for dev."""
-        mongo_url = os.environ.get("MONGODB_URL", "mongodb://localhost:27017")
+        # Accept MONGODB_URI (deployment/Atlas standard) or legacy MONGODB_URL.
+        mongo_url = (
+            os.environ.get("MONGODB_URI")
+            or os.environ.get("MONGODB_URL")
+            or "mongodb://localhost:27017"
+        )
         db_name   = os.environ.get("MONGODB_DB_NAME", "entropy_prime")
 
         for attempt in range(1, self.max_retries + 1):
@@ -200,6 +205,17 @@ class Database:
             await self.db.biometric_profiles.create_index(
                 [("tenant_id", ASCENDING), ("onboarding_state", ASCENDING)],
                 name="idx_bp_tenant_state",
+            )
+
+            # ── Phase D.1 (shadow mode) — additive, validation-only ───────────
+            await self.db.enrollment_baselines.create_index(
+                [("user_id", ASCENDING), ("baseline_version", ASCENDING)],
+                unique=True,
+                name="idx_eb_user_ver",
+            )
+            await self.db.biometric_comparisons.create_index(
+                [("user_id", ASCENDING), ("ts", ASCENDING)],
+                name="idx_bc_user_ts",
             )
 
             # ── threat_intelligence ───────────────────────────────────────────
@@ -921,6 +937,97 @@ async def store_biometric_sample(
         },
         upsert=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase D.1 — Frozen Enrollment Baselines + Shadow Comparison Log
+#
+# SHADOW MODE / VALIDATION ONLY.  These helpers add a *frozen* enrollment
+# baseline and a comparison log.  Nothing here influences PPO, the watchdog,
+# the trust score, the UI confidence, or re-authentication — they only capture
+# evidence that a server-side biometric comparison would work.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def freeze_enrollment_baseline(
+    db: AsyncIOMotorDatabase,
+    user_id: str,
+    mean: List[float],
+    std: List[float],
+    feature_order: List[str],
+    selected_features: List[str],
+    sample_count: int,
+    tenant_id:      Optional[str] = None,
+    site_id:        Optional[str] = None,
+    engine_version: str           = "biometrics@phaseD1",
+) -> int:
+    """
+    Write-once snapshot of the enrollment profile, captured when the user first
+    reaches `stable`.  **Never overwrites an existing locked baseline** — this is
+    the frozen-baseline invariant.  Returns the active baseline_version.
+    """
+    existing = await db.enrollment_baselines.find_one(
+        {"user_id": user_id, "locked": True},
+        sort=[("baseline_version", DESCENDING)],
+    )
+    if existing:
+        return int(existing.get("baseline_version", 1))  # already frozen → no-op
+
+    order = feature_order or []
+    sel   = selected_features or []
+    weights = [1.5 if (order[i] in sel) else 1.0 for i in range(len(order))]
+
+    doc = {
+        "user_id":           user_id,
+        "tenant_id":         tenant_id,
+        "site_id":           site_id,
+        "baseline_version":  1,
+        "locked":            True,
+        "created_at":        datetime.utcnow(),
+        "engine_version":    engine_version,
+        "feature_order":     order,
+        "n_samples":         int(sample_count),
+        "mean":              [float(x) for x in (mean or [])],
+        "std":               [float(x) for x in (std or [])],
+        "selected_features": sel,
+        "feature_weights":   weights,
+    }
+    await db.enrollment_baselines.insert_one(doc)
+    logger.info(
+        "[DB.EB] Froze enrollment baseline v1 user=%s n=%d features=%d",
+        user_id, sample_count, len(order),
+    )
+    return 1
+
+
+async def get_enrollment_baseline(
+    db: AsyncIOMotorDatabase, user_id: str
+) -> Optional[dict]:
+    doc = await db.enrollment_baselines.find_one(
+        {"user_id": user_id, "locked": True},
+        sort=[("baseline_version", DESCENDING)],
+    )
+    if doc:
+        doc["_id"] = str(doc["_id"])
+    return doc
+
+
+async def log_biometric_comparison(
+    db: AsyncIOMotorDatabase, comparison: dict
+) -> None:
+    """Append one shadow comparison result. Best-effort; never raises upward."""
+    doc = {**comparison, "ts": time.time(), "created_at": datetime.utcnow()}
+    await db.biometric_comparisons.insert_one(doc)
+
+
+async def get_biometric_comparisons(
+    db: AsyncIOMotorDatabase, user_id: str, limit: int = 100
+) -> List[dict]:
+    rows = await db.biometric_comparisons.find(
+        {"user_id": user_id}
+    ).sort("ts", DESCENDING).limit(limit).to_list(limit)
+    for r in rows:
+        r["_id"] = str(r["_id"])
+    return rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────

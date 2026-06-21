@@ -5,7 +5,12 @@
 import { KeystrokeCollector, MouseCollector, TouchCollector } from './collectors';
 
 const SDK_VERSION = '1.1.0';
-const DEFAULT_ENDPOINT = 'http://localhost:8000/api/v1';
+// Deployment-driven default endpoint. Prefers the build-time API base URL;
+// falls back to localhost only for local development of the standalone SDK.
+const _API_BASE =
+  (typeof import.meta !== 'undefined' && import.meta.env &&
+    (import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_BACKEND_URL)) || '';
+const DEFAULT_ENDPOINT = _API_BASE ? `${_API_BASE}/api/v1` : 'http://localhost:8000/api/v1';
 
 class BiometricSDK {
     constructor() {

@@ -7,7 +7,17 @@
  * are surfaced so the UI can reflect model certainty.
  */
 
-const BACKEND_URL = import.meta.env.VITE_API_URL || (typeof window !== 'undefined' ? '' : 'http://localhost:8000')
+// Backend base URL resolution (deployment-driven):
+//   1. VITE_API_BASE_URL  (preferred, e.g. https://entropy-prime.onrender.com)
+//   2. VITE_BACKEND_URL   (alias)
+//   3. VITE_API_URL       (legacy — kept for backward compatibility)
+//   4. '' in the browser  → same-origin / Vite dev proxy
+//   5. http://localhost:8000 for non-browser (SSR/test) contexts
+const BACKEND_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  import.meta.env.VITE_BACKEND_URL ||
+  import.meta.env.VITE_API_URL ||
+  (typeof window !== 'undefined' ? '' : 'http://localhost:8000')
 
 // ── Core fetch wrapper ────────────────────────────────────────────────────────
 
@@ -172,8 +182,9 @@ export async function sendWatchdogHeartbeat({
   adaptiveThreshold,
   selectedFeatures,
   sampleCount,
+  featureWindow,
 }) {
-  return req('/session/verify', 'POST', {
+  const payload = {
     session_token:      localStorage.getItem('ep_token') ?? '',
     user_id:            userId,
     latent_vector:      latentVector,
@@ -183,7 +194,11 @@ export async function sendWatchdogHeartbeat({
     adaptive_threshold: adaptiveThreshold,
     selected_features:  selectedFeatures,
     sample_count:       sampleCount,
-  })
+  }
+  // Phase D.1 (shadow): optional normalized feature window for server-side
+  // comparison logging. Omitted entirely when unavailable.
+  if (Array.isArray(featureWindow)) payload.feature_window = featureWindow
+  return req('/session/verify', 'POST', payload)
 }
 
 // ── Stage 3 MAB feedback ──────────────────────────────────────────────────────

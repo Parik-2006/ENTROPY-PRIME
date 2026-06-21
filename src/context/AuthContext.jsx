@@ -177,6 +177,12 @@ export function AuthProvider({ children }) {
 
         // Pass the authoritative onboarding state to the server so it can
         // gate drift detection independently of the sample-count claim.
+        // Phase D.1 (shadow): include the current normalized feature window so the
+        // backend can log a server-side comparison. Optional + best-effort; the
+        // heartbeat behaves identically if this is null.
+        let featureWindow = null
+        try { featureWindow = ep.getFeatureVector?.() ?? null } catch { featureWindow = null }
+
         const res = await sendWatchdogHeartbeat({
           userId:            user.id,
           latentVector:      vec,
@@ -187,6 +193,7 @@ export function AuthProvider({ children }) {
           selectedFeatures:  pStats?.selectedFeatures ?? [],
           sampleCount:       pStats?.sampleCount ?? 0,
           onboarding_state:  onboardingState,
+          featureWindow,
         })
 
         // Update our local state from the server's authoritative response.

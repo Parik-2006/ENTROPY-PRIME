@@ -1,0 +1,46 @@
+# Render deployment blueprint — Entropy Prime backend (FastAPI)
+# Secrets are NOT stored here: every secret env var uses `sync: false`, so it
+# must be set in the Render dashboard. Non-secret values are inlined.
+#
+# Entry point: backend.main:app  (backend/main.py inserts the repo root into
+# sys.path at import time, so `backend.*` absolute imports resolve from root).
+services:
+  - type: web
+    name: entropy-prime
+    runtime: python
+    plan: starter            # NOTE: torch makes the build heavy; free tier may OOM.
+    region: oregon
+    branch: main
+    buildCommand: "pip install -r backend/requirements.txt"
+    startCommand: "uvicorn backend.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: ENVIRONMENT
+        value: production
+      - key: MONGODB_DB_NAME
+        value: entropy_prime
+      - key: CORS_ORIGINS
+        value: "http://localhost:5173,http://localhost:3000"
+      - key: CORS_ORIGIN_REGEX
+        value: "https://.*\\.vercel\\.app"
+      # ── Secrets — set these in the Render dashboard (sync:false) ──────────────
+      - key: MONGODB_URI
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: EP_SESSION_SECRET
+        sync: false
+      - key: EP_API_KEY_SECRET
+        sync: false
+      - key: SHADOW_SECRET
+        sync: false

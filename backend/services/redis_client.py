@@ -41,9 +41,16 @@ async def get_redis() -> Optional[Any]:
     if _redis_pool is not None:
         return _redis_pool
     
-    redis_url = os.environ.get("EP_REDIS_URL", "")
+    # Accept EP_REDIS_URL (legacy) or REDIS_URL / REDIS_URI (deployment / Upstash).
+    # Upstash provides a rediss:// URL via REDIS_URL — used directly by redis-py.
+    redis_url = (
+        os.environ.get("EP_REDIS_URL")
+        or os.environ.get("REDIS_URL")
+        or os.environ.get("REDIS_URI")
+        or ""
+    )
     if not redis_url:
-        logger.debug("EP_REDIS_URL not set; Redis caching disabled")
+        logger.debug("No Redis URL set (EP_REDIS_URL / REDIS_URL / REDIS_URI); caching disabled")
         return None
     
     try:
