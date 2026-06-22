@@ -60,6 +60,14 @@ export async function runScore(params: {
   user_agent?: string
   latent_vector?: number[]
   fingerprint?: string
+  // Phase 3 MVP — optional attacker-intent signals (drive attack classification)
+  distinct_usernames?: number
+  failed_attempts?: number
+  password_attempts?: number
+  request_rate?: number
+  admin_path_hits?: number
+  unique_paths?: number
+  not_found_ratio?: number
 }): Promise<ScoreResponse> {
   const payload = {
     theta:         params.theta         ?? 0.5,
@@ -68,6 +76,13 @@ export async function runScore(params: {
     user_agent:    params.user_agent    ?? navigator.userAgent,
     latent_vector: params.latent_vector ?? [],
     fingerprint:   params.fingerprint   ?? '',
+    distinct_usernames: params.distinct_usernames ?? 0,
+    failed_attempts:    params.failed_attempts    ?? 0,
+    password_attempts:  params.password_attempts  ?? 0,
+    request_rate:       params.request_rate       ?? 0,
+    admin_path_hits:    params.admin_path_hits     ?? 0,
+    unique_paths:       params.unique_paths        ?? 0,
+    not_found_ratio:    params.not_found_ratio     ?? 0,
   }
   return post<ScoreResponse>('/score', payload)
 }
@@ -116,4 +131,63 @@ export async function fetchSignatures(): Promise<{
   count: number
 }> {
   return get('/honeypot/signatures')
+}
+
+// ── Phase 3 MVP — Shadow World + Threat Intel (additive) ──────────────────────
+//
+// After a shadow-routed "login success", the SDK navigates the attacker into a
+// synthetic world served from /api/shadow/*.  Every call carries the session
+// token as a bearer credential; the backend resolves which world (banking /
+// shadow_admin) the session belongs to.  These helpers let FakeVault /
+// FakeTerminal / ShadowDashboard render REAL backend-generated synthetic data
+// instead of hardcoded props.
+
+async function getAuthed<T>(path: string, sessionToken: string): Promise<T> {
+  const res = await fetch(`${BACKEND}${path}`, {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  })
+  if (!res.ok) throw new Error(`[honeypotClient] GET ${path} → ${res.status}`)
+  return res.json() as Promise<T>
+}
+
+/** Discover which synthetic world this shadow session is in + its assets. */
+export async function fetchShadowEnv(sessionToken: string): Promise<{
+  world: string
+  assets: string[]
+  user: { role: string }
+}> {
+  return getAuthed('/api/shadow/me', sessionToken)
+}
+
+/** Generic shadow-world asset fetcher (banking: dashboard/accounts/transactions/…). */
+export async function fetchShadowAsset<T = unknown>(
+  asset: string,
+  sessionToken: string,
+  query: Record<string, string | number> = {},
+): Promise<T> {
+  const qs = Object.entries(query)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&')
+  const suffix = qs ? `?${qs}` : ''
+  return getAuthed<T>(`/api/shadow/${asset}${suffix}`, sessionToken)
+}
+
+/** Shadow Admin asset fetcher (users/logs/analytics/config/secrets). */
+export async function fetchShadowAdmin<T = unknown>(
+  asset: string,
+  sessionToken: string,
+  query: Record<string, string | number> = {},
+): Promise<T> {
+  return fetchShadowAsset<T>(`admin/${asset}`, sessionToken, query)
+}
+
+/** Defender dashboard: recorded attacker sessions (ThreatPage / ThreatIntel). */
+export async function fetchDeceptionSessions(): Promise<{ sessions: any[] }> {
+  return get('/admin/deception/sessions')
+}
+
+/** Defender dashboard: recorded attacker events. */
+export async function fetchDeceptionEvents(sessionToken?: string): Promise<{ events: any[] }> {
+  const suffix = sessionToken ? `?session_token=${encodeURIComponent(sessionToken)}` : ''
+  return get(`/admin/deception/events${suffix}`)
 }

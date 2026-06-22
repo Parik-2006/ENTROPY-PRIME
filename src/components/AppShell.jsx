@@ -15,7 +15,12 @@ import { useAuth } from '../context/AuthContext'
 import { ThemeToggle } from './ui'
 import IdentityConfidence from './IdentityConfidence'
 import { TrustBanner, TrustModal } from './TrustGuards'
+import IdentityDebugPanel from './IdentityDebugPanel'
 import s from './AppShell.module.css'
+
+// Dev-only diagnostics toggle: append ?dev=1 to the URL.
+const DEV_DIAG = typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('dev') === '1'
 
 const NAV = [
   { section: 'Banking' },
@@ -30,6 +35,7 @@ const NAV = [
   { section: 'Entropy Prime' },
   { to: '/app/security',      label: 'Security Center',     icon: '🛡' },
   { to: '/app/threats',       label: 'Threat Intelligence', icon: '◬' },
+  { to: '/app/deception',     label: 'Deception Demo Lab',  icon: '🪤' },
   { to: '/app/settings',      label: 'Settings',       icon: '⚙' },
 ]
 
@@ -44,6 +50,7 @@ const TITLES = {
   '/app/profile':       ['Profile', 'Your personal details'],
   '/app/security':      ['Security Center', 'Entropy Prime — continuous identity assurance'],
   '/app/threats':       ['Threat Intelligence', 'Live threat feed & deception analytics'],
+  '/app/deception':     ['Deception Demo Lab', 'Simulate attacks through the live deception pipeline'],
   '/app/settings':      ['Settings', 'Preferences & advanced'],
 }
 
@@ -132,6 +139,7 @@ export default function AppShell() {
       </div>
 
       <TrustModal />
+      {DEV_DIAG && <IdentityDebugPanel />}
     </div>
   )
 }

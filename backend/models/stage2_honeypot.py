@@ -138,6 +138,7 @@ def run(
     mab_agent,
     shadow_secret: str,
     ip_address:    str = "?",
+    attack_class:  Optional[str] = None,
 ) -> HoneypotResult:
     """
     Decide shadow routing and, if shadowing, build a signed ChallengeConfig.
@@ -147,6 +148,14 @@ def run(
       • verdict == SUSPECT  AND  confidence in {HIGH, MEDIUM}
 
     A SUSPECT with LOW confidence gets the benefit of the doubt — no shadow.
+
+    Phase 3 MVP (additive, backward-compatible)
+      • ``attack_class`` is an OPTIONAL intent hint from the deception
+        classifier (framework.deception.classifier).  When supplied it is only
+        folded into the decoy seed for per-attack variation; it never changes
+        the routing decision, so existing callers are unaffected.
+      • Decoys are generated per-session via the anti-fingerprint factory when
+        available, falling back to the original static arm strategies.
     """
     should_shadow = _should_shadow(bio)
 
@@ -168,7 +177,10 @@ def run(
     token = _make_shadow_token(ip_address, arm, shadow_secret)
 
     # ── Build signed challenge config for the SDK ─────────────────────────────
-    challenge = _build_challenge(arm, shadow_secret)
+    # Seed decoys with the token (+ arm + attack_class) so they vary per session
+    # and per attack — defeating signature-based fingerprinting (Feature 6).
+    decoy_seed = f"{attack_class or 'unknown'}:{arm}:{token}"
+    challenge = _build_challenge(arm, shadow_secret, decoy_seed=decoy_seed)
 
     logger.info(
         "[S2] Shadow routing: verdict=%s arm=%d mab_conf=%s challenge=%s",
@@ -386,10 +398,46 @@ def _sign_challenge(
     return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
-def _build_challenge(arm: int, shadow_secret: str) -> ChallengeConfig:
+def _seeded_decoys(arm: int, decoy_seed: str) -> Optional[list[DecoySpec]]:
+    """
+    Build per-session randomized decoys via the anti-fingerprint factory.
+
+    Returns None if the framework deception package isn't importable (e.g. some
+    isolated unit-test contexts), so the caller falls back to the original
+    static arm strategies and nothing breaks.
+    """
+    try:
+        from framework.deception.anti_fingerprint import generate_decoys
+    except Exception:
+        return None
+    try:
+        # Arm influences the decoy count: tarpit (0) heaviest, canary (2) lightest.
+        count = {0: 4, 1: 4, 2: 2}.get(arm, 3)
+        fields = generate_decoys(decoy_seed, count=count)
+        return [
+            DecoySpec(
+                decoy_id     = fld.decoy_id,
+                kind         = fld.kind,
+                name         = fld.name,
+                label        = fld.label,
+                autocomplete = fld.autocomplete,
+                tab_index    = fld.tab_index,
+            )
+            for fld in fields
+        ]
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("[S2] seeded decoy generation failed (%s) — using static", exc)
+        return None
+
+
+def _build_challenge(arm: int, shadow_secret: str, decoy_seed: str = "") -> ChallengeConfig:
     challenge_id = secrets.token_urlsafe(16)
     expires_at   = time.time() + _CHALLENGE_TTL
-    decoys       = _ARM_STRATEGIES.get(arm, _arm2_canary_decoys)()
+    decoys       = None
+    if decoy_seed:
+        decoys = _seeded_decoys(arm, decoy_seed)
+    if decoys is None:
+        decoys   = _ARM_STRATEGIES.get(arm, _arm2_canary_decoys)()
     decoy_ids    = [d.decoy_id for d in decoys]
     signature    = _sign_challenge(challenge_id, arm, expires_at, decoy_ids, shadow_secret)
 

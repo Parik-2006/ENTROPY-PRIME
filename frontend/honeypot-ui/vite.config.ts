@@ -19,6 +19,8 @@ export default defineConfig({
       '/session':           { target: 'http://localhost:8000', changeOrigin: true },
       '/auth':              { target: 'http://localhost:8000', changeOrigin: true },
       '/admin':             { target: 'http://localhost:8000', changeOrigin: true },
+      // Phase 3 MVP — shadow world synthetic APIs
+      '/api/shadow':        { target: 'http://localhost:8000', changeOrigin: true },
     },
   },
 })

@@ -1174,6 +1174,88 @@ async def get_honeypot_count(db: AsyncIOMotorDatabase) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Deception MVP (Phase 3) — Shadow Sessions & Attacker Events
+# Additive: backs framework.deception.threat_intel with durable storage.
+# All functions are best-effort; callers wrap them so a missing/offline DB
+# never breaks the request path (the recorder keeps an in-process copy too).
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def store_shadow_session(
+    db: AsyncIOMotorDatabase,
+    session_token: str,
+    tenant_id:     str,
+    attack_class:  str,
+    world:         str,
+    arm:           int,
+    ip_address:    str,
+) -> str:
+    """Upsert a shadow (honeypot) session record keyed by session_token."""
+    doc = {
+        "session_token": session_token,
+        "tenant_id":     tenant_id,
+        "attack_class":  attack_class,
+        "world":         world,
+        "arm":           arm,
+        "ip_address":    ip_address,
+        "created_at":    datetime.utcnow(),
+        "last_seen":     datetime.utcnow(),
+    }
+    await db.shadow_sessions.update_one(
+        {"session_token": session_token},
+        {"$set": doc},
+        upsert=True,
+    )
+    return session_token
+
+
+async def store_attacker_event(
+    db: AsyncIOMotorDatabase,
+    session_token: str,
+    tenant_id:     str,
+    attack_class:  str,
+    event_type:    str,
+    detail:        Optional[dict] = None,
+) -> str:
+    """Append one attacker interaction event."""
+    entry = {
+        "session_token": session_token,
+        "tenant_id":     tenant_id,
+        "attack_class":  attack_class,
+        "event_type":    event_type,
+        "detail":        detail or {},
+        "ts":            datetime.utcnow(),
+    }
+    result = await db.attacker_events.insert_one(entry)
+    # Bump the parent session's activity timestamp (best-effort).
+    await db.shadow_sessions.update_one(
+        {"session_token": session_token},
+        {"$set": {"last_seen": datetime.utcnow()}},
+    )
+    return str(result.inserted_id)
+
+
+async def get_shadow_sessions(
+    db: AsyncIOMotorDatabase, limit: int = 100
+) -> list:
+    docs = await db.shadow_sessions.find().sort("last_seen", DESCENDING).limit(limit).to_list(limit)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+
+async def get_attacker_events(
+    db: AsyncIOMotorDatabase,
+    limit: int = 200,
+    session_token: Optional[str] = None,
+) -> list:
+    query = {"session_token": session_token} if session_token else {}
+    docs = await db.attacker_events.find(query).sort("ts", DESCENDING).limit(limit).to_list(limit)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Cleanup  (unchanged from v4.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
 

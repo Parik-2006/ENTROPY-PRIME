@@ -62,6 +62,19 @@ export interface ScoreResponse {
   challenge?: ChallengeConfig
   // Present only when latent_vector was provided (Stage 4)
   watchdog?: WatchdogResult
+  // Phase 3 MVP — present when shadow_mode=true.
+  //   redirect:     believable post-login navigation ("/dashboard" | "/admin")
+  //   attack_class: DEFENDER-FACING ONLY telemetry; never shown to the attacker
+  redirect?: string
+  attack_class?: string
+}
+
+// ── Shadow environment shapes (Phase 3 MVP) ──────────────────────────────────
+// Mirrors framework/deception/api.py :: GET /api/shadow/me
+export interface ShadowEnv {
+  world: 'banking' | 'shadow_admin' | string
+  assets: string[]
+  user: { role: string }
 }
 
 // ── /honeypot/trigger request ─────────────────────────────────────────────────

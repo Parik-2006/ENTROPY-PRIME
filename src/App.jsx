@@ -23,6 +23,7 @@ import Beneficiaries from './pages/bank/Beneficiaries'
 import Support       from './pages/bank/Support'
 import SecurityCenter from './pages/security/SecurityCenter'
 import ThreatIntel    from './pages/security/ThreatIntel'
+import DeceptionLab   from './pages/security/DeceptionLab'
 
 // Legacy (kept reachable — nothing removed)
 import ProfileBuildPage from './pages/ProfileBuildPage'
@@ -82,6 +83,7 @@ export default function App() {
               <Route path="profile"       element={<Profile />} />
               <Route path="security"      element={<SecurityCenter />} />
               <Route path="threats"       element={<ThreatIntel />} />
+              <Route path="deception"     element={<DeceptionLab />} />
               <Route path="settings"      element={<Settings />} />
             </Route>
 

@@ -1,10 +1,15 @@
 # Environment variables (never commit secrets)
+# Catch-all: ignore every *.env file in any directory, but ALWAYS keep the
+# documented *.env.example / *.env.template references.
+*.env
 .env
-.env.local
-.env.local.template
-.env.*.local
-.env.production
+.env.*
+**/.env
+**/.env.*
 all.env
+!*.env.example
+!*.env.template
+!.env.example
 
 # Certificates & keys (never commit)
 *.pem

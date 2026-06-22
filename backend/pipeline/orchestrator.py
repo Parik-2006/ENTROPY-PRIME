@@ -221,12 +221,15 @@ class PipelineOrchestrator:
     ) -> PipelineOutput:
         shadow_mode = honeypot.should_shadow
 
-        # Session token: shadow gets a "bot_" prefix so the client can detect
-        # it only if they know the pattern (they shouldn't)
-        if shadow_mode:
-            token = honeypot.synthetic_token or ("bot_" + secrets.token_hex(32))
-        else:
-            token = _make_session_token("anon", raw.latent_vector, self._session_secret)
+        # Phase 3 MVP — Synthetic Success Injection (Feature 1):
+        # Shadow sessions now receive a token in the SAME format as a genuine
+        # session token (ep_<hmac>_<rand>).  No "bot_"/"ep_shadow_" marker is
+        # placed on the wire, so an attacker cannot detect shadow mode by
+        # inspecting their token.  The "this is shadow" fact is tracked
+        # server-side (framework.deception.synthetic_success.ShadowStateStore,
+        # registered by main.py) and via PipelineOutput.shadow_mode for the
+        # defender dashboard only.
+        token = _make_session_token("anon", raw.latent_vector, self._session_secret)
 
         argon2_params = {
             "time_cost":   governor.time_cost,

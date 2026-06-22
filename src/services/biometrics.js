@@ -14,6 +14,48 @@ const CNN_SEQ_LEN  = 50
 const CNN_FEATURES = 8   // dwell, flight, speed, jitter, accel, rhythm, pressure_proxy, pause
 const LATENT_DIM   = 32
 const EREC_THRESH  = 0.18
+
+// Inactivity threshold for continuous auth. If no keyboard/pointer event has
+// been captured within this window, the session is considered IDLE: drift is
+// frozen and the trust score is held (idle is not behavioural deviation).
+const INACTIVITY_MS = 5000
+
+// ── Frozen-template identity scoring (human-vs-human discrimination) ──────────
+// A frozen enrollment template is compared against the live typing signature.
+// Typing + digraph dominate; mouse is a weak tie-breaker. A large typing/
+// digraph mismatch is GATED (capped) so matching mouse data can't hide a
+// different human. Scores map to zones with hysteresis to avoid false positives.
+const ID_W_TYPING   = 0.40
+const ID_W_DIGRAPH  = 0.40
+const ID_W_MOUSE    = 0.20
+const ID_TOL_TYPING  = 0.30   // relative-diff tolerance (Gaussian width) — owner variation stays high
+const ID_TOL_DIGRAPH = 0.30
+const ID_TOL_MOUSE   = 0.60   // mouse is lenient (noisy, low weight)
+const ID_GATE_DWELL   = 0.30  // relative-diff gate thresholds — exceed any → strong penalty
+const ID_GATE_FLIGHT  = 0.28
+const ID_GATE_DIGRAPH = 0.30
+const ID_GATE_CAP     = 40    // a gated typing mismatch caps the identity score here (→ re-auth zone)
+const ID_ENROLL_MIN_KEYS     = 30   // keystrokes required before the template auto-freezes
+const ID_ENROLL_MIN_DIGRAPHS = 10   // distinct digraphs required
+const ID_MIN_LIVE_KEYS  = 12   // need at least this much live evidence to score (else hold)
+const ID_REAUTH_STREAK  = 3    // (legacy, kept for back-compat logging)
+const ID_REAUTH_COOLDOWN_MS = 120_000 // after a successful verify, suppress new re-auth for 120 s
+
+// Progressive scoring (replaces the binary hard cap) ─────────────────────────
+const ID_TRUSTED_MIN  = 80     // ≥80 Trusted
+const ID_MONITOR_MIN  = 60     // 60–80 Monitor, <60 candidate Re-auth
+const ID_SMOOTH_ALPHA = 0.25   // EMA smoothing → confidence decays gradually (no instant jumps)
+const ID_WINDOW       = 20     // rolling window of recent evaluations
+const ID_SUSP_MAX     = 14     // suspicion accumulator ceiling
+const ID_SUSP_REAUTH  = 8      // sustained suspicion required before re-auth is allowed
+const ID_SUSP_MIN_LOW = 10     // ≥ this many of the last 20 evals below 60 (sustained pattern)
+const ID_CORROB_DIGRAPH = 0.80 // strong digraph match → very likely the owner (Task 7)
+const ID_CORROB_MOUSE   = 0.75 // strong mouse match → don't escalate on typing-speed alone
+const ID_MONITOR_FLOOR  = 0.60 // hold effective trust here until a sustained pattern is confirmed
+
+const idZone = (s) => (s >= 80 ? 'trusted' : s >= 60 ? 'monitor' : 'reauth')
+const _gaussSim = (relDiff, tol) => Math.exp(-0.5 * (relDiff / tol) ** 2)
+const _relDiff  = (a, b) => Math.abs(a - b) / Math.max(Math.abs(b), 1e-6)
 const PROFILE_WIN  = 200  // rolling window for per-user profile update
 const DRIFT_ALPHA  = 0.05 // EMA coefficient for profile smoothing
 const FEAT_K       = 6    // top-K features selected per user
@@ -261,6 +303,24 @@ export class KeyboardCollector {
 
   getWindow(n = CNN_SEQ_LEN) { return this._events.slice(-n) }
 
+  /** Timestamp (performance.now ms) of the most recent keystroke, or -Infinity. */
+  getLastTs() { const e = this._events; return e.length ? e[e.length - 1].ts : -Infinity }
+
+  /** Copy of the per-digraph smoothed-latency map ("prevCode>code" → ms). */
+  getDigraphMap() { return { ...this._bigramTs } }
+  getDigraphCount() { return Object.keys(this._bigramTs).length }
+
+  /** Mean+std of dwell and flight over the last `n` keystrokes. */
+  getDwellFlightStats(n = 200) {
+    const ev = this._events.slice(-n)
+    if (!ev.length) return { dwellMean: 0, dwellStd: 0, flightMean: 0, flightStd: 0, count: 0 }
+    const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length
+    const std  = (a, m) => Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length)
+    const dw = ev.map(e => e.dwell), fl = ev.map(e => e.flight)
+    const dm = mean(dw), fm = mean(fl)
+    return { dwellMean: dm, dwellStd: std(dw, dm), flightMean: fm, flightStd: std(fl, fm), count: ev.length }
+  }
+
   getStats() {
     if (!this._events.length) return { avgDwell: 0, avgFlight: 0, count: 0 }
     const avg = arr => arr.reduce((s, v) => s + v, 0) / arr.length
@@ -321,6 +381,9 @@ export class PointerCollector {
   }
 
   getWindow(n = CNN_SEQ_LEN) { return this._samples.slice(-n) }
+
+  /** Timestamp (performance.now ms) of the most recent pointer sample, or -Infinity. */
+  getLastTs() { const s = this._samples; return s.length ? s[s.length - 1].ts : -Infinity }
 
   getStats() {
     if (!this._samples.length) return { avgSpeed: 0, avgJitter: 0, avgAccel: 0, count: 0 }
@@ -500,6 +563,60 @@ export function loadUserProfile(userId) {
   }
 }
 
+// ── Frozen Enrollment Template ────────────────────────────────────────────────
+/**
+ * Immutable snapshot of the OWNER's typing signature, captured once at
+ * enrollment and NEVER adapted afterwards. Verification compares the live
+ * signature against this frozen template, so an impostor can never become the
+ * new baseline (the EMA-laundering failure mode is eliminated).
+ */
+const TEMPLATE_PREFIX = 'ep_enrolltpl_'
+
+export class EnrollmentTemplate {
+  constructor(data) {
+    this.dwellMean   = data.dwellMean
+    this.dwellStd    = data.dwellStd
+    this.flightMean  = data.flightMean
+    this.flightStd   = data.flightStd
+    this.digraphs    = data.digraphs || {}   // "prevCode>code" → latency ms
+    this.mouse       = data.mouse || { speed: 0, jitter: 0, accel: 0 }
+    this.frozenAt    = data.frozenAt || Date.now()
+    this.basisKeys   = data.basisKeys || 0
+  }
+
+  /** Capture a frozen template from the current capture buffers. */
+  static capture(keyboard, pointer) {
+    const kf = keyboard.getDwellFlightStats(300)
+    const ms = pointer.getStats()
+    return new EnrollmentTemplate({
+      dwellMean:  kf.dwellMean,
+      dwellStd:   kf.dwellStd,
+      flightMean: kf.flightMean,
+      flightStd:  kf.flightStd,
+      digraphs:   keyboard.getDigraphMap(),
+      mouse:      { speed: ms.avgSpeed || 0, jitter: ms.avgJitter || 0, accel: ms.avgAccel || 0 },
+      frozenAt:   Date.now(),
+      basisKeys:  kf.count,
+    })
+  }
+
+  toJSON() { return { ...this } }
+  static fromJSON(obj) { return obj ? new EnrollmentTemplate(obj) : null }
+}
+
+export function saveEnrollmentTemplate(userId, tpl) {
+  try { localStorage.setItem(TEMPLATE_PREFIX + userId, JSON.stringify(tpl.toJSON())) } catch {}
+}
+export function loadEnrollmentTemplate(userId) {
+  try {
+    const raw = localStorage.getItem(TEMPLATE_PREFIX + userId)
+    return raw ? EnrollmentTemplate.fromJSON(JSON.parse(raw)) : null
+  } catch { return null }
+}
+export function clearEnrollmentTemplate(userId) {
+  try { localStorage.removeItem(TEMPLATE_PREFIX + userId) } catch {}
+}
+
 // ── Main Client ───────────────────────────────────────────────────────────────
 export class EntropyPrimeClient {
   constructor() {
@@ -516,6 +633,18 @@ export class EntropyPrimeClient {
     this.behavioralProfile   = new UserBehavioralProfile()
     this.featureSelector     = new UserFeatureSelector()
     this._featureSampleCount = 0
+    // Frozen-template identity scoring
+    this.enrollTemplate      = null
+    this._lastIdentity       = null
+    this._reauthStreak       = 0
+    this._reauthCooldownUntil = 0       // FIX 4: post-verify cooldown
+    this._lastEvalKeyTs       = -Infinity  // FIX 3: require NEW evidence
+    this._lastEvalPtrTs       = -Infinity
+    this._idleLogged          = false   // throttle idle debug logging
+    // Progressive scoring state
+    this._scoreWindow         = []      // rolling window of raw scores
+    this._suspicion           = 0       // suspicion accumulator
+    this._smoothConf          = null    // EMA-smoothed confidence
   }
 
   setUpdateCallback(fn) { this._onUpdate = fn }
@@ -526,6 +655,170 @@ export class EntropyPrimeClient {
       const { profile, selector } = loadUserProfile(userId)
       this.behavioralProfile = profile
       this.featureSelector   = selector
+      this.enrollTemplate    = loadEnrollmentTemplate(userId)
+      this._lastIdentity     = null
+      this._reauthStreak     = 0
+    }
+  }
+
+  /** Discard the frozen template so the next sufficient typist re-enrolls. */
+  resetEnrollmentTemplate() {
+    this.enrollTemplate = null
+    this._lastIdentity  = null
+    this._reauthStreak  = 0
+    this._scoreWindow   = []
+    this._suspicion     = 0
+    this._smoothConf    = null
+    if (this._userId) clearEnrollmentTemplate(this._userId)
+  }
+
+  /**
+   * FIX 1 + FIX 4 — called after a successful re-authentication / verify.
+   * Returns the session to a clean trusted state and starts a cooldown during
+   * which no new re-auth can fire (prevents the immediate re-auth loop). The
+   * frozen enrollment template is NOT touched — identity is still owner-bound.
+   */
+  confirmVerified() {
+    this._reauthStreak  = 0                 // clear streak / gating state
+    this._suspicion     = 0                 // clear suspicion accumulator
+    this._scoreWindow   = []                // clear rolling window
+    this._smoothConf    = 100               // restart smoothed confidence at trusted
+    this._reauthCooldownUntil = performance.now() + ID_REAUTH_COOLDOWN_MS
+    if (this.watchdog) {
+      this.watchdog.trustScore = 1.0        // clear watchdog temporary penalties
+      this.watchdog.lastERec   = 0
+    }
+    // Snap identity back to fully trusted so idle/heartbeat read a clean value.
+    this._lastIdentity = this.enrollTemplate
+      ? { identityScore: 100, rawScore: 100, suspicion: 0, zone: 'trusted', reauth: false,
+          cooldown: true, corroborated: true, effectiveTrust: 1.0,
+          typingSim: 1, digraphSim: 1, mouseSim: 1, gated: false, sharedDigraphs: 0 }
+      : null
+    console.log('[Reauth] Reauth Success')
+    console.log('[Reauth] Trust Reset (trustScore=1.0, identityScore=100, streak=0)')
+    console.log(`[Reauth] Cooldown Started (${ID_REAUTH_COOLDOWN_MS / 1000}s)`)
+  }
+
+  /**
+   * Freeze the enrollment template once enough OWNER evidence exists and no
+   * template is stored yet. The first sufficiently-typed session becomes the
+   * immutable baseline; it is never updated afterwards.
+   */
+  _maybeEnroll() {
+    if (this.enrollTemplate) return
+    if (this.keyboard._events.length < ID_ENROLL_MIN_KEYS) return
+    if (this.keyboard.getDigraphCount() < ID_ENROLL_MIN_DIGRAPHS) return
+    this.enrollTemplate = EnrollmentTemplate.capture(this.keyboard, this.pointer)
+    if (this._userId) saveEnrollmentTemplate(this._userId, this.enrollTemplate)
+    console.log('[Enroll] Frozen template captured:',
+      `dwell=${this.enrollTemplate.dwellMean.toFixed(0)}ms`,
+      `flight=${this.enrollTemplate.flightMean.toFixed(0)}ms`,
+      `digraphs=${Object.keys(this.enrollTemplate.digraphs).length}`)
+  }
+
+  /**
+   * Identity score (0–100) of the live typing signature vs the frozen template.
+   * Typing + digraph dominate; mouse is a weak tie-breaker. A large typing or
+   * digraph mismatch is gated so matching mouse data cannot mask a different
+   * human. Returns null when there isn't enough live evidence (hold trust).
+   */
+  computeIdentity() {
+    const tpl = this.enrollTemplate
+    if (!tpl) return null
+    const live = this.keyboard.getDwellFlightStats(CNN_SEQ_LEN)
+    if (live.count < ID_MIN_LIVE_KEYS) return null
+
+    // ── Typing similarity (dwell + flight means, relative-diff) ──────────────
+    const dwellRel  = _relDiff(live.dwellMean,  tpl.dwellMean)
+    const flightRel = _relDiff(live.flightMean, tpl.flightMean)
+    const typingSim = (_gaussSim(dwellRel, ID_TOL_TYPING) + _gaussSim(flightRel, ID_TOL_TYPING)) / 2
+
+    // ── Digraph similarity (shared digraphs only) ────────────────────────────
+    const liveDg = this.keyboard.getDigraphMap()
+    const shared = Object.keys(tpl.digraphs).filter(k => liveDg[k] !== undefined)
+    let digraphSim, digraphRel = 0
+    if (shared.length >= 3) {
+      const rels = shared.map(k => _relDiff(liveDg[k], tpl.digraphs[k]))
+      digraphRel = rels.reduce((s, v) => s + v, 0) / rels.length
+      digraphSim = _gaussSim(digraphRel, ID_TOL_DIGRAPH)
+    } else {
+      digraphSim = typingSim   // not enough overlap → defer to typing
+    }
+
+    // ── Mouse similarity (weak, lenient) ─────────────────────────────────────
+    const pm = this.pointer.getStats()
+    const mouseRel = (
+      _relDiff(pm.avgSpeed  || 0, tpl.mouse.speed)  +
+      _relDiff(pm.avgJitter || 0, tpl.mouse.jitter) +
+      _relDiff(pm.avgAccel  || 0, tpl.mouse.accel)
+    ) / 3
+    const mouseSim = pm.count > 5 ? _gaussSim(mouseRel, ID_TOL_MOUSE) : 1.0
+
+    // ── Weighted combine — CONTINUOUS, no hard cap (Task 1) ──────────────────
+    const rawScore = Math.max(0, Math.min(100, Math.round(
+      100 * (ID_W_TYPING * typingSim + ID_W_DIGRAPH * digraphSim + ID_W_MOUSE * mouseSim)
+    )))
+    // `gated` is kept as a diagnostic flag only — it NO LONGER caps the score.
+    const gated = dwellRel > ID_GATE_DWELL || flightRel > ID_GATE_FLIGHT || digraphRel > ID_GATE_DIGRAPH
+
+    // ── Rolling window of recent evaluations (Task 4) ────────────────────────
+    this._scoreWindow.push(rawScore)
+    if (this._scoreWindow.length > ID_WINDOW) this._scoreWindow.shift()
+    const lowCount = this._scoreWindow.filter(v => v < ID_MONITOR_MIN).length
+
+    // ── Gradual confidence via EMA smoothing (Task 6: 98→90→82→… not 98→40) ──
+    this._smoothConf = this._smoothConf == null
+      ? rawScore
+      : (1 - ID_SMOOTH_ALPHA) * this._smoothConf + ID_SMOOTH_ALPHA * rawScore
+    const conf = Math.max(0, Math.min(100, Math.round(this._smoothConf)))
+
+    // ── Corroboration (Task 7): a strong digraph + mouse match means this is
+    //    very likely the OWNER typing in a different context (speed varies). Do
+    //    not escalate to re-auth even when typing similarity drops. ───────────
+    const corroborated = digraphSim > ID_CORROB_DIGRAPH && mouseSim > ID_CORROB_MOUSE
+
+    // ── Suspicion accumulator (Tasks 2 & 5) ──────────────────────────────────
+    if (corroborated || conf >= ID_TRUSTED_MIN) {
+      this._suspicion = Math.max(0, this._suspicion - 2)         // strong evidence → recover
+    } else if (conf < ID_MONITOR_MIN) {
+      this._suspicion = Math.min(ID_SUSP_MAX, this._suspicion + 1)  // sustained low → accrue
+    } else {
+      this._suspicion = Math.max(0, this._suspicion - 0.5)       // monitor band → slow recover
+    }
+
+    // ── Three states (Task 3) ────────────────────────────────────────────────
+    const zone = conf >= ID_TRUSTED_MIN ? 'trusted'
+               : conf >= ID_MONITOR_MIN ? 'monitor'
+               : 'reauth'
+
+    // ── Re-auth only on a SUSTAINED pattern (Tasks 5,7,FIX 4) ────────────────
+    const inCooldown = performance.now() < this._reauthCooldownUntil
+    const sustained  = this._suspicion >= ID_SUSP_REAUTH && lowCount >= ID_SUSP_MIN_LOW
+    const reauth = !inCooldown && !corroborated && sustained
+    this._reauthStreak = sustained ? this._reauthStreak + 1 : 0   // legacy/back-compat
+
+    // Effective trust drives the visible confidence and the modal. It eases
+    // gradually with `conf`; until a sustained pattern is confirmed (or while
+    // corroborated / in cooldown) it is held in the monitor band so a transient
+    // dip never crosses into the re-auth/modal range. Once sustained, the true
+    // low score is released and the modal fires.
+    let effectiveTrust = conf / 100
+    if (!reauth) effectiveTrust = Math.max(effectiveTrust, ID_MONITOR_FLOOR)
+
+    return {
+      identityScore: conf,           // smoothed (gradual) — the progressive score
+      rawScore,                      // instantaneous similarity (diagnostic)
+      suspicion: Math.round(this._suspicion * 10) / 10,
+      zone,
+      reauth,
+      cooldown: inCooldown,
+      corroborated,
+      effectiveTrust,
+      typingSim:  +typingSim.toFixed(3),
+      digraphSim: +digraphSim.toFixed(3),
+      mouseSim:   +mouseSim.toFixed(3),
+      gated,
+      sharedDigraphs: shared.length,
     }
   }
 
@@ -543,8 +836,34 @@ export class EntropyPrimeClient {
     this._onUpdate?.({ type: 'ready' })
   }
 
+  /**
+   * Idle = no KEYBOARD activity within INACTIVITY_MS.
+   *
+   * DEMO-CRITICAL FIX: identity is a TYPING signature, so only keystrokes count
+   * as activity. Mouse movement / scrolling must NEVER un-freeze scoring (they
+   * would otherwise re-score against a stale keyboard window and drop the score
+   * even though the user is not typing). Pointer activity is deliberately
+   * ignored here.
+   */
+  _isIdle() {
+    return (performance.now() - this.keyboard.getLastTs()) > INACTIVITY_MS
+  }
+
   async _liveEval() {
     if (!this._ready || !this.cnn) return
+    // Idle sessions produce no new behavioural evidence. Skipping the eval keeps
+    // sampleCount/drift/EMA frozen so inactivity is never mistaken for drift.
+    // FIX 2: idle freezes identity, drift, reauth counters and watchdog — and
+    // emits no re-auth. Log once per idle entry (throttled).
+    if (this._isIdle()) {
+      if (!this._idleLogged) {
+        console.log('[Identity] Idle Detected')
+        console.log('[Identity] Behavior Evaluation Skipped (idle — frozen)')
+        this._idleLogged = true
+      }
+      return
+    }
+    this._idleLogged = false
     try {
       const t = buildCNNInput(
         this.keyboard.getWindow(), this.pointer.getWindow(), this.keyboard
@@ -572,6 +891,50 @@ export class EntropyPrimeClient {
         selectedFeatures: this.featureSelector.selectedIndices,
         featureNames:     this.featureSelector.selectedIndices.map(i => FEATURE_NAMES[i]),
       })
+
+      // ── Frozen-template identity scoring (human-vs-human) ──────────────────
+      // Auto-freeze the owner's template on first sufficient typing, then score
+      // every live tick against it. This is the dominant trust signal: it drives
+      // trustScore so a different human drops confidence and triggers re-auth.
+      this._maybeEnroll()
+
+      // DEMO-CRITICAL FIX: only (re)score identity when there is genuinely NEW
+      // KEYBOARD evidence since the last evaluation. Mouse movement / scrolling
+      // must NOT trigger scoring — otherwise a mouse-only session re-scores
+      // against a stale keyboard window and the mouse-similarity term drifts the
+      // confidence down even though the user is not typing.
+      const keyTs = this.keyboard.getLastTs()
+      const hasNewEvidence = keyTs > this._lastEvalKeyTs
+      if (!hasNewEvidence) {
+        console.log('[Identity] Behavior Evaluation Skipped (no new keyboard evidence)')
+        return
+      }
+      this._lastEvalKeyTs = keyTs
+
+      const id = this.computeIdentity()
+      if (id) {
+        this._lastIdentity = id
+        if (this.watchdog) this.watchdog.trustScore = id.effectiveTrust
+        console.log(
+          `[Identity] conf=${id.identityScore} raw=${id.rawScore} zone=${id.zone} ` +
+          `suspicion=${id.suspicion} typing=${id.typingSim} digraph=${id.digraphSim} mouse=${id.mouseSim}` +
+          (id.corroborated ? ' [CORROBORATED]' : '') + (id.reauth ? ' [RE-AUTH]' : '')
+        )
+        this._onUpdate?.({
+          type:          'identity',
+          identityScore: id.identityScore,
+          rawScore:      id.rawScore,
+          suspicion:     id.suspicion,
+          zone:          id.zone,
+          reauth:        id.reauth,
+          corroborated:  id.corroborated,
+          trustScore:    id.effectiveTrust,
+          typingSim:     id.typingSim,
+          digraphSim:    id.digraphSim,
+          mouseSim:      id.mouseSim,
+          gated:         id.gated,
+        })
+      }
     } catch (e) {
       console.error('[LiveEval] error:', e)
     }
@@ -615,9 +978,70 @@ export class EntropyPrimeClient {
    * Used by the watchdog heartbeat.
    */
   async checkIdentity() {
-    const vec = await this.getLatentVector()
-    if (!this.watchdog) return { eRec: 0, trustScore: 1 }
+    // FIX: the watchdog autoencoder reconstructs the ORIGINAL behavioural
+    // feature vector (CNN_SEQ_LEN * CNN_FEATURES = 400 dims), NOT the 32-dim
+    // latent. Previously this passed getLatentVector() (32 dims) into the
+    // autoencoder, causing the runtime error:
+    //   "expected input4 to have shape [null,400] but got array with shape [1,32]"
+    // The 32-dim latent is still produced separately by getLatentVector() for
+    // the backend /session/verify call — only the client-side anomaly check
+    // uses the 400-dim feature vector here.
+    // Idle guard: with no recent interaction there is no new behavioural
+    // evidence, so HOLD the previous confidence instead of decaying it. This
+    // prevents inactivity from being scored as drift / deviation.
+    if (this._isIdle()) {
+      return {
+        eRec:       this.watchdog?.lastERec ?? 0,
+        trustScore: this.watchdog?.trustScore ?? 1,
+        idle:       true,
+      }
+    }
+
+    // Frozen-template identity is the authoritative trust signal once enrolled.
+    // It is recomputed continuously in _liveEval; reuse the latest result so the
+    // 30 s server heartbeat agrees with the live confidence the user sees.
+    if (this.enrollTemplate && this._lastIdentity) {
+      const id = this._lastIdentity
+      return {
+        eRec:          this.watchdog?.lastERec ?? 0,
+        trustScore:    id.effectiveTrust,
+        idle:          false,
+        identityScore: id.identityScore,
+        zone:          id.zone,
+        reauth:        id.reauth,
+      }
+    }
+
+    const vec = await this._buildWatchdogInput()
+    if (!this.watchdog || !vec) {
+      return {
+        eRec:       this.watchdog?.lastERec ?? 0,
+        trustScore: this.watchdog?.trustScore ?? 1,
+      }
+    }
     return this.watchdog.check(vec, this.behavioralProfile)
+  }
+
+  /**
+   * Build the 400-dim autoencoder input (flattened [1, 50, 8] CNN window).
+   * Returns null when there isn't enough recent input — the heartbeat then
+   * skips the anomaly check this tick instead of crashing.
+   */
+  async _buildWatchdogInput() {
+    try {
+      const keyEvents     = this.keyboard.getWindow(CNN_SEQ_LEN)
+      const pointerEvents = this.pointer.getWindow(CNN_SEQ_LEN)
+      if (keyEvents.length < 10) return null
+      const tensor    = buildCNNInput(keyEvents, pointerEvents, this.keyboard)
+      const flattened = tensor.reshape([1, CNN_SEQ_LEN * CNN_FEATURES])
+      tensor.dispose()
+      const arr = Array.from(await flattened.data())
+      flattened.dispose()
+      return arr
+    } catch (e) {
+      console.error('[checkIdentity] watchdog input build failed:', e)
+      return null
+    }
   }
 
   getKeyboardStats() { return this.keyboard.getStats() }
@@ -631,6 +1055,9 @@ export class EntropyPrimeClient {
       isDrifting:        this.behavioralProfile.isDrifting,
       selectedFeatures:  this.featureSelector.selectedIndices.map(i => FEATURE_NAMES[i]),
       featureMeans:      Array.from(this.featureSelector.means),
+      // Frozen-template identity diagnostics (for the dev debug panel)
+      enrolled:          !!this.enrollTemplate,
+      identity:          this._lastIdentity,
     }
   }
 

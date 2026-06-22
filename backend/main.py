@@ -95,6 +95,8 @@ from backend.database import (
     get_biometric_profile_summary, get_onboarding_state, set_onboarding_state,
     reset_biometric_profile, profile_build_summary,
     store_honeypot_entry, get_honeypot_signatures, get_honeypot_count,
+    # Phase 3 MVP — deception threat-intel storage (additive)
+    store_shadow_session, store_attacker_event, get_shadow_sessions, get_attacker_events,
     log_drift_event,
     # Phase D.1 (shadow mode — validation only)
     freeze_enrollment_baseline, get_enrollment_baseline, log_biometric_comparison,
@@ -149,6 +151,25 @@ logger.info("Starting Entropy Prime v4.0.2 (log level: %s)", os.environ.get("LOG
 
 SESSION_SECRET = os.environ.get("EP_SESSION_SECRET", secrets.token_hex(32))
 SHADOW_SECRET  = os.environ.get("EP_SHADOW_SECRET",  secrets.token_hex(32))
+
+# ── Phase 3 MVP — Deception Engine (additive, best-effort) ──────────────────
+# The deception layer lives in framework.deception and is imported defensively:
+# if the package is unavailable for any reason the core pipeline still runs and
+# /score behaves exactly as before.
+try:
+    from framework.deception.classifier import classify as classify_attack, AttackSignals
+    from framework.deception.classifier.attack_classifier import DEFAULT_STRATEGY_FOR_CLASS
+    from framework.deception.synthetic_success import SyntheticSuccessInjector
+    from framework.deception.threat_intel import get_recorder as get_threat_recorder
+    synthetic_injector = SyntheticSuccessInjector(secret=SESSION_SECRET)
+    threat_recorder    = get_threat_recorder()
+    DECEPTION_AVAILABLE = True
+    logger.info("✓ Deception engine (Phase 3 MVP) loaded")
+except Exception as _dec_exc:  # pragma: no cover - deception layer is best-effort
+    synthetic_injector  = None
+    threat_recorder     = None
+    DECEPTION_AVAILABLE = False
+    logger.warning("Deception engine not loaded (non-fatal): %s", _dec_exc)
 
 db_handler = Database()
 
@@ -288,6 +309,23 @@ async def lifespan(app: FastAPI):
     logger.info(
         "✓ Entropy Prime v4.0.2 initialised — 4-stage pipeline + onboarding state machine"
     )
+
+    # ── Runtime route audit ────────────────────────────────────────────────
+    # Prints EVERY path registered on THIS app instance at startup, so a 404 on
+    # a route that exists in source can be diagnosed without guesswork.
+    try:
+        _all_paths = sorted({getattr(r, "path", "?") for r in app.routes})
+        logger.info("[RouteAudit] %d routes registered on this app:", len(_all_paths))
+        for _p in _all_paths:
+            logger.info("[RouteAudit]   %s", _p)
+        for _need in ("/admin/deception/summary", "/admin/deception/sessions", "/admin/deception/events"):
+            logger.info(
+                "[RouteAudit] %s : %s",
+                _need, "PRESENT" if _need in _all_paths else "MISSING ❌",
+            )
+    except Exception as _audit_exc:  # never block startup on the audit
+        logger.error("[RouteAudit] failed: %s", _audit_exc)
+
     yield
 
     logger.info("🛑 Entropy Prime shutting down…")
@@ -335,6 +373,46 @@ app.add_middleware(
     allow_methods     = ["*"],
     allow_headers     = ["*"],
 )
+
+# ── Phase 3 MVP — mount the Deception shadow API (additive, best-effort) ─────
+# Exposes /api/shadow/* (synthetic banking + shadow-admin worlds) and
+# /admin/deception/* (threat-intel views).  Wrapped so a failure to load the
+# deception router never prevents the core API from starting.
+try:
+    from framework.deception.api import router as deception_router
+    app.include_router(deception_router)
+    _dec_paths = sorted({r.path for r in deception_router.routes})
+    logger.info(
+        "✓ Deception shadow API mounted (%d routes): %s",
+        len(_dec_paths), ", ".join(_dec_paths),
+    )
+except Exception as _dec_router_exc:  # non-fatal, but must NOT be silent —
+    # a swallowed failure here is exactly what makes /admin/deception/* and
+    # /api/shadow/* return 404 with no explanation. Log the full traceback so
+    # the cause is diagnosable instead of invisible.
+    logger.error(
+        "Deception shadow API NOT mounted — /admin/deception/* and "
+        "/api/shadow/* will 404. Cause: %s",
+        _dec_router_exc, exc_info=True,
+    )
+
+
+# ── Runtime route probe ──────────────────────────────────────────────────────
+# Returns the live route table of THIS running app instance. Use it to confirm
+# (a) whether the deception routes are actually registered in the process, and
+# (b) that your request reaches this app (the JSON `app` id is process-unique).
+@app.get("/__debug/routes")
+async def __debug_routes():
+    paths = sorted({getattr(r, "path", "?") for r in app.routes})
+    needed = ["/admin/deception/summary", "/admin/deception/sessions", "/admin/deception/events"]
+    return {
+        "app_id":          hex(id(app)),
+        "total_routes":    len(paths),
+        "deception_mounted": all(p in paths for p in needed),
+        "deception_routes": {p: (p in paths) for p in needed},
+        "shadow_routes":   [p for p in paths if p.startswith("/api/shadow")],
+        "routes":          paths,
+    }
 
 
 @app.middleware("http")
@@ -413,6 +491,17 @@ class ScoreReq(BaseModel):
     user_agent:    str         = ""
     latent_vector: list[float] = Field(default_factory=list)
     fingerprint:   str         = ""
+    # Phase 3 MVP (Feature 2) — OPTIONAL attacker-intent signals used by the
+    # deception classifier when a session is shadow-routed.  All default to 0,
+    # so existing /score callers are unaffected; an SDK/gateway that tracks
+    # auth history can populate them to get precise attack classification.
+    distinct_usernames: int   = Field(0, ge=0)
+    failed_attempts:    int   = Field(0, ge=0)
+    password_attempts:  int   = Field(0, ge=0)
+    request_rate:       float = Field(0.0, ge=0.0)
+    admin_path_hits:    int   = Field(0, ge=0)
+    unique_paths:       int   = Field(0, ge=0)
+    not_found_ratio:    float = Field(0.0, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _validate(self):
@@ -682,6 +771,10 @@ async def score(req: ScoreReq, request: Request):
 
     result = orchestrator.run(raw)
 
+    # Phase 3 MVP — populated when shadow-routed so the response can carry the
+    # believable redirect + (defender-only) attack classification.
+    deception_meta: dict = {}
+
     if result.shadow_mode:
         try:
             await store_honeypot_entry(
@@ -694,6 +787,74 @@ async def score(req: ScoreReq, request: Request):
             )
         except Exception as exc:
             logger.error("[Honeypot] DB write failed: %s", exc)
+
+        # ── Deception engine: classify intent → register shadow world ──────────
+        if DECEPTION_AVAILABLE:
+            try:
+                signals = AttackSignals(
+                    distinct_usernames = req.distinct_usernames,
+                    failed_attempts    = req.failed_attempts,
+                    password_attempts  = req.password_attempts,
+                    request_rate       = req.request_rate,
+                    admin_path_hits    = req.admin_path_hits,
+                    unique_paths       = req.unique_paths,
+                    not_found_ratio    = req.not_found_ratio,
+                    theta              = req.theta,
+                    user_agent         = req.user_agent or "",
+                )
+                clf = classify_attack(signals)
+
+                # Synthetic Success Injection (Feature 1): register the existing
+                # pipeline token as a shadow session bound to the chosen world.
+                state = synthetic_injector.register(
+                    session_token = result.session_token,
+                    tenant_id     = "default",
+                    attack_class  = clf.attack_class.value,
+                    world         = clf.suggested_world,
+                    arm           = result.honeypot.mab_arm_selected,
+                    ip_address    = ip,
+                )
+
+                # Threat intel (Feature 5): in-process + best-effort durable.
+                threat_recorder.record(
+                    session_token = state.session_token,
+                    tenant_id     = state.tenant_id,
+                    attack_class  = state.attack_class,
+                    event_type    = "shadow_start",
+                    detail        = {"world": state.world, "reasons": clf.reasons},
+                )
+                try:
+                    await store_shadow_session(
+                        db_handler.db,
+                        session_token = state.session_token,
+                        tenant_id     = state.tenant_id,
+                        attack_class  = state.attack_class,
+                        world         = state.world,
+                        arm           = state.arm,
+                        ip_address    = ip,
+                    )
+                    await store_attacker_event(
+                        db_handler.db,
+                        session_token = state.session_token,
+                        tenant_id     = state.tenant_id,
+                        attack_class  = state.attack_class,
+                        event_type    = "shadow_start",
+                        detail        = {"world": state.world},
+                    )
+                except Exception as exc:
+                    logger.error("[Deception] DB mirror failed: %s", exc)
+
+                # Believable redirect into the synthetic world (Feature 1).
+                deception_meta = {
+                    "redirect":     "/admin" if state.world == "shadow_admin" else "/dashboard",
+                    "attack_class": state.attack_class,   # defender-facing telemetry
+                }
+                logger.info(
+                    "[Deception] shadow session class=%s world=%s arm=%d",
+                    state.attack_class, state.world, state.arm,
+                )
+            except Exception as exc:
+                logger.error("[Deception] classification/registration failed: %s", exc)
 
         notification_service.notify_bot_detected(
             user_id = f"anon_{result.session_token[:8]}",
@@ -733,6 +894,12 @@ async def score(req: ScoreReq, request: Request):
 
     if result.shadow_mode and result.honeypot.mab_arm_selected >= 0:
         response["mab_arm"] = result.honeypot.mab_arm_selected
+
+    # Phase 3 MVP — believable redirect into the synthetic world + (defender-
+    # facing) attack classification.  `redirect` looks like a normal post-login
+    # navigation; `attack_class` is telemetry the front-end dashboard reads.
+    if deception_meta:
+        response.update(deception_meta)
 
     # FIX-5: challenge comes from _assemble() which wires it from honeypot.challenge
     if result.challenge is not None:

@@ -19,6 +19,8 @@ export default defineConfig({
       '/session':           { target: 'http://localhost:8000', changeOrigin: true },
       '/auth':              { target: 'http://localhost:8000', changeOrigin: true },
       '/admin':             { target: 'http://localhost:8000', changeOrigin: true },
+      // Deception Demo Lab — synthetic shadow world APIs
+      '/api/shadow':        { target: 'http://localhost:8000', changeOrigin: true },
     },
   },
 })

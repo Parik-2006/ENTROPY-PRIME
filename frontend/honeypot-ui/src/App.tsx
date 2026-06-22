@@ -25,6 +25,18 @@ type AppState = 'idle' | 'loading' | 'human' | 'shadow' | 'error'
 
 const DEV_MODE = new URLSearchParams(window.location.search).get('dev') === '1'
 
+// Dev-only attack scenarios — drive the backend attack classifier so the demo
+// can route into different synthetic worlds (banking vs admin).  These signals
+// are passed straight to /score; an empty set ("generic") yields UNKNOWN→banking.
+type ScenarioKey = 'generic' | 'credential_stuffing' | 'recon' | 'scraper' | 'brute_force'
+const SCENARIOS: Record<ScenarioKey, { label: string; expect: string; signals: Record<string, number> }> = {
+  generic:             { label: 'Generic bot',          expect: 'Banking',      signals: {} },
+  credential_stuffing: { label: 'Credential stuffing',  expect: 'Banking',      signals: { distinct_usernames: 18, failed_attempts: 22 } },
+  brute_force:         { label: 'Brute force',          expect: 'Banking',      signals: { password_attempts: 12 } },
+  recon:               { label: 'Recon / admin probe',  expect: 'Shadow Admin', signals: { admin_path_hits: 4, unique_paths: 30, not_found_ratio: 0.6 } },
+  scraper:             { label: 'Scraper',              expect: 'Banking',      signals: { request_rate: 25, unique_paths: 40 } },
+}
+
 export default function App() {
   const [state,    setState]    = useState<AppState>('idle')
   const [response, setResponse] = useState<ScoreResponse | null>(null)
@@ -34,8 +46,10 @@ export default function App() {
   const [theta,  setTheta]  = useState(0.05)  // low = bot-like
   const [hExp,   setHExp]   = useState(0.5)
   const [load,   setLoad]   = useState(0.4)
+  const [scenario, setScenario] = useState<ScenarioKey>('generic')
 
-  const probe = useCallback(async () => {
+  const probe = useCallback(async (override?: ScenarioKey) => {
+    const key = override ?? scenario
     setState('loading')
     setErrorMsg('')
     try {
@@ -44,6 +58,7 @@ export default function App() {
         h_exp:       hExp,
         server_load: load,
         latent_vector: Array(32).fill(0).map(() => Math.random() * 0.1),
+        ...SCENARIOS[key].signals,
       })
       setResponse(res)
       setState(res.shadow_mode ? 'shadow' : 'human')
@@ -51,7 +66,7 @@ export default function App() {
       setErrorMsg(e instanceof Error ? e.message : String(e))
       setState('error')
     }
-  }, [theta, hExp, load])
+  }, [theta, hExp, load, scenario])
 
   const reset = useCallback(() => {
     setState('idle')
@@ -115,6 +130,23 @@ export default function App() {
                 onChange={setLoad}
                 color="#a78bfa"
               />
+
+              <div style={styles.controlsTitle}>ATTACK SCENARIO</div>
+              <div style={styles.scenarioGrid}>
+                {(Object.keys(SCENARIOS) as ScenarioKey[]).map((k) => (
+                  <button
+                    key={k}
+                    onClick={() => { setScenario(k); probe(k) }}
+                    style={{
+                      ...styles.scenarioBtn,
+                      ...(scenario === k ? styles.scenarioBtnActive : {}),
+                    }}
+                  >
+                    {SCENARIOS[k].label}
+                    <span style={styles.scenarioExpect}>→ {SCENARIOS[k].expect}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
 
@@ -126,7 +158,7 @@ export default function App() {
                   With low θ the response activates shadow mode.
                 </p>
               )}
-              <button style={styles.probeBtn} onClick={probe}>
+              <button style={styles.probeBtn} onClick={() => probe()}>
                 Run /score Pipeline
               </button>
             </div>
@@ -263,6 +295,15 @@ const styles: Record<string, React.CSSProperties> = {
   controlsTitle: {
     fontFamily: 'monospace', fontSize: 8, letterSpacing: 2, color: '#3a5068',
   },
+  scenarioGrid: { display: 'flex', flexDirection: 'column', gap: 6 },
+  scenarioBtn: {
+    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+    padding: '8px 12px', border: '1px solid #1e2d3d', background: '#080b0f',
+    borderRadius: 6, cursor: 'pointer', color: '#c9d6e3',
+    fontFamily: 'monospace', fontSize: 11,
+  },
+  scenarioBtnActive: { borderColor: '#00e5ff', color: '#00e5ff', background: 'rgba(0,229,255,0.06)' },
+  scenarioExpect: { fontSize: 9, color: '#6b8299' },
 
   sliderRow:  { display: 'flex', flexDirection: 'column', gap: 4 },
   sliderTop:  { display: 'flex', justifyContent: 'space-between' },

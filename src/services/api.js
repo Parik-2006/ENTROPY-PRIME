@@ -19,6 +19,20 @@ const BACKEND_URL =
   import.meta.env.VITE_API_URL ||
   (typeof window !== 'undefined' ? '' : 'http://localhost:8000')
 
+// ── Central auth-error handling ───────────────────────────────────────────────
+// AuthContext registers a handler here. Any authenticated call that gets a 401
+// (e.g. an expired/wiped session after refresh) notifies it ONCE so the app can
+// perform a clean logout + redirect instead of looping 401s forever.
+let _authErrorHandler = null
+export function registerAuthErrorHandler(fn) { _authErrorHandler = fn }
+
+function makeApiError(status, message) {
+  const err = new Error(message)
+  err.status = status               // callers can branch on 401 vs other failures
+  err.isAuthError = status === 401
+  return err
+}
+
 // ── Core fetch wrapper ────────────────────────────────────────────────────────
 
 async function req(path, method = 'GET', body = null) {
@@ -32,7 +46,7 @@ async function req(path, method = 'GET', body = null) {
 
   const url = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) + path : BACKEND_URL + path
   const res  = await fetch(url, opts)
-  const data = await res.json()
+  const data = await res.json().catch(() => ({}))
 
   if (!res.ok) {
     let errorMsg = data.detail || `API error ${res.status}`
@@ -41,13 +55,11 @@ async function req(path, method = 'GET', body = null) {
         err.msg ? `${err.loc?.join('.')}: ${err.msg}` : JSON.stringify(err)
       ).join('; ')
     }
-    console.error(`[API] ${res.status} ${path}:`, {
-      status:       res.status,
-      detail:       data.detail,
-      errorMsg,
-      fullResponse: data,
-    })
-    throw new Error(errorMsg)
+    console.error(`[API] ${res.status} ${path}: ${errorMsg}`)
+    // 401 on an authenticated path → the session is gone. Notify the central
+    // handler so the app logs out cleanly (prevents the infinite 401 loop).
+    if (res.status === 401 && _authErrorHandler) _authErrorHandler(path, errorMsg)
+    throw makeApiError(res.status, errorMsg)
   }
   return data
 }
@@ -242,9 +254,11 @@ export async function fetchMe(sessionToken = localStorage.getItem('ep_token')) {
   if (sessionToken) opts.headers['X-Session-Token'] = sessionToken
   const url = BACKEND_URL.endsWith('/') ? BACKEND_URL.slice(0, -1) + '/me' : BACKEND_URL + '/me'
   const res = await fetch(url, opts)
-  const data = await res.json()
+  const data = await res.json().catch(() => ({}))
   if (!res.ok) {
-    throw new Error(data.detail || `API error ${res.status}`)
+    // Attach status so the caller (session restore) can distinguish a 401
+    // (invalid/expired session → clean logout) from a transient network error.
+    throw makeApiError(res.status, data.detail || `API error ${res.status}`)
   }
   return data
 }

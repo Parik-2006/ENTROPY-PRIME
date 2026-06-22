@@ -25,25 +25,44 @@ import { useAuth } from './AuthContext'
 
 const TrustCtx = createContext(null)
 
+// ── DEMO MODE ─────────────────────────────────────────────────────────────────
+// Presentation safety switch. When true, identity confidence is pinned at 98
+// (Trusted) and can ONLY be lowered by the manual "Simulate Identity Deviation"
+// button — so random behavioural drift can never disrupt the live demo. Set to
+// false to restore the fully live behavioural-trust pipeline.
+export const DEMO_MODE = true
+
+// Confidence zones (aligned to the spec):
+//   Trusted 80–100  → green   (no action)
+//   Monitor 60–79   → yellow  (banner only — NEVER opens the re-auth modal)
+//   Re-auth  0–59   → orange (40–59 quick-verify) / red (<40 blocked)
+// The re-auth modal opens ONLY below 60, so Monitor can never trigger re-auth.
 export const TIERS = {
-  green:  { key: 'green',  min: 85, label: 'Verified',            color: 'var(--accent)', tone: 'ok' },
-  yellow: { key: 'yellow', min: 65, label: 'Behavior deviation',  color: 'var(--gold)',   tone: 'warn' },
-  orange: { key: 'orange', min: 40, label: 'Confidence reduced',  color: '#FF9F45',       tone: 'warn' },
+  green:  { key: 'green',  min: 80, label: 'Verified',             color: 'var(--accent)', tone: 'ok' },
+  yellow: { key: 'yellow', min: 60, label: 'Monitoring',          color: 'var(--gold)',   tone: 'warn' },
+  orange: { key: 'orange', min: 40, label: 'Confidence reduced',   color: '#FF9F45',       tone: 'warn' },
   red:    { key: 'red',    min: 0,  label: 'Identity not verified', color: 'var(--danger)', tone: 'danger' },
 }
 
 export function tierFor(conf) {
-  if (conf >= 85) return TIERS.green
-  if (conf >= 65) return TIERS.yellow
+  if (conf >= 80) return TIERS.green
+  if (conf >= 60) return TIERS.yellow
   if (conf >= 40) return TIERS.orange
   return TIERS.red
 }
 
 export function behaviorStatusFor(conf) {
-  if (conf >= 85) return 'Stable'
-  if (conf >= 65) return 'Minor deviation'
+  if (conf >= 80) return 'Stable'
+  if (conf >= 60) return 'Monitoring'
   if (conf >= 40) return 'Significant deviation'
   return 'Anomalous'
+}
+
+// Spec zone label for logging/diagnostics.
+export function zoneFor(conf) {
+  if (conf >= 80) return 'Trusted'
+  if (conf >= 60) return 'Monitor'
+  return 'Reauth'
 }
 
 const clamp = (n, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, n))
@@ -70,7 +89,7 @@ function driftToConf(drift, thr) {
 }
 
 export function TrustProvider({ children }) {
-  const { trustScore, liveTheta, anomaly, isProfileStable, liveDrift, profileStats } = useAuth()
+  const { trustScore, liveTheta, anomaly, isProfileStable, liveDrift, profileStats, confirmVerified, identity } = useAuth()
 
   const [confidence, setConfidence] = useState(100)
   const [demo, setDemo] = useState(null) // null | { kind, floor }
@@ -88,6 +107,8 @@ export function TrustProvider({ children }) {
   // Live engine signals mirrored into refs so the animation loop reads fresh
   // values without re-creating its interval on every drift update.
   const trustR = useRef(1), thetaR = useRef(1), stableR = useRef(false), driftR = useRef(0), thrR = useRef(1.8)
+  const identityR = useRef(null)
+  useEffect(() => { identityR.current = identity }, [identity])
   useEffect(() => {
     trustR.current  = trustScore ?? 1
     thetaR.current  = liveTheta ?? 1
@@ -100,37 +121,41 @@ export function TrustProvider({ children }) {
     setEvents(prev => [mkEvent(kind, title, desc), ...prev].slice(0, MAX_EVENTS))
   }, [])
 
-  // Base target from REAL signals (used when no demo override is active).
-  // Before the profile is stable we trust the watchdog score; once stable we
-  // map live drift → confidence so a different human is actually detected.
+  // Base target = the PROGRESSIVE identity-trust signal (the engine's
+  // effectiveTrust, surfaced as trustScore). It already encodes corroboration,
+  // post-verify cooldown, idle-freeze, the suspicion accumulator and the
+  // monitor floor — so it stays ≥60 (Monitor) until a SUSTAINED genuine
+  // mismatch, then drops below 60 (Re-auth). The legacy EMA `liveDrift` is no
+  // longer the primary signal: that caused random dips and Monitor behaving
+  // like Re-auth. (liveDrift still feeds the drift widget elsewhere.)
   const baseTarget = () => {
-    if (!stableR.current) return clamp(trustR.current * 100)
-    const conf = driftToConf(driftR.current, thrR.current)
-    let v = Math.min(conf, trustR.current * 100 + 8) // watchdog acts as a ceiling
-    if (thetaR.current < 0.3) v = Math.min(v, 55)    // clearly non-human cadence
-    return clamp(v)
+    // Confidence tracks the identity-trust signal ONLY. The previous theta floor
+    // is removed: `theta` comes from an untrained cold-start CNN (effectively
+    // random) and could spuriously cap confidence at 50 — a demo-instability
+    // source. Human-vs-human detection does not depend on it.
+    return clamp(trustR.current * 100)
   }
 
-  // Organic drift: a real watchdog anomaly while stable pushes us into deviation.
-  useEffect(() => {
-    if (anomaly && isProfileStable && !demoRef.current) {
-      setDemo({ kind: 'organic', floor: 58 })
-      pushEvent('risk', 'Behavior drift detected', 'Live keystroke cadence diverged from baseline')
-    }
-  }, [anomaly, isProfileStable, pushEvent])
+  // NOTE: the old "anomaly → floor 58" auto-override was REMOVED. It forced the
+  // session into the re-auth band independent of the confidence zone and could
+  // re-fire from a stale anomaly. Re-auth is now driven solely by the engine's
+  // sustained-mismatch trust signal flowing through baseTarget().
 
   // Single animation loop — eases the displayed value toward its target, adds
   // gentle jitter when healthy, records history, and emits tier-change events.
   useEffect(() => {
     const id = setInterval(() => {
       const d = demoRef.current
-      let target = d ? d.floor : baseTarget()
-      if (!d && target > 90) target = 96 + Math.round(Math.random() * 4)
+      // DEMO_MODE: confidence is pinned at 98 (Trusted) and never drifts. The
+      // ONLY way to lower it is the manual "Simulate Identity Deviation" demo
+      // override (d). This guarantees zero random drops during the presentation.
+      let target = d ? d.floor : (DEMO_MODE ? 98 : baseTarget())
+      if (!d && !DEMO_MODE && target > 90) target = 96 + Math.round(Math.random() * 4)
 
       const cur = confRef.current
       let next
       if (Math.abs(target - cur) <= 1.5) {
-        next = target + (!d && target >= 90 ? (Math.random() * 3 - 1.5) : 0)
+        next = target + (!d && !DEMO_MODE && target >= 90 ? (Math.random() * 3 - 1.5) : 0)
       } else {
         next = cur + (target - cur) * 0.28
       }
@@ -143,6 +168,18 @@ export function TrustProvider({ children }) {
       if (newTier !== tierRef.current) {
         const prev = tierRef.current
         tierRef.current = newTier
+
+        // [REAUTH CHECK] — single line on every zone transition (no per-tick spam).
+        const idn = identityR.current
+        const idle = idn ? (now() - (idn.t || 0) > 5000) : false
+        const willReauth = next < 60
+        console.log(
+          `[REAUTH CHECK] confidence=${next} zone=${zoneFor(next)} ` +
+          `suspicion=${idn?.suspicion ?? 0} corroborated=${!!idn?.corroborated} idle=${idle} ` +
+          `trigger=${d ? 'demo:' + d.kind : 'identity'} ` +
+          `reason=${willReauth ? (next < 40 ? 'blocked(<40)' : 'reauth(<60)') : newTier === 'yellow' ? 'monitor(60-79)' : 'trusted(>=80)'}`
+        )
+
         if (newTier === 'yellow') pushEvent('risk', 'Behavior deviation detected', 'Interaction pattern shifted slightly')
         else if (newTier === 'orange') pushEvent('verification', 'Verification requested', 'Confidence reduced — quick check required')
         else if (newTier === 'red') pushEvent('risk', 'Identity not verified', 'Sensitive actions blocked — re-auth required')
@@ -178,13 +215,25 @@ export function TrustProvider({ children }) {
     setDemo({ kind: 'attacker', floor: 28 })
     pushEvent('bot', 'Automated / attacker pattern detected', 'Non-human cadence — humanity score collapsed')
   }, [pushEvent])
+  // Presenter-controlled trigger: manually drops confidence into the re-auth
+  // band so the re-authentication modal can be shown on cue (TASK B).
+  const simulateIdentityDeviation = useCallback(() => {
+    setDemo({ kind: 'manual_deviation', floor: 42 })
+    pushEvent('risk', 'Identity deviation (simulated)', 'Presenter-triggered re-authentication demonstration')
+  }, [pushEvent])
   const verifyIdentity = useCallback(() => {
+    // FIX 1: reset the ENGINE (trust, identity score, reauth streak, watchdog
+    // penalties) and start the post-verify cooldown — not just the UI value.
+    // Without this the engine keeps emitting the last low score and the modal
+    // immediately reappears.
+    confirmVerified?.()
     setDemo(null)
     confRef.current = 100
     setConfidence(100)
+    tierRef.current = 'green'
     setLastVerifiedAt(now())
     pushEvent('verification', 'Identity confirmed', 'User re-verified — confidence restored to 100%')
-  }, [pushEvent])
+  }, [pushEvent, confirmVerified])
   const resetTrust = useCallback(() => {
     setDemo(null); confRef.current = 100; setConfidence(100); setLastVerifiedAt(now())
     pushEvent('session', 'Trust state reset', 'Verified baseline restored')
@@ -193,7 +242,9 @@ export function TrustProvider({ children }) {
   const tier = tierFor(confidence)
   const value = {
     confidence,
-    trustScore,
+    // DEMO_MODE pins the exposed trust score to 1.0 (Trusted) unless a manual
+    // deviation is active, so widgets reading trustScore stay stable too.
+    trustScore: DEMO_MODE && !demo ? 1.0 : trustScore,
     tier,
     tierKey: tier.key,
     color: tier.color,
@@ -201,9 +252,11 @@ export function TrustProvider({ children }) {
     behaviorStatus: behaviorStatusFor(confidence),
     isDemo: !!demo,
     demoKind: demo?.kind ?? null,
-    canSensitive: confidence >= 65,
-    needsVerify:  tier.key === 'orange',
-    blocked:      tier.key === 'red',
+    demoMode: DEMO_MODE,
+    canSensitive: confidence >= 60,                 // Monitor (60-79) can still act
+    needsVerify:  tier.key === 'orange',            // 40-59 → quick verify (Re-auth)
+    blocked:      tier.key === 'red',               // <40   → blocked (Re-auth)
+    zone:         zoneFor(confidence),
     history,
     events,
     lastVerifiedAt,
@@ -213,6 +266,7 @@ export function TrustProvider({ children }) {
     simulateFastTypist,
     simulateDifferentUser,
     simulateAttacker,
+    simulateIdentityDeviation,
     verifyIdentity,
     resetTrust,
   }
@@ -227,9 +281,10 @@ export const useTrust = () => {
       confidence: 100, trustScore: 1, tier: TIERS.green, tierKey: 'green', color: 'var(--accent)',
       label: 'Verified', behaviorStatus: 'Stable', isDemo: false, demoKind: null, canSensitive: true,
       needsVerify: false, blocked: false, history: [], events: [], lastVerifiedAt: Date.now(),
-      sessionStart: Date.now(), pushEvent: () => {},
+      sessionStart: Date.now(), pushEvent: () => {}, demoMode: DEMO_MODE, zone: 'Trusted',
       simulateSlowTypist: () => {}, simulateFastTypist: () => {},
       simulateDifferentUser: () => {}, simulateAttacker: () => {},
+      simulateIdentityDeviation: () => {},
       verifyIdentity: () => {}, resetTrust: () => {},
     }
   }
