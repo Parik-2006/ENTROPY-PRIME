@@ -201,9 +201,18 @@ export function AuthProvider({ children }) {
           zone:         payload.zone,
           reauth:       payload.reauth,
           corroborated: payload.corroborated,
+          driftCount:   payload.driftCount,
           typingSim:    payload.typingSim,
           digraphSim:   payload.digraphSim,
           mouseSim:     payload.mouseSim,
+          // enhanced keyboard-biometric signals
+          digraphProfileSim: payload.digraphProfileSim,
+          trigraphSim:       payload.trigraphSim,
+          burstSim:          payload.burstSim,
+          backspaceSim:      payload.backspaceSim,
+          spacebarSim:       payload.spacebarSim,
+          dwellSim:          payload.dwellSim,
+          phraseSim:         payload.phraseSim,
           gated:        payload.gated,
           t:            Date.now(),
         })

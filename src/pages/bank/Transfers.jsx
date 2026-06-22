@@ -20,17 +20,17 @@ import s from './bank.module.css'
 
 const EMPTY = { name: '', account: '', ifsc: '', amount: '', purpose: '', message: '', notes: '', fromAccountId: 'ac_chk' }
 
-function gateState(trust, stable, blocked) {
-  if (blocked) return { ok: false, tone: 'danger', title: 'Transfer blocked by Entropy Prime', desc: 'Identity confidence is too low. Re-authentication required.' }
-  if (!stable) return { ok: false, tone: 'warn', title: 'Enrollment incomplete', desc: 'Finish behavioral enrollment before sending money.' }
-  if (trust < 0.4) return { ok: false, tone: 'danger', title: 'Transfer blocked', desc: 'Identity confidence too low for sensitive actions.' }
-  if (trust < 0.7) return { ok: true, tone: 'warn', title: 'Additional verification recommended', desc: 'Trust is moderate — transfer allowed but logged for review.' }
-  return { ok: true, tone: 'ok', title: 'Identity verified', desc: 'Entropy Prime confirms this is you. Transfer permitted.' }
-}
+// ── SINGLE SOURCE OF TRUTH for transfer authorization ─────────────────────────
+//   ALLOWED  ⇔  identityConfidence >= 70  AND  sessionTrust >= 65
+//   LOCKED   otherwise.
+// (All previous gating — trust tiers, profile-stable requirement, legacy
+//  gateState, trustScore-only / confidence-only checks — has been removed.)
+const CONF_MIN  = 70
+const TRUST_MIN = 65
 
 export default function Transfers() {
-  const { trustScore, isProfileStable } = useAuth()
-  const { blocked } = useTrust()
+  const { trustScore } = useAuth()
+  const { confidence } = useTrust()
   const { accounts, beneficiaries, templates, transferLog, transfer, addTemplate } = useBank()
   const navigate = useNavigate()
   const location = useLocation()
@@ -42,12 +42,28 @@ export default function Transfers() {
   // Clear router state after consuming the prefill so a refresh doesn't re-apply.
   useEffect(() => { if (location.state?.prefill) navigate(location.pathname, { replace: true }) }, []) // eslint-disable-line
 
-  const gate = gateState(trustScore, isProfileStable, blocked)
+  // ── Live gate — recomputed every render from the CURRENT context values, so
+  //    the button reacts immediately when confidence or trust changes. No gate
+  //    state is cached anywhere. ───────────────────────────────────────────────
+  const identityConfidence = Math.round(confidence ?? 0)          // 0–100
+  const sessionTrust       = Math.round((trustScore ?? 0) * 100)  // 0–100
+  const canTransfer = identityConfidence >= CONF_MIN && sessionTrust >= TRUST_MIN
+
+  useEffect(() => {
+    console.log('[TRANSFER GATE]', { confidence: identityConfidence, trust: sessionTrust, canTransfer })
+  }, [identityConfidence, sessionTrust, canTransfer])
+
+  const tone  = canTransfer ? 'ok' : 'danger'
+  const gateTitle = canTransfer ? 'Transfer Allowed' : 'Transfer Locked'
+  const gateDesc  = canTransfer
+    ? 'Entropy Prime confirms this is you — transfers are authorized.'
+    : `Locked — requires identity confidence ≥ ${CONF_MIN}% (now ${identityConfidence}%) and session trust ≥ ${TRUST_MIN}% (now ${sessionTrust}%).`
+
   const set = (k) => (e) => { setForm(f => ({ ...f, [k]: e.target.value })); setErr('') }
   const valid = form.name && form.account && form.ifsc && Number(form.amount) > 0
 
   const submit = () => {
-    if (!gate.ok || !valid) return
+    if (!canTransfer || !valid) return
     const ok = transfer({ ...form, amount: Number(form.amount) })
     if (!ok) { setErr('Insufficient balance in the selected account.'); return }
     setDone({ ...form })
@@ -66,11 +82,11 @@ export default function Transfers() {
   return (
     <div className={s.transferLayout}>
       <Card title="New Transfer" sub="Send money to any account">
-        <div className={s.gateBox} style={{ borderColor: `var(--${gate.tone === 'ok' ? 'accent' : gate.tone})` }}>
-          <Badge tone={gate.tone} dot>{(trustScore * 100).toFixed(0)}% trust</Badge>
+        <div className={s.gateBox} style={{ borderColor: `var(--${tone === 'ok' ? 'accent' : tone})` }}>
+          <Badge tone={tone} dot>{identityConfidence}% confidence · {sessionTrust}% trust · {canTransfer ? 'Transfer Allowed' : 'Transfer Locked'}</Badge>
           <div className={s.gateText}>
-            <div className={s.gateTitle}>{gate.title}</div>
-            <div className={s.gateDesc}>{gate.desc}</div>
+            <div className={s.gateTitle}>{gateTitle}</div>
+            <div className={s.gateDesc}>{gateDesc}</div>
           </div>
         </div>
 
@@ -123,8 +139,8 @@ export default function Transfers() {
         {err && <div style={{ color: 'var(--danger)', fontSize: 12.5, marginBottom: 10 }}>{err}</div>}
         <div style={{ display: 'flex', gap: 10 }}>
           <Button variant="ghost" onClick={saveTemplate} disabled={!form.name || !form.account}>Save as template</Button>
-          <Button full size="lg" onClick={submit} disabled={!gate.ok || !valid}>
-            {gate.ok ? `Send ${form.amount ? INR(Number(form.amount)) : 'transfer'} →` : 'Transfer locked'}
+          <Button full size="lg" onClick={submit} disabled={!canTransfer || !valid}>
+            {canTransfer ? `Send ${form.amount ? INR(Number(form.amount)) : 'transfer'} →` : 'Transfer locked'}
           </Button>
         </div>
       </Card>
@@ -167,7 +183,7 @@ export default function Transfers() {
           <>
             <p>You sent <strong>{INR(Number(done.amount))}</strong> to <strong>{done.name}</strong> ({done.account}).</p>
             {done.message && <p style={{ marginTop: 8 }}>Message: “{done.message}”</p>}
-            <p style={{ marginTop: 10, color: 'var(--text-3)' }}>Verified and authorized by Entropy Prime · trust {(trustScore * 100).toFixed(0)}%.</p>
+            <p style={{ marginTop: 10, color: 'var(--text-3)' }}>Verified and authorized by Entropy Prime · confidence {identityConfidence}% · trust {sessionTrust}%.</p>
           </>
         )}
       </Modal>

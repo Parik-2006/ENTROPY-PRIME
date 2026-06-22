@@ -50,11 +50,19 @@ export default function IdentityDebugPanel() {
             <div style={{ ...st.score, color }}>{score}</div>
             <div style={{ ...st.zone, color }}>{zone.toUpperCase()}{identity.corroborated ? ' · CORROBORATED' : ''}</div>
           </div>
-          <Bar label="Typing similarity"  v={identity.typingSim}  />
-          <Bar label="Digraph similarity" v={identity.digraphSim} />
-          <Bar label="Mouse similarity"   v={identity.mouseSim}   />
+          <Bar label="Typing"          v={identity.typingSim}  />
+          <Bar label="Digraph"         v={identity.digraphSim} />
+          <Bar label="Digraph profile" v={identity.digraphProfileSim} />
+          <Bar label="Trigraph"        v={identity.trigraphSim} />
+          <Bar label="Dwell"           v={identity.dwellSim} />
+          <Bar label="Burst"           v={identity.burstSim} />
+          <Bar label="Backspace"       v={identity.backspaceSim} />
+          <Bar label="Spacebar"        v={identity.spacebarSim} />
+          <Bar label="Phrase"          v={identity.phraseSim} />
+          <Bar label="Mouse"           v={identity.mouseSim}   />
           <div style={st.row}><span style={st.k}>Confidence (smoothed)</span><span style={{ ...st.v, color }}>{score}/100</span></div>
           <div style={st.row}><span style={st.k}>Raw score (instant)</span><span style={st.v}>{identity.raw ?? '—'}</span></div>
+          <div style={st.row}><span style={st.k}>Drifting signals</span><span style={st.v}>{identity.driftCount ?? 0}</span></div>
           <div style={st.row}><span style={st.k}>Suspicion</span><span style={st.v}>{identity.suspicion ?? 0} / 8</span></div>
           <div style={st.row}><span style={st.k}>Trust (effective)</span><span style={st.v}>{pct(trustScore)}</span></div>
           {identity.reauth && <div style={st.reauth}>RE-AUTH triggered (sustained pattern)</div>}

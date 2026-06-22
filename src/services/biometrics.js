@@ -56,6 +56,111 @@ const ID_MONITOR_FLOOR  = 0.60 // hold effective trust here until a sustained pa
 const idZone = (s) => (s >= 80 ? 'trusted' : s >= 60 ? 'monitor' : 'reauth')
 const _gaussSim = (relDiff, tol) => Math.exp(-0.5 * (relDiff / tol) ** 2)
 const _relDiff  = (a, b) => Math.abs(a - b) / Math.max(Math.abs(b), 1e-6)
+
+// ── Enhanced keyboard-biometric evidence signals (ADDITIVE — feed the existing
+//    engine; existing typing/digraph/mouse logic is unchanged) ────────────────
+// Per-signal weights (sum = 1.00). Missing/insufficient signals are dropped and
+// the remaining weights are renormalised, so the score degrades gracefully and
+// old templates keep working.
+const ID_WEIGHTS = {
+  typing:         0.10,
+  digraph:        0.15,   // existing bigram-dwell-ratio similarity
+  mouse:          0.10,
+  digraphProfile: 0.15,   // Feature 1 — top-50 digraph latency profile
+  trigraph:       0.15,   // Feature 2 — trigraph latency profile (hard to fake)
+  burst:          0.10,   // Feature 3 — burst/pause rhythm
+  backspace:      0.05,   // Feature 4 — correction signature
+  spacebar:       0.05,   // Feature 5 — pre/post-space delays
+  dwell:          0.10,   // Feature 6 — key hold time (classic keystroke biometric)
+  phrase:         0.05,   // Feature 7 — privacy-preserving phrase fingerprint
+}
+const ID_TOL_TRIGRAPH = 0.35
+const ID_TOL_BURST    = 0.40
+const ID_TOL_BACKSPC  = 0.50
+const ID_TOL_SPACE    = 0.35
+const ID_TOL_DWELL    = 0.25
+const ID_TOL_PHRASE   = 0.40
+const ID_DRIFT_THRESH = 0.55   // a signal below this counts as "drifting"
+const ID_DRIFT_MIN    = 2      // re-auth needs ≥2 INDEPENDENT signals drifting (false-positive guard)
+const ID_MIN_DG_OVERLAP = 4    // shared digraphs needed for digraphProfile similarity
+const ID_MIN_TG_OVERLAP = 3    // shared trigraphs needed for trigraph similarity
+
+// Welford accumulator helpers (online mean + variance), used to build the
+// per-digraph / per-trigraph / dwell profiles without storing raw keystrokes.
+function _welPush(map, key, x) {
+  let a = map[key]; if (!a) a = map[key] = { n: 0, mean: 0, m2: 0 }
+  a.n++; const d = x - a.mean; a.mean += d / a.n; a.m2 += d * (x - a.mean)
+}
+function _welStd(a) { return a && a.n > 1 ? Math.sqrt(a.m2 / a.n) : 0 }
+function _meanPush(m, x) { m.n++; m.mean += (x - m.mean) / m.n }
+// EMA accumulator — RECENT-weighted mean+variance. Used for the live digraph /
+// trigraph latency profiles so that the CURRENT typist (not a cumulative average
+// dominated by enrolment) drives the live comparison against the frozen template.
+function _emaPush(map, key, x, alpha = 0.30) {
+  let a = map[key]; if (!a) { a = map[key] = { n: 1, mean: x, var2: 0 }; return }
+  a.n++; const prev = a.mean
+  a.mean = (1 - alpha) * a.mean + alpha * x
+  a.var2 = (1 - alpha) * a.var2 + alpha * (x - prev) * (x - a.mean)
+}
+function _emaStd(a) { return a ? Math.sqrt(Math.max(0, a.var2)) : 0 }
+// Privacy-preserving phrase fingerprint: only frequencies for these common tokens
+// are kept; everything the user types is otherwise discarded at each word break.
+const COMMON_WORDS = new Set(['the', 'and', 'you', 'that', 'for', 'are', 'with', 'this', 'have', 'not', 'ok', 'bro', 'wt', 'hey', 'yes', 'no', 'to', 'is', 'it', 'of', 'in', 'on', 'my', 'me', 'so', 'lol', 'hi', 'hello', 'thanks', 'please'])
+// Cosine similarity of two {token: freq} vectors → [0,1].
+function _cosineFreq(a, b) {
+  const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})])
+  let dot = 0, na = 0, nb = 0
+  keys.forEach(k => { const x = a?.[k] || 0, y = b?.[k] || 0; dot += x * y; na += x * x; nb += y * y })
+  return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : null
+}
+
+// ── Enhanced-signal similarity functions (each → [0,1] or null = no evidence) ──
+// Compare two latency profiles { "key": {meanLatency, count} } on shared keys,
+// weighted by the enrolled count. (Features 1 & 2)
+function _profileSim(live, tpl, tol, minOverlap) {
+  if (!live || !tpl) return null
+  const shared = Object.keys(tpl).filter(k => live[k])
+  if (shared.length < minOverlap) return null
+  let sim = 0, wsum = 0
+  for (const k of shared) {
+    const w = tpl[k].count || 1
+    sim += w * _gaussSim(_relDiff(live[k].meanLatency, tpl[k].meanLatency), tol)
+    wsum += w
+  }
+  return wsum ? sim / wsum : null
+}
+function _burstSim(live, tpl) {                                     // Feature 3
+  if (!tpl || !live || live.avgBurstLength <= 0) return null
+  return (_gaussSim(_relDiff(live.avgBurstLength, tpl.avgBurstLength), ID_TOL_BURST) +
+          _gaussSim(_relDiff(live.avgPauseLength, tpl.avgPauseLength || 1), ID_TOL_BURST)) / 2
+}
+function _backspaceSim(live, tpl) {                                 // Feature 4
+  if (!tpl || !live || live.chars < 20) return null
+  const d1 = Math.abs(live.backspacesPer100Chars - tpl.backspacesPer100Chars) / 20
+  const d2 = Math.abs(live.immediateCorrectionRate - tpl.immediateCorrectionRate)
+  const d3 = Math.abs(live.wholeWordDeleteRate - tpl.wholeWordDeleteRate)
+  return (_gaussSim(d1, ID_TOL_BACKSPC) + _gaussSim(d2, ID_TOL_BACKSPC) + _gaussSim(d3, ID_TOL_BACKSPC)) / 3
+}
+function _spacebarSim(live, tpl) {                                  // Feature 5
+  if (!tpl || !live || live.n < 3) return null
+  return (_gaussSim(_relDiff(live.avgPreSpaceDelay, tpl.avgPreSpaceDelay), ID_TOL_SPACE) +
+          _gaussSim(_relDiff(live.avgPostSpaceDelay, tpl.avgPostSpaceDelay), ID_TOL_SPACE)) / 2
+}
+function _dwellSim(live, tpl) {                                     // Feature 6
+  if (!tpl || !live || live.n < 8) return null
+  return (_gaussSim(_relDiff(live.avgDwellTime, tpl.avgDwellTime), ID_TOL_DWELL) +
+          _gaussSim(_relDiff(live.stdDwellTime, tpl.stdDwellTime || 1), ID_TOL_DWELL)) / 2
+}
+function _phraseSim(live, tpl) {                                    // Feature 7
+  if (!tpl || !live || live.averageWordLength <= 0) return null
+  const wl  = _gaussSim(_relDiff(live.averageWordLength, tpl.averageWordLength), ID_TOL_PHRASE)
+  const sl  = (tpl.averageSentenceLength > 0 && live.averageSentenceLength > 0)
+    ? _gaussSim(_relDiff(live.averageSentenceLength, tpl.averageSentenceLength), ID_TOL_PHRASE) : null
+  const cos = _cosineFreq(live.commonWordFrequency, tpl.commonWordFrequency)
+  const parts = [wl, sl, cos].filter(v => v != null)
+  return parts.length ? parts.reduce((s, v) => s + v, 0) / parts.length : null
+}
+const _r3 = (v) => (v == null ? null : +v.toFixed(3))
 const PROFILE_WIN  = 200  // rolling window for per-user profile update
 const DRIFT_ALPHA  = 0.05 // EMA coefficient for profile smoothing
 const FEAT_K       = 6    // top-K features selected per user
@@ -243,16 +348,47 @@ export class KeyboardCollector {
     this._bigramTs   = {}
     this._burstStart = null
     this._pauses     = []
+    // ── Enhanced keyboard-biometric state (additive) ─────────────────────────
+    this._keys       = []                                   // recent {code, char, downTs, upTs}
+    this._dg         = {}                                   // digraph latency "a>b" → Welford
+    this._tg         = {}                                   // trigraph latency "a>b>c" → Welford
+    this._dwellAgg   = { n: 0, mean: 0, m2: 0 }             // key hold-time profile
+    this._preSpace   = { n: 0, mean: 0 }                    // delay before Space
+    this._postSpace  = { n: 0, mean: 0 }                    // delay after Space
+    this._bs         = { backspaces: 0, chars: 0, immediate: 0, wholeWord: 0, lastWasChar: false }
+    this._bursts     = []                                   // continuous-typing burst durations (ms)
+    this._burstStartT = null
+    this._wordBuf    = ''                                   // transient current word (DISCARDED at boundary)
+    this._wordLens   = { n: 0, mean: 0 }
+    this._sentWords  = 0
+    this._sentLens   = { n: 0, mean: 0 }
+    this._common     = {}                                   // whitelisted short-word frequency
   }
 
   start(target = document) {
     this._onDown = e => {
       const now = performance.now()
       this._keyDownTs[e.code] = now
+      // pause + burst rhythm (Feature 3)
       if (this._lastKeyUp && now - this._lastKeyUp > 800) {
         const pause = now - this._lastKeyUp
         this._pauses.push(pause)
         if (this._pauses.length > 50) this._pauses.shift()
+        if (this._burstStartT != null) {                       // close the previous burst
+          this._bursts.push(Math.max(0, this._lastKeyUp - this._burstStartT))
+          if (this._bursts.length > 50) this._bursts.shift()
+        }
+        this._burstStartT = now                                 // start a new burst
+      } else if (this._burstStartT == null) {
+        this._burstStartT = now
+      }
+      // backspace signature (Feature 4)
+      if (e.key === 'Backspace') {
+        this._bs.backspaces++
+        if (e.ctrlKey || e.altKey) this._bs.wholeWord++         // ctrl/alt+backspace = word delete
+        else if (this._bs.lastWasChar) this._bs.immediate++     // correcting right after a char
+        this._bs.lastWasChar = false
+        if (this._wordBuf) this._wordBuf = this._wordBuf.slice(0, -1)
       }
     }
     this._onUp = e => {
@@ -273,9 +409,64 @@ export class KeyboardCollector {
       this._events.push({ dwell, flight, ts: now, bigramRatio })
       if (this._events.length > 300) this._events.shift()
       this._lastKeyUp = now
+      this._ingestRich(e, down, now, dwell, flight)             // enhanced signals (additive)
     }
     target.addEventListener('keydown', this._onDown)
     target.addEventListener('keyup',   this._onUp)
+  }
+
+  /**
+   * Build the enhanced keyboard-biometric profiles from a keystroke. Privacy:
+   * raw text is never stored — only timing stats, rates, and counts for a small
+   * whitelist of common tokens; the in-progress word buffer is discarded at each
+   * word boundary.
+   */
+  _ingestRich(e, downTs, upTs, dwell, flight) {
+    const char = (e.key && e.key.length === 1) ? e.key : null
+    // recent keystroke buffer for digraph/trigraph latencies (down-down timing)
+    this._keys.push({ code: e.code, char, downTs, upTs })
+    if (this._keys.length > 6) this._keys.shift()
+    const K = this._keys
+    // Feature 6 — dwell (key hold time)
+    if (dwell > 0 && dwell < 1000) { const a = this._dwellAgg; a.n++; const d = dwell - a.mean; a.mean += d / a.n; a.m2 += d * (dwell - a.mean) }
+    // Feature 1 — digraph latency (down-to-down), RECENT-weighted (EMA)
+    if (K.length >= 2) {
+      const a = K[K.length - 2], b = K[K.length - 1]
+      const lat = b.downTs - a.downTs
+      if (lat > 0 && lat < 2000) _emaPush(this._dg, `${a.code}>${b.code}`, lat)
+    }
+    // Feature 2 — trigraph latency (first-to-third down), RECENT-weighted (EMA)
+    if (K.length >= 3) {
+      const a = K[K.length - 3], b = K[K.length - 2], c = K[K.length - 1]
+      const lat = c.downTs - a.downTs
+      if (lat > 0 && lat < 3000) _emaPush(this._tg, `${a.code}>${b.code}>${c.code}`, lat)
+    }
+    // Feature 5 — spacebar rhythm
+    if (e.code === 'Space') _meanPush(this._preSpace, flight)
+    else if (K.length >= 2 && K[K.length - 2].code === 'Space') _meanPush(this._postSpace, flight)
+    // Feature 4 + 7 — character / word / sentence bookkeeping
+    const isWordBreak = e.code === 'Space' || char === ' '
+    const isSentEnd   = char === '.' || char === '!' || char === '?'
+    const isPunct     = isSentEnd || char === ',' || char === ';' || char === ':'
+    if (char && char !== ' ' && !isPunct) {
+      this._bs.chars++; this._bs.lastWasChar = true
+      if (this._wordBuf.length < 40) this._wordBuf += char
+    } else if (e.key !== 'Backspace') {
+      this._bs.lastWasChar = false
+    }
+    if (isWordBreak || isPunct) this._finishWord(isSentEnd)
+  }
+
+  _finishWord(sentenceEnd) {
+    const w = this._wordBuf
+    if (w.length) {
+      _meanPush(this._wordLens, w.length)
+      const lc = w.toLowerCase()
+      if (COMMON_WORDS.has(lc)) this._common[lc] = (this._common[lc] || 0) + 1
+      this._sentWords++
+    }
+    this._wordBuf = ''
+    if (sentenceEnd && this._sentWords > 0) { _meanPush(this._sentLens, this._sentWords); this._sentWords = 0 }
   }
 
   stop(target = document) {
@@ -320,6 +511,57 @@ export class KeyboardCollector {
     const dm = mean(dw), fm = mean(fl)
     return { dwellMean: dm, dwellStd: std(dw, dm), flightMean: fm, flightStd: std(fl, fm), count: ev.length }
   }
+
+  // ── Enhanced biometric profiles (Features 1–7) ───────────────────────────
+  /** Feature 1 — top-N digraphs by count → { "a>b": {count, meanLatency, stdDev} }. */
+  getDigraphProfile(topN = 50) {
+    return Object.entries(this._dg)
+      .sort((a, b) => b[1].n - a[1].n).slice(0, topN)
+      .reduce((o, [k, a]) => { o[k] = { count: a.n, meanLatency: a.mean, stdDev: _emaStd(a) }; return o }, {})
+  }
+  /** Feature 2 — top-N trigraphs by count → { "a>b>c": {count, meanLatency, stdDev} }. */
+  getTrigraphProfile(topN = 40) {
+    return Object.entries(this._tg)
+      .sort((a, b) => b[1].n - a[1].n).slice(0, topN)
+      .reduce((o, [k, a]) => { o[k] = { count: a.n, meanLatency: a.mean, stdDev: _emaStd(a) }; return o }, {})
+  }
+  /** Feature 3 — burst/pause rhythm. */
+  getBurstProfile() {
+    const b = this._bursts
+    const avgBurstLength = b.length ? b.reduce((s, v) => s + v, 0) / b.length : 0
+    const burstVariance  = b.length > 1 ? b.reduce((s, v) => s + (v - avgBurstLength) ** 2, 0) / b.length : 0
+    const avgPauseLength = this.getAvgPause()
+    return { avgBurstLength, avgPauseLength, burstVariance }
+  }
+  /** Feature 4 — backspace / correction signature. */
+  getBackspaceProfile() {
+    const c = Math.max(this._bs.chars, 1), b = Math.max(this._bs.backspaces, 1)
+    return {
+      backspacesPer100Chars:  (this._bs.backspaces / c) * 100,
+      immediateCorrectionRate: this._bs.immediate / b,
+      wholeWordDeleteRate:     this._bs.wholeWord / b,
+      chars: this._bs.chars,
+    }
+  }
+  /** Feature 5 — spacebar rhythm. */
+  getSpacebarProfile() { return { avgPreSpaceDelay: this._preSpace.mean, avgPostSpaceDelay: this._postSpace.mean, n: this._preSpace.n } }
+  /** Feature 6 — key hold time profile (RECENT window so it tracks the current typist). */
+  getDwellProfile() {
+    const ev = this._events.slice(-60)
+    if (ev.length < 5) return { avgDwellTime: 0, stdDwellTime: 0, n: ev.length }
+    const dw = ev.map(e => e.dwell)
+    const m = dw.reduce((s, v) => s + v, 0) / dw.length
+    const sd = Math.sqrt(dw.reduce((s, v) => s + (v - m) ** 2, 0) / dw.length)
+    return { avgDwellTime: m, stdDwellTime: sd, n: ev.length }
+  }
+  /** Feature 7 — privacy-preserving phrase fingerprint (no raw text). */
+  getPhraseProfile() {
+    const total = Object.values(this._common).reduce((s, v) => s + v, 0) || 1
+    const commonWordFrequency = Object.fromEntries(Object.entries(this._common).map(([k, v]) => [k, v / total]))
+    return { averageWordLength: this._wordLens.mean, averageSentenceLength: this._sentLens.mean, commonWordFrequency }
+  }
+  /** Counts used to decide whether the rich profiles have enough evidence. */
+  getRichReadiness() { return { digraphs: Object.keys(this._dg).length, trigraphs: Object.keys(this._tg).length, chars: this._bs.chars } }
 
   getStats() {
     if (!this._events.length) return { avgDwell: 0, avgFlight: 0, count: 0 }
@@ -578,16 +820,27 @@ export class EnrollmentTemplate {
     this.dwellStd    = data.dwellStd
     this.flightMean  = data.flightMean
     this.flightStd   = data.flightStd
-    this.digraphs    = data.digraphs || {}   // "prevCode>code" → latency ms
+    this.digraphs    = data.digraphs || {}   // "prevCode>code" → latency ms (legacy bigram-dwell)
     this.mouse       = data.mouse || { speed: 0, jitter: 0, accel: 0 }
     this.frozenAt    = data.frozenAt || Date.now()
     this.basisKeys   = data.basisKeys || 0
+    // ── Enhanced profiles (Features 1–7). Backward compatible: older templates
+    //    lack these → null/{} → the matching live similarity returns null and is
+    //    dropped from the weighted score (graceful degradation). ──────────────
+    this.digraphProfile   = data.digraphProfile   || null
+    this.trigraphProfile  = data.trigraphProfile  || null
+    this.burstProfile     = data.burstProfile     || null
+    this.backspaceProfile = data.backspaceProfile || null
+    this.spacebarProfile  = data.spacebarProfile  || null
+    this.dwellProfile     = data.dwellProfile     || null
+    this.phraseProfile    = data.phraseProfile    || null
   }
 
   /** Capture a frozen template from the current capture buffers. */
   static capture(keyboard, pointer) {
     const kf = keyboard.getDwellFlightStats(300)
     const ms = pointer.getStats()
+    const rich = keyboard.getRichReadiness()
     return new EnrollmentTemplate({
       dwellMean:  kf.dwellMean,
       dwellStd:   kf.dwellStd,
@@ -597,6 +850,14 @@ export class EnrollmentTemplate {
       mouse:      { speed: ms.avgSpeed || 0, jitter: ms.avgJitter || 0, accel: ms.avgAccel || 0 },
       frozenAt:   Date.now(),
       basisKeys:  kf.count,
+      // Only freeze a rich profile when there is enough evidence for it.
+      digraphProfile:   rich.digraphs >= 6 ? keyboard.getDigraphProfile(50)  : null,
+      trigraphProfile:  rich.trigraphs >= 5 ? keyboard.getTrigraphProfile(40) : null,
+      burstProfile:     keyboard.getBurstProfile(),
+      backspaceProfile: rich.chars >= 20 ? keyboard.getBackspaceProfile() : null,
+      spacebarProfile:  keyboard.getSpacebarProfile().n >= 3 ? keyboard.getSpacebarProfile() : null,
+      dwellProfile:     keyboard.getDwellProfile().n >= 10 ? keyboard.getDwellProfile() : null,
+      phraseProfile:    rich.chars >= 20 ? keyboard.getPhraseProfile() : null,
     })
   }
 
@@ -681,9 +942,14 @@ export class EntropyPrimeClient {
   confirmVerified() {
     this._reauthStreak  = 0                 // clear streak / gating state
     this._suspicion     = 0                 // clear suspicion accumulator
-    this._scoreWindow   = []                // clear rolling window
-    this._smoothConf    = 100               // restart smoothed confidence at trusted
-    this._reauthCooldownUntil = performance.now() + ID_REAUTH_COOLDOWN_MS
+    this._scoreWindow   = []                // clear rolling low-score window (clears lowCount)
+    this._smoothConf    = 100               // reset EMA / smoothed confidence to 100
+    this._reauthCooldownUntil = performance.now() + ID_REAUTH_COOLDOWN_MS  // 120s cooldown
+    // clear the legacy drift history + any monitor state
+    if (this.behavioralProfile) {
+      this.behavioralProfile.driftHistory = []
+      this.behavioralProfile.lastDrift    = 0
+    }
     if (this.watchdog) {
       this.watchdog.trustScore = 1.0        // clear watchdog temporary penalties
       this.watchdog.lastERec   = 0
@@ -754,10 +1020,42 @@ export class EntropyPrimeClient {
     ) / 3
     const mouseSim = pm.count > 5 ? _gaussSim(mouseRel, ID_TOL_MOUSE) : 1.0
 
-    // ── Weighted combine — CONTINUOUS, no hard cap (Task 1) ──────────────────
-    const rawScore = Math.max(0, Math.min(100, Math.round(
-      100 * (ID_W_TYPING * typingSim + ID_W_DIGRAPH * digraphSim + ID_W_MOUSE * mouseSim)
-    )))
+    // ── Enhanced keyboard-biometric signals (Features 1–7) ───────────────────
+    // Each returns [0,1], or null when the live data / template lacks evidence
+    // (null signals are dropped from the weighted score, never penalised).
+    const kb = this.keyboard
+    const digraphProfileSim = _profileSim(kb.getDigraphProfile(50),  tpl.digraphProfile,  ID_TOL_DIGRAPH, ID_MIN_DG_OVERLAP)
+    const trigraphSim       = _profileSim(kb.getTrigraphProfile(40), tpl.trigraphProfile, ID_TOL_TRIGRAPH, ID_MIN_TG_OVERLAP)
+    const burstSim          = _burstSim(kb.getBurstProfile(),       tpl.burstProfile)
+    const backspaceSim      = _backspaceSim(kb.getBackspaceProfile(), tpl.backspaceProfile)
+    const spacebarSim       = _spacebarSim(kb.getSpacebarProfile(),  tpl.spacebarProfile)
+    const dwellSim          = _dwellSim(kb.getDwellProfile(),        tpl.dwellProfile)
+    const phraseSim         = _phraseSim(kb.getPhraseProfile(),      tpl.phraseProfile)
+
+    // ── Weighted evidence fusion (renormalised over available signals) ───────
+    const signals = [
+      ['typing',         typingSim,         ID_WEIGHTS.typing],
+      ['digraph',        digraphSim,        ID_WEIGHTS.digraph],
+      ['mouse',          mouseSim,          ID_WEIGHTS.mouse],
+      ['digraphProfile', digraphProfileSim, ID_WEIGHTS.digraphProfile],
+      ['trigraph',       trigraphSim,       ID_WEIGHTS.trigraph],
+      ['burst',          burstSim,          ID_WEIGHTS.burst],
+      ['backspace',      backspaceSim,      ID_WEIGHTS.backspace],
+      ['spacebar',       spacebarSim,       ID_WEIGHTS.spacebar],
+      ['dwell',          dwellSim,          ID_WEIGHTS.dwell],
+      ['phrase',         phraseSim,         ID_WEIGHTS.phrase],
+    ]
+    const avail = signals.filter(s => s[1] != null)
+    const totW  = avail.reduce((s, x) => s + x[2], 0) || 1
+    let rawScore = Math.round(100 * avail.reduce((s, x) => s + x[1] * x[2], 0) / totW)
+    rawScore = Math.max(0, Math.min(100, rawScore))
+
+    // ── False-positive guard (Feature requirement): ONE drifting signal must
+    //    never reach the re-auth band. Only ≥ ID_DRIFT_MIN independent signals
+    //    drifting together may push the score below the monitor floor. ────────
+    const driftCount = avail.filter(s => s[1] < ID_DRIFT_THRESH).length
+    if (driftCount < ID_DRIFT_MIN) rawScore = Math.max(rawScore, ID_MONITOR_MIN)
+
     // `gated` is kept as a diagnostic flag only — it NO LONGER caps the score.
     const gated = dwellRel > ID_GATE_DWELL || flightRel > ID_GATE_FLIGHT || digraphRel > ID_GATE_DIGRAPH
 
@@ -775,7 +1073,12 @@ export class EntropyPrimeClient {
     // ── Corroboration (Task 7): a strong digraph + mouse match means this is
     //    very likely the OWNER typing in a different context (speed varies). Do
     //    not escalate to re-auth even when typing similarity drops. ───────────
-    const corroborated = digraphSim > ID_CORROB_DIGRAPH && mouseSim > ID_CORROB_MOUSE
+    // Corroboration: the legacy digraph+mouse match, OR a strong dwell match
+    // combined with a strong digraph/trigraph profile match (the new hard-to-fake
+    // keystroke signals) — either means "very likely the owner".
+    const corroborated =
+      (digraphSim > ID_CORROB_DIGRAPH && mouseSim > ID_CORROB_MOUSE) ||
+      (dwellSim != null && dwellSim > 0.85 && Math.max(digraphProfileSim ?? 0, trigraphSim ?? 0) > 0.80)
 
     // ── Suspicion accumulator (Tasks 2 & 5) ──────────────────────────────────
     if (corroborated || conf >= ID_TRUSTED_MIN) {
@@ -805,18 +1108,49 @@ export class EntropyPrimeClient {
     let effectiveTrust = conf / 100
     if (!reauth) effectiveTrust = Math.max(effectiveTrust, ID_MONITOR_FLOOR)
 
+    // ── CHANGE 1 — POST-REAUTH COOLDOWN HOLD ─────────────────────────────────
+    // For the entire 120s verification cooldown the session is pinned to a fully
+    // Trusted state: confidence cannot decrease, suspicion stays 0, and re-auth
+    // cannot trigger. Normal monitoring resumes automatically afterward.
+    let outConf = conf, outZone = zone, outReauth = reauth
+    if (inCooldown) {
+      this._smoothConf = 100          // keep the smoothed confidence pinned (no decay)
+      this._suspicion  = 0
+      effectiveTrust   = 1.0
+      outConf = 100; outZone = 'trusted'; outReauth = false
+    }
+
+    // Behaviour vector — the full multi-signal fingerprint (for diagnostics/debug).
+    const behaviorVector = {
+      typing: _r3(typingSim), digraph: _r3(digraphSim), mouse: _r3(mouseSim),
+      digraphProfile: _r3(digraphProfileSim), trigraph: _r3(trigraphSim),
+      burst: _r3(burstSim), backspace: _r3(backspaceSim), spacebar: _r3(spacebarSim),
+      dwell: _r3(dwellSim), phrase: _r3(phraseSim),
+    }
+
     return {
-      identityScore: conf,           // smoothed (gradual) — the progressive score
-      rawScore,                      // instantaneous similarity (diagnostic)
+      identityScore: outConf,        // smoothed (gradual) — the progressive score
+      rawScore,                      // instantaneous fused similarity (diagnostic)
       suspicion: Math.round(this._suspicion * 10) / 10,
-      zone,
-      reauth,
+      zone: outZone,
+      reauth: outReauth,
       cooldown: inCooldown,
       corroborated,
+      driftCount,                    // # of independent signals currently drifting
       effectiveTrust,
+      // Existing signals (unchanged)
       typingSim:  +typingSim.toFixed(3),
       digraphSim: +digraphSim.toFixed(3),
       mouseSim:   +mouseSim.toFixed(3),
+      // New enhanced signals (null when no evidence yet)
+      digraphProfileSim: _r3(digraphProfileSim),
+      trigraphSim:       _r3(trigraphSim),
+      burstSim:          _r3(burstSim),
+      backspaceSim:      _r3(backspaceSim),
+      spacebarSim:       _r3(spacebarSim),
+      dwellSim:          _r3(dwellSim),
+      phraseSim:         _r3(phraseSim),
+      behaviorVector,
       gated,
       sharedDigraphs: shared.length,
     }
@@ -928,10 +1262,20 @@ export class EntropyPrimeClient {
           zone:          id.zone,
           reauth:        id.reauth,
           corroborated:  id.corroborated,
+          driftCount:    id.driftCount,
           trustScore:    id.effectiveTrust,
           typingSim:     id.typingSim,
           digraphSim:    id.digraphSim,
           mouseSim:      id.mouseSim,
+          // enhanced keyboard-biometric signals
+          digraphProfileSim: id.digraphProfileSim,
+          trigraphSim:       id.trigraphSim,
+          burstSim:          id.burstSim,
+          backspaceSim:      id.backspaceSim,
+          spacebarSim:       id.spacebarSim,
+          dwellSim:          id.dwellSim,
+          phraseSim:         id.phraseSim,
+          behaviorVector:    id.behaviorVector,
           gated:         id.gated,
         })
       }
