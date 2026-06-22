@@ -45,51 +45,34 @@ async function postJSON(path, body) {
 // Each entry maps to REAL classifier signals (framework.deception.classifier).
 // `presentation` controls only how the attacker view is rendered; the backend
 // classification, routing, and threat-intel logging are always authoritative.
+// Final presentation set — exactly three credible, finished attack demos.
 export const ATTACKS = {
   credential_stuffing: {
     label:    'Credential Stuffing',
     icon:     '🔑',
-    expect:   'Banking Shadow World',
+    expect:   'Banking Shadow Environment',
     threat:   'high',
     signals:  { distinct_usernames: 18, failed_attempts: 22 },
     userAgent:'python-requests/2.31',
     presentation: 'banking',
   },
-  brute_force: {
-    label:    'Brute Force',
-    icon:     '🔨',
-    expect:   'Tarpit Environment',
-    threat:   'medium',
-    signals:  { password_attempts: 14, failed_attempts: 14 },
-    userAgent:'Hydra/9.5',
-    presentation: 'tarpit',
-  },
   recon: {
     label:    'Reconnaissance',
     icon:     '🛰',
-    expect:   'Shadow Admin World',
+    expect:   'Recon Sandbox Terminal',
     threat:   'high',
     signals:  { admin_path_hits: 4, unique_paths: 32, not_found_ratio: 0.6 },
     userAgent:'curl/8.1',
-    presentation: 'admin',
+    presentation: 'terminal',
   },
-  scraper: {
-    label:    'Data Scraper',
-    icon:     '🕷',
-    expect:   'Synthetic Dataset',
+  brute_force: {
+    label:    'Brute Force',
+    icon:     '🔨',
+    expect:   'Argon2id + Tarpit',
     threat:   'medium',
-    signals:  { request_rate: 25, unique_paths: 40 },
-    userAgent:'Scrapy/2.11',
-    presentation: 'scraper',
-  },
-  session_hijack: {
-    label:    'Session Hijacking',
-    icon:     '🎭',
-    expect:   'Restricted Session Sandbox',
-    threat:   'medium',
-    signals:  {},                       // no strong rule match → classifier = UNKNOWN
-    userAgent:'Mozilla/5.0 (compatible)',
-    presentation: 'restricted',
+    signals:  { password_attempts: 14, failed_attempts: 14 },
+    userAgent:'Hydra/9.5',
+    presentation: 'bruteforce',
   },
 }
 
@@ -116,16 +99,9 @@ export async function simulateAttack(attackKey) {
 }
 
 // ── Shadow world (attacker view) ──────────────────────────────────────────────
-export const getShadowEnv     = (token)               => getJSON('/api/shadow/me', token)
-export const getShadowAsset   = (asset, token, q = {}) => getJSON(`/api/shadow/${asset}${qs(q)}`, token)
-export const getShadowAdmin   = (asset, token, q = {}) => getJSON(`/api/shadow/admin/${asset}${qs(q)}`, token)
+// Optional: the attacker environments render entirely client-side for demo
+// stability, but these are kept for backends that serve live synthetic data.
+export const getShadowEnv = (token) => getJSON('/api/shadow/me', token)
 
-// ── Threat intelligence (defender view) ───────────────────────────────────────
-export const getDeceptionSessions = ()      => getJSON('/admin/deception/sessions')
-export const getDeceptionSummary  = ()      => getJSON('/admin/deception/summary')
-export const getDeceptionEvents   = (token) => getJSON(`/admin/deception/events${token ? `?session_token=${encodeURIComponent(token)}` : ''}`)
-
-function qs(obj) {
-  const e = Object.entries(obj)
-  return e.length ? '?' + e.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : ''
-}
+// NOTE: the Threat-Intelligence client functions (getDeceptionSummary/Sessions/
+// Events) were removed for the presentation build — that module is retired.

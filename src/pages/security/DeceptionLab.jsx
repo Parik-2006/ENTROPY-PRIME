@@ -14,7 +14,7 @@
  * an operator must explicitly launch a simulation.
  */
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { Card, Button, Badge } from '../../components/ui'
 import { ATTACKS, simulateAttack, getShadowEnv } from '../../services/deception'
 import AttackPipeline from '../../components/deception/AttackPipeline'
@@ -29,11 +29,18 @@ export default function DeceptionLab() {
   const [result, setResult] = useState(null)
   const [env, setEnv]       = useState(null)
   const [view, setView]     = useState('pipeline')
+  const switchTimer = useRef(null)
 
   const attack = ATTACKS[attackKey]
 
+  // Pipeline runs ~6 stages × 750ms; auto-open the environment shortly after.
+  const PIPELINE_MS = 5200
+
+  useEffect(() => () => clearTimeout(switchTimer.current), [])
+
   const launch = async () => {
-    setLaunching(true); setError(null); setResult(null); setEnv(null)
+    clearTimeout(switchTimer.current)
+    setLaunching(true); setError(null); setResult(null); setEnv(null); setView('pipeline')
     try {
       const res = await simulateAttack(attackKey)
       let envData = null
@@ -43,6 +50,11 @@ export default function DeceptionLab() {
       setResult(res)
       setEnv(envData)
       setView('pipeline')
+      // After the pipeline animation finishes, AUTOMATICALLY switch into the
+      // shadow environment so the deception is unmistakable.
+      if (res.shadow_mode) {
+        switchTimer.current = setTimeout(() => setView('attacker'), PIPELINE_MS)
+      }
     } catch (e) {
       setError(e.message)
     } finally {
@@ -90,14 +102,16 @@ export default function DeceptionLab() {
       {/* ── Attack Pipeline + attacker environment (replaces Threat Intel) ── */}
       {result && (
         <Card
-          title="Attack Pipeline"
-          sub={`Classified "${result.attack_class || 'unknown'}" → ${attack.expect}`}
+          title={view === 'attacker' ? '⚠ Shadow Environment — Attacker View' : 'Attack Pipeline'}
+          sub={view === 'attacker'
+            ? `Attacker redirected into ${attack.expect} — fully synthetic & isolated`
+            : `Classified "${result.attack_class || 'unknown'}" → ${attack.expect}`}
           action={
             <div style={st.tabs}>
               {['pipeline', 'attacker'].map((v) => (
                 <button key={v} onClick={() => setView(v)}
                   style={{ ...st.tab, ...(view === v ? st.tabActive : {}) }}>
-                  {v === 'pipeline' ? 'Pipeline' : 'Attacker View'}
+                  {v === 'pipeline' ? 'Pipeline' : 'Shadow Environment'}
                 </button>
               ))}
             </div>

@@ -26,11 +26,15 @@ import { useAuth } from './AuthContext'
 const TrustCtx = createContext(null)
 
 // ── DEMO MODE ─────────────────────────────────────────────────────────────────
-// Presentation safety switch. When true, identity confidence is pinned at 98
-// (Trusted) and can ONLY be lowered by the manual "Simulate Identity Deviation"
-// button — so random behavioural drift can never disrupt the live demo. Set to
-// false to restore the fully live behavioural-trust pipeline.
-export const DEMO_MODE = true
+// When true, identity confidence is PINNED at 98 (Trusted) — used only as a last
+// resort. For the behavioural-authentication demo this MUST be false so the
+// confidence moves realistically with the live engine:
+//   same user 90–100 · minor variation 75–90 · different user <60 ·
+//   idle = frozen · mouse/scroll = no change · verify = reset.
+// Stability (no random drops) comes from the engine's keyboard-only idle/evidence
+// gates and the removed theta floor — NOT from pinning. The manual
+// "Simulate Identity Deviation" button remains available as a presenter fallback.
+export const DEMO_MODE = false
 
 // Confidence zones (aligned to the spec):
 //   Trusted 80–100  → green   (no action)
